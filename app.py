@@ -50,10 +50,10 @@ logging.basicConfig(level=logging.INFO)
 # ══════════════════════════════════════════════════════════════════════════════
 #  CITY LOCK  — change this one line to re-scope the whole app
 # ══════════════════════════════════════════════════════════════════════════════
-DEFAULT_CITY = "Milan, Italy"
+DEFAULT_CITY = "Dnipro, Ukraine"
 
 CITY_CENTRES: dict[str, tuple[float, float]] = {
-    "Milan, Italy":    (45.4654,  9.1859),
+    "Dnipro, Ukraine": (45.4654,  9.1859),
     "London, UK":      (51.5074, -0.1278),
     "Paris, France":   (48.8566,  2.3522),
     "Berlin, Germany": (52.5200, 13.4050),
