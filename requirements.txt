@@ -1,0 +1,10 @@
+# requirements.txt — Delivery Route Optimizer
+# Install with: pip install -r requirements.txt
+
+osmnx>=1.9.1
+networkx>=3.2
+folium>=0.16
+geopy>=2.4
+numpy>=1.26
+shapely>=2.0
+scikit-learn>=1.4
