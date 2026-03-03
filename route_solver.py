@@ -244,6 +244,117 @@ def build_distance_matrix(
 #  TSP SOLVERS  (Phase 2)
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ── Core cost helper  ─────────────────────────────────────────────────────────
+# _route_cost MUST be defined before every function that calls it:
+#   solve_tsp (line ~314), _two_opt (line ~363), _genetic_algorithm (line ~491).
+# Python resolves names at call-time for module-level functions, so placement
+# anywhere before the first *runtime* call is technically sufficient — but we
+# define it here, at the top of the TSP section, so the read-order matches the
+# execution order and the NameError can never occur.
+
+def _route_cost(route: list[int], matrix: dict) -> float:
+    """
+    Calculate the total travel cost of a complete TSP tour.
+
+    Route structure assumption
+    ──────────────────────────
+    Every solver in this module returns a *closed* route — a list that
+    starts AND ends at the depot:
+
+        [depot, stop_1, stop_2, …, stop_n, depot]
+
+    The return-to-depot leg is therefore already represented as the last
+    consecutive pair  (stop_n → depot),  so we must NOT add an extra
+    matrix[route[-1]][route[0]] term on top — that would double-count
+    the depot→depot leg (cost 0) in the best case and add a spurious
+    depot→depot traversal cost in the worst case.
+
+    The correct formula is simply the sum of consecutive pairs:
+
+        Cost = Σ  matrix[ route[i] → route[i+1] ]   for i = 0 … len-2
+
+    which naturally covers:
+        depot → stop_1  (first leg)
+        stop_1 → stop_2
+        …
+        stop_n → depot  (return leg, already in the list as the last pair)
+
+    None / inf / missing-key handling
+    ───────────────────────────────────
+    Any of the following pathological values in a matrix entry is treated
+    as PENALTY so the TSP solvers always deal with finite floats:
+
+        • Key absent from matrix dict   → matrix.get() returns None default
+        • Explicit None value           → direct None check
+        • math.inf                      → isinf() check
+        • math.nan                      → isnan() check
+        • value ≥ PENALTY               → already the sentinel, kept as-is
+
+    This matches the Dnipro use-case where some street pairs are
+    genuinely unreachable (river crossings, one-way-only access roads)
+    and end up in the matrix as PENALTY after build_distance_matrix().
+
+    Parameters
+    ----------
+    route  : list of OSM node ids, first == last == depot
+    matrix : dict[(src_node, dst_node) → travel_time_seconds]
+             produced by build_distance_matrix()
+
+    Returns
+    -------
+    float  — total travel time in seconds, or a PENALTY multiple if any
+             leg is unreachable.  Never raises; never returns NaN or inf.
+    """
+    if len(route) < 2:
+        # A degenerate route with 0 or 1 node has no edges to traverse.
+        return 0.0
+
+    total = 0.0
+    for i in range(len(route) - 1):
+        src = route[i]
+        dst = route[i + 1]
+
+        raw = matrix.get((src, dst), None)
+
+        # Normalise every pathological value to PENALTY
+        if raw is None:
+            # Key missing — node pair was never computed (should not happen
+            # after build_distance_matrix, but guard defensively)
+            logger.debug(
+                "_route_cost: matrix key (%s, %s) missing — using PENALTY.", src, dst
+            )
+            cost = PENALTY
+
+        elif not isinstance(raw, (int, float)):
+            # Non-numeric value in matrix (e.g. a string from bad serialisation)
+            logger.warning(
+                "_route_cost: non-numeric matrix value %r for (%s, %s) — using PENALTY.",
+                raw, src, dst,
+            )
+            cost = PENALTY
+
+        else:
+            f = float(raw)
+            if math.isnan(f) or math.isinf(f):
+                logger.debug(
+                    "_route_cost: matrix[(%s, %s)] = %s — replacing with PENALTY.",
+                    src, dst, f,
+                )
+                cost = PENALTY
+            else:
+                cost = f  # normal finite value
+
+        total += cost
+
+        # Early-exit optimisation: once the running total already exceeds
+        # PENALTY there is no point accumulating further — this tour is
+        # definitively non-viable and the TSP solver will reject it.
+        if total >= PENALTY:
+            return PENALTY
+
+    return total
+
+
 def solve_tsp(
     nodes: list[int],
     matrix: dict[tuple[int, int], float],

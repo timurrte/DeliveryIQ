@@ -53,7 +53,7 @@ logging.basicConfig(level=logging.INFO)
 DEFAULT_CITY = "Dnipro, Ukraine"
 
 CITY_CENTRES: dict[str, tuple[float, float]] = {
-    "Dnipro, Ukraine": (45.4654,  9.1859),
+    "Dnipro, Ukraine": (48.4639, 35.0480),
     "London, UK":      (51.5074, -0.1278),
     "Paris, France":   (48.8566,  2.3522),
     "Berlin, Germany": (52.5200, 13.4050),
