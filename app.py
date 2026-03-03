@@ -1,6 +1,14 @@
 """
-app.py — Delivery Route Optimizer · Streamlit Dashboard
-Run with:  streamlit run app.py
+app.py — DeliveryIQ · Route Optimizer v3.0
+==========================================
+New in v3:
+  • City-locked address search  — every geocode is scoped to one city
+  • Click-to-Add on the map     — reverse geocodes click coords to an address
+  • Live 'Selected Deliveries' list with per-item remove buttons
+  • Green depot / red numbered client markers
+  • Full multi-modal AntPath route rendering after optimisation
+
+Run:  streamlit run app.py
 """
 
 from __future__ import annotations
@@ -8,22 +16,22 @@ from __future__ import annotations
 import math
 import sys
 import os
-import time
 import datetime
 import logging
 from dataclasses import dataclass, field
+from typing import Optional
 
 import folium
 import networkx as nx
 import streamlit as st
 from streamlit_folium import st_folium
 from folium.plugins import AntPath
+from geopy.geocoders import Nominatim
+from geopy.exc import GeocoderTimedOut
 
-# ── ensure sibling modules are importable ─────────────────────────────────────
 sys.path.insert(0, os.path.dirname(__file__))
 
 from graph_builder import get_network, add_travel_times, nearest_node, SPEED_KMH
-from geocoder import geocode_all, Location
 from route_solver import (
     build_distance_matrix,
     solve_tsp,
@@ -34,9 +42,24 @@ from route_solver import (
 logging.basicConfig(level=logging.INFO)
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  PAGE CONFIG & GLOBAL STYLES
+#  CITY LOCK  — change this one line to re-scope the whole app
 # ══════════════════════════════════════════════════════════════════════════════
+DEFAULT_CITY = "Milan, Italy"
 
+CITY_CENTRES: dict[str, tuple[float, float]] = {
+    "Milan, Italy":    (45.4654,  9.1859),
+    "London, UK":      (51.5074, -0.1278),
+    "Paris, France":   (48.8566,  2.3522),
+    "Berlin, Germany": (52.5200, 13.4050),
+    "Rome, Italy":     (41.9028, 12.4964),
+    "Madrid, Spain":   (40.4168, -3.7038),
+}
+
+_geolocator = Nominatim(user_agent="deliveryiq_v3", timeout=10)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PAGE CONFIG
+# ══════════════════════════════════════════════════════════════════════════════
 st.set_page_config(
     page_title="DeliveryIQ · Route Optimizer",
     page_icon="📦",
@@ -44,260 +67,126 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  GLOBAL CSS
+# ══════════════════════════════════════════════════════════════════════════════
 st.markdown("""
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@300;400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Outfit:wght@300;400;500;600;700;800&display=swap');
 
-  html, body, [class*="css"] {
-    font-family: 'DM Sans', sans-serif;
-  }
+html,body,[class*="css"]{ font-family:'Outfit',sans-serif; }
 
-  /* ── Dark sidebar ── */
-  section[data-testid="stSidebar"] {
-    background: #0f1117;
-    border-right: 1px solid #1e2130;
-  }
-  section[data-testid="stSidebar"] * {
-    color: #e2e8f0 !important;
-  }
-  section[data-testid="stSidebar"] .stTextArea textarea,
-  section[data-testid="stSidebar"] .stTextInput input,
-  section[data-testid="stSidebar"] .stSelectbox select,
-  section[data-testid="stSidebar"] .stSlider {
-    background: #1a1f2e !important;
-    border: 1px solid #2d3348 !important;
-    border-radius: 8px !important;
-    color: #e2e8f0 !important;
-  }
+/* sidebar */
+section[data-testid="stSidebar"]{background:#080c14!important;border-right:1px solid #161d2e;}
+section[data-testid="stSidebar"] *{color:#cbd5e1!important;}
+section[data-testid="stSidebar"] input,
+section[data-testid="stSidebar"] textarea,
+section[data-testid="stSidebar"] .stSelectbox>div>div{
+  background:#0f1623!important;border:1px solid #1e2d45!important;
+  border-radius:8px!important;color:#e2e8f0!important;}
+section[data-testid="stSidebar"] .stButton>button{
+  width:100%;background:linear-gradient(135deg,#1d4ed8,#2563eb)!important;
+  color:white!important;border:none!important;border-radius:10px!important;
+  padding:13px!important;font-size:.88rem!important;font-weight:600!important;
+  box-shadow:0 4px 14px rgba(37,99,235,.4)!important;transition:all .2s!important;}
+section[data-testid="stSidebar"] .stButton>button:hover{
+  background:linear-gradient(135deg,#1e40af,#1d4ed8)!important;transform:translateY(-1px);}
 
-  /* ── Main background ── */
-  .main .block-container {
-    background: #f8fafc;
-    padding-top: 1.5rem;
-    padding-bottom: 3rem;
-    max-width: 1400px;
-  }
+/* main */
+.main .block-container{background:#f1f5f9;padding-top:1.2rem;padding-bottom:3rem;max-width:1440px;}
 
-  /* ── Header banner ── */
-  .app-header {
-    background: linear-gradient(135deg, #0f1117 0%, #1a2744 60%, #0f3460 100%);
-    border-radius: 16px;
-    padding: 28px 36px;
-    margin-bottom: 24px;
-    display: flex;
-    align-items: center;
-    gap: 18px;
-    box-shadow: 0 4px 24px rgba(15,17,23,0.18);
-  }
-  .app-header h1 {
-    color: #f0f6ff !important;
-    font-size: 2rem !important;
-    font-weight: 700 !important;
-    margin: 0 !important;
-    letter-spacing: -0.5px;
-  }
-  .app-header p {
-    color: #7b9bc8 !important;
-    margin: 4px 0 0 0 !important;
-    font-size: 0.95rem;
-  }
+/* header */
+.page-header{
+  background:linear-gradient(120deg,#080c14 0%,#0f2044 55%,#0c3d6b 100%);
+  border-radius:18px;padding:26px 36px;margin-bottom:20px;
+  display:flex;align-items:center;gap:20px;
+  box-shadow:0 6px 30px rgba(8,12,20,.25);}
+.page-header h1{color:#f0f9ff!important;font-size:1.9rem!important;
+  font-weight:800!important;margin:0!important;letter-spacing:-.5px;}
+.page-header p{color:#7eb3d8!important;margin:5px 0 0!important;font-size:.88rem;}
+.city-pill{
+  display:inline-block;background:rgba(37,99,235,.25);
+  border:1px solid rgba(96,165,250,.4);color:#93c5fd!important;
+  font-size:.72rem;font-weight:600;padding:4px 14px;
+  border-radius:20px;margin-top:8px;letter-spacing:.4px;}
 
-  /* ── Metric cards ── */
-  .metric-card {
-    background: white;
-    border-radius: 14px;
-    padding: 22px 24px;
-    box-shadow: 0 2px 12px rgba(0,0,0,0.07);
-    border: 1.5px solid #e8edf5;
-    text-align: center;
-    transition: transform 0.15s ease, box-shadow 0.15s ease;
-    height: 100%;
-  }
-  .metric-card:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 6px 20px rgba(0,0,0,0.11);
-  }
-  .metric-card.winner {
-    border-color: #10b981;
-    background: linear-gradient(135deg, #f0fdf8 0%, #ecfdf5 100%);
-    box-shadow: 0 4px 20px rgba(16,185,129,0.15);
-  }
-  .metric-icon { font-size: 2rem; margin-bottom: 8px; }
-  .metric-mode {
-    font-size: 0.72rem;
-    font-weight: 600;
-    letter-spacing: 1.2px;
-    text-transform: uppercase;
-    color: #94a3b8;
-    margin-bottom: 4px;
-  }
-  .metric-time {
-    font-family: 'DM Mono', monospace;
-    font-size: 1.75rem;
-    font-weight: 500;
-    color: #0f1117;
-    line-height: 1.1;
-  }
-  .metric-sub {
-    font-size: 0.78rem;
-    color: #64748b;
-    margin-top: 6px;
-  }
-  .winner-badge {
-    display: inline-block;
-    background: #10b981;
-    color: white !important;
-    font-size: 0.65rem;
-    font-weight: 700;
-    letter-spacing: 0.8px;
-    text-transform: uppercase;
-    padding: 3px 10px;
-    border-radius: 20px;
-    margin-top: 8px;
-  }
+/* metric cards */
+.metric-card{
+  background:white;border-radius:16px;padding:22px 20px;text-align:center;
+  box-shadow:0 2px 16px rgba(0,0,0,.06);border:1.5px solid #e2e8f0;height:100%;
+  transition:transform .15s,box-shadow .15s;}
+.metric-card:hover{transform:translateY(-2px);box-shadow:0 6px 24px rgba(0,0,0,.1);}
+.metric-card.winner{
+  border-color:#10b981;background:linear-gradient(150deg,#f0fdf8,#ecfdf5);
+  box-shadow:0 4px 20px rgba(16,185,129,.16);}
+.m-icon{font-size:1.9rem;margin-bottom:6px;}
+.m-mode{font-size:.63rem;font-weight:700;letter-spacing:1.3px;text-transform:uppercase;color:#94a3b8;}
+.m-time{font-family:'DM Mono',monospace;font-size:1.65rem;font-weight:500;color:#0f172a;line-height:1.1;}
+.m-sub{font-size:.72rem;color:#64748b;margin-top:5px;}
+.winner-badge{
+  display:inline-block;background:#10b981;color:white!important;
+  font-size:.6rem;font-weight:700;letter-spacing:.8px;text-transform:uppercase;
+  padding:3px 10px;border-radius:20px;margin-top:7px;}
 
-  /* ── Section headers ── */
-  .section-header {
-    font-size: 0.7rem;
-    font-weight: 700;
-    letter-spacing: 1.5px;
-    text-transform: uppercase;
-    color: #94a3b8;
-    margin: 28px 0 12px 0;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .section-header::after {
-    content: '';
-    flex: 1;
-    height: 1px;
-    background: #e2e8f0;
-  }
+/* section headers */
+.sec-head{
+  font-size:.63rem;font-weight:700;letter-spacing:1.6px;text-transform:uppercase;
+  color:#94a3b8;margin:24px 0 10px;display:flex;align-items:center;gap:8px;}
+.sec-head::after{content:'';flex:1;height:1px;background:#e2e8f0;}
 
-  /* ── Stop table ── */
-  .stop-table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 0.875rem;
-    background: white;
-    border-radius: 12px;
-    overflow: hidden;
-    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
-  }
-  .stop-table thead tr {
-    background: #0f1117;
-    color: #94a3b8 !important;
-  }
-  .stop-table thead th {
-    padding: 12px 16px;
-    font-size: 0.68rem;
-    font-weight: 600;
-    letter-spacing: 1px;
-    text-transform: uppercase;
-    text-align: left;
-    color: #94a3b8;
-  }
-  .stop-table tbody tr {
-    border-bottom: 1px solid #f1f5f9;
-    transition: background 0.1s;
-  }
-  .stop-table tbody tr:hover { background: #f8faff; }
-  .stop-table tbody td {
-    padding: 12px 16px;
-    color: #334155;
-    vertical-align: middle;
-  }
-  .stop-num {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 26px; height: 26px;
-    border-radius: 50%;
-    font-weight: 700;
-    font-size: 0.75rem;
-    color: white;
-    flex-shrink: 0;
-  }
-  .stop-depot { background: #1e3a5f; }
-  .stop-client { background: #e74c3c; }
-  .mono { font-family: 'DM Mono', monospace; font-size: 0.82rem; }
-  .tag {
-    display: inline-block;
-    padding: 2px 10px;
-    border-radius: 20px;
-    font-size: 0.7rem;
-    font-weight: 600;
-  }
-  .tag-depot { background: #dbeafe; color: #1d4ed8; }
-  .tag-stop  { background: #fee2e2; color: #dc2626; }
-  .tag-return { background: #f3f4f6; color: #6b7280; }
+/* sidebar delivery list */
+.delivery-item{
+  display:flex;align-items:flex-start;gap:8px;
+  background:#0f1623;border:1px solid #1e2d45;
+  border-radius:10px;padding:9px 12px;margin-bottom:6px;
+  font-size:.76rem;line-height:1.4;}
+.delivery-item.depot-item{border-color:#166534;background:#052e16;}
+.di-num{
+  flex-shrink:0;width:22px;height:22px;border-radius:50%;
+  background:#dc2626;color:white;font-weight:700;font-size:.68rem;
+  display:flex;align-items:center;justify-content:center;}
+.di-num.depot{background:#16a34a;}
+.di-addr{flex:1;color:#cbd5e1!important;word-break:break-word;}
+.di-coords{font-size:.63rem;color:#475569!important;font-family:'DM Mono',monospace;}
 
-  /* ── Sidebar run button ── */
-  div[data-testid="stSidebar"] .stButton > button {
-    width: 100%;
-    background: linear-gradient(135deg, #2563eb, #1d4ed8) !important;
-    color: white !important;
-    border: none !important;
-    border-radius: 10px !important;
-    padding: 14px !important;
-    font-size: 0.95rem !important;
-    font-weight: 600 !important;
-    letter-spacing: 0.3px;
-    box-shadow: 0 4px 14px rgba(37,99,235,0.35) !important;
-    transition: all 0.2s !important;
-    margin-top: 8px;
-  }
-  div[data-testid="stSidebar"] .stButton > button:hover {
-    background: linear-gradient(135deg, #1d4ed8, #1e40af) !important;
-    box-shadow: 0 6px 20px rgba(37,99,235,0.45) !important;
-    transform: translateY(-1px);
-  }
+/* click mode banner */
+.click-active{
+  background:linear-gradient(90deg,#0c4a6e,#075985);border:1px solid #0284c7;
+  border-radius:10px;padding:12px 16px;color:#bae6fd!important;
+  font-size:.82rem;font-weight:500;text-align:center;
+  animation:pulse-b 2s infinite;}
+@keyframes pulse-b{
+  0%,100%{box-shadow:0 0 0 0 rgba(14,165,233,.4);}
+  50%{box-shadow:0 0 0 6px rgba(14,165,233,0);}}
 
-  /* ── Info / warning boxes ── */
-  .info-box {
-    background: #eff6ff;
-    border: 1px solid #bfdbfe;
-    border-left: 4px solid #2563eb;
-    border-radius: 8px;
-    padding: 14px 16px;
-    font-size: 0.875rem;
-    color: #1e3a5f;
-    margin: 12px 0;
-  }
-  .warn-box {
-    background: #fffbeb;
-    border: 1px solid #fde68a;
-    border-left: 4px solid #f59e0b;
-    border-radius: 8px;
-    padding: 14px 16px;
-    font-size: 0.875rem;
-    color: #78350f;
-    margin: 12px 0;
-  }
+/* info/warn boxes */
+.info-box{background:#eff6ff;border:1px solid #bfdbfe;border-left:4px solid #2563eb;
+  border-radius:8px;padding:12px 16px;font-size:.83rem;color:#1e3a5f;margin:10px 0;}
+.warn-box{background:#fffbeb;border:1px solid #fde68a;border-left:4px solid #f59e0b;
+  border-radius:8px;padding:12px 16px;font-size:.83rem;color:#78350f;margin:10px 0;}
 
-  /* ── Map container ── */
-  .map-container {
-    border-radius: 14px;
-    overflow: hidden;
-    box-shadow: 0 4px 20px rgba(0,0,0,0.1);
-    border: 1.5px solid #e2e8f0;
-  }
+/* stop table */
+.stop-table{
+  width:100%;border-collapse:collapse;font-size:.83rem;
+  background:white;border-radius:14px;overflow:hidden;
+  box-shadow:0 2px 16px rgba(0,0,0,.06);}
+.stop-table thead tr{background:#0f172a;}
+.stop-table thead th{
+  padding:12px 16px;font-size:.61rem;font-weight:700;
+  letter-spacing:1.1px;text-transform:uppercase;color:#94a3b8;text-align:left;}
+.stop-table tbody tr{border-bottom:1px solid #f1f5f9;transition:background .1s;}
+.stop-table tbody tr:hover{background:#f8faff;}
+.stop-table tbody td{padding:11px 16px;color:#334155;vertical-align:middle;}
+.snum{display:inline-flex;align-items:center;justify-content:center;
+  width:24px;height:24px;border-radius:50%;font-weight:700;font-size:.7rem;color:white;}
+.snum-depot{background:#16a34a;} .snum-stop{background:#dc2626;}
+.tag{display:inline-block;padding:2px 9px;border-radius:20px;font-size:.65rem;font-weight:600;}
+.tag-depot{background:#dcfce7;color:#15803d;}
+.tag-stop{background:#fee2e2;color:#dc2626;}
+.tag-return{background:#f3f4f6;color:#6b7280;}
+.mono{font-family:'DM Mono',monospace;font-size:.78rem;}
 
-  /* ── Progress / status ── */
-  .status-step {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 8px 0;
-    font-size: 0.875rem;
-    color: #334155;
-  }
-  .step-done  { color: #10b981; font-weight: 600; }
-  .step-active { color: #2563eb; font-weight: 600; }
-
-  /* hide streamlit branding */
-  #MainMenu, footer, header { visibility: hidden; }
+#MainMenu,footer,header{visibility:hidden;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -307,6 +196,15 @@ st.markdown("""
 # ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
+class DeliveryStop:
+    address: str
+    lat: float
+    lon: float
+    source: str = "typed"        # "typed" | "map_click"
+    node_id: Optional[int] = None
+
+
+@dataclass
 class LegInfo:
     from_label: str
     to_label: str
@@ -314,211 +212,261 @@ class LegInfo:
     travel_time_s: float
     cumulative_time_s: float
 
+
 @dataclass
 class ModeResult:
     mode: str
-    tsp_route: list[int]
-    full_route: list[int]
+    tsp_route: list
+    full_route: list
     total_time_s: float
-    legs: list[LegInfo] = field(default_factory=list)
+    legs: list = field(default_factory=list)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  HELPERS
+#  SESSION STATE
+# ══════════════════════════════════════════════════════════════════════════════
+#
+#  All interactive state is stored here so that Streamlit re-runs (triggered
+#  by any widget interaction) always have consistent data.
+#
+#  Key                Type                  Purpose
+#  ─────────────────────────────────────────────────────────────────────────
+#  city               str                   Active city lock
+#  depot              DeliveryStop | None   The warehouse / start point
+#  stops              list[DeliveryStop]    Growing list of delivery stops
+#  click_mode         bool                  True = map captures clicks
+#  last_click         tuple | None          Dedup: last processed click coords
+#  opt_results        dict | None           TSP results (all 3 modes)
+#  opt_graphs         dict | None           Weighted nx graphs (all 3 modes)
+#
+def _init():
+    defs = {
+        "city": DEFAULT_CITY,
+        "depot": None,
+        "stops": [],
+        "click_mode": False,
+        "last_click": None,
+        "opt_results": None,
+        "opt_graphs": None,
+    }
+    for k, v in defs.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+_init()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CITY-LOCKED GEOCODING
 # ══════════════════════════════════════════════════════════════════════════════
 
-MODE_META = {
-    "drive": {"icon": "🚗", "colour": "#e74c3c", "label": "Car",    "ant_colour": "#e74c3c"},
-    "bike":  {"icon": "🚲", "colour": "#2ecc71", "label": "Bicycle","ant_colour": "#2ecc71"},
-    "walk":  {"icon": "🚶", "colour": "#3498db", "label": "Walking","ant_colour": "#3498db"},
-}
+def _lock(address: str, city: str) -> str:
+    """
+    Append the city suffix if not already present.
+    This single function is the city-lock gate for ALL forward geocoding.
+    Example:  "Navigli"  →  "Navigli, Milan, Italy"
+    """
+    city_stem = city.lower().split(",")[0].strip()
+    if city_stem not in address.lower():
+        return f"{address.strip()}, {city}"
+    return address.strip()
 
-def hms(s: float) -> str:
-    if not math.isfinite(s): return "N/A"
-    h, r = divmod(int(s), 3600); m, sc = divmod(r, 60)
-    return f"{h}h {m:02d}m {sc:02d}s" if h else f"{m}m {sc:02d}s" if m else f"{sc}s"
 
-def node_coords(G: nx.MultiDiGraph, n: int) -> tuple[float, float]:
-    d = G.nodes[n]; return d["y"], d["x"]
+def forward_geocode(raw: str, city: str) -> Optional[DeliveryStop]:
+    """Forward geocode with city lock. Returns None on failure."""
+    query = _lock(raw, city)
+    try:
+        r = _geolocator.geocode(query, timeout=10)
+        if r is None:
+            return None
+        return DeliveryStop(address=r.address, lat=r.latitude, lon=r.longitude, source="typed")
+    except GeocoderTimedOut:
+        return None
 
-def leg_distance(G: nx.MultiDiGraph, path: list[int]) -> float:
-    total = 0.0
-    for i in range(len(path) - 1):
-        edge_data = G.get_edge_data(path[i], path[i+1])
-        if edge_data:
-            lengths = [v.get("length", 0) for v in edge_data.values()]
-            total += min(lengths)
-    return total
+
+def reverse_geocode(lat: float, lon: float) -> Optional[DeliveryStop]:
+    """Reverse geocode (lat, lon) → DeliveryStop. Falls back to coord string."""
+    try:
+        r = _geolocator.reverse((lat, lon), language="en", timeout=10)
+        addr = r.address if r else f"{lat:.5f}, {lon:.5f}"
+    except GeocoderTimedOut:
+        addr = f"{lat:.5f}, {lon:.5f}"
+    return DeliveryStop(address=addr, lat=lat, lon=lon, source="map_click")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CORE PIPELINE  (cached aggressively)
+#  OSM / ROUTING
 # ══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_resource(show_spinner=False)
-def cached_network(depot_address: str, radius: int):
-    return get_network(depot_address, dist=radius)
+def cached_network(city: str, radius: int):
+    return get_network(city, dist=radius)
+
 
 @st.cache_resource(show_spinner=False)
 def cached_mode_graphs(_G):
     return add_travel_times(_G)
 
 
-def run_pipeline(
-    depot_address: str,
-    client_addresses: list[str],
-    radius: int,
-    tsp_method: str,
-) -> tuple[dict[str, ModeResult], list[Location], dict]:
-    """Full optimization pipeline. Returns (mode_results, locations, mode_graphs)."""
+def leg_dist(G, path):
+    d = 0.0
+    for i in range(len(path) - 1):
+        ed = G.get_edge_data(path[i], path[i+1])
+        if ed:
+            d += min(v.get("length", 0) for v in ed.values())
+    return d
 
-    status = st.empty()
 
-    def log(msg: str, done: bool = False):
+def n_coords(G, n):
+    return G.nodes[n]["y"], G.nodes[n]["x"]
+
+
+def run_optimization(depot, stops, city, radius, tsp_method):
+    prog = st.empty()
+    def s(msg, done=False):
         icon = "✅" if done else "⏳"
-        status.markdown(f'<div class="status-step">{icon} {msg}</div>', unsafe_allow_html=True)
+        prog.markdown(f'<p style="color:#64748b;font-size:.83rem">{icon} {msg}</p>',
+                      unsafe_allow_html=True)
 
-    # Step 1 — Geocode
-    log("Geocoding addresses…")
-    all_addresses = [depot_address] + client_addresses
-    locations = geocode_all(all_addresses)
-    depot_loc = locations[0]
-    client_locs = locations[1:]
-    log(f"Geocoded {len(all_addresses)} addresses", done=True)
+    s("Downloading OSM network…")
+    G_raw = cached_network(city, radius)
+    s(f"Network ready — {G_raw.number_of_nodes():,} nodes", done=True)
 
-    # Step 2 — Network
-    log("Downloading OSM street network (cached after first run)…")
-    G_raw = cached_network(depot_address, radius)
-    log(f"Network ready — {G_raw.number_of_nodes():,} nodes, {G_raw.number_of_edges():,} edges", done=True)
+    s("Snapping addresses to road nodes…")
+    depot.node_id = nearest_node(G_raw, depot.lat, depot.lon)
+    for stop in stops:
+        stop.node_id = nearest_node(G_raw, stop.lat, stop.lon)
+    s("All stops snapped", done=True)
 
-    # Step 3 — Snap nodes
-    log("Snapping addresses to nearest OSM nodes…")
-    depot_loc.node_id = nearest_node(G_raw, depot_loc.lat, depot_loc.lon)
-    for loc in client_locs:
-        loc.node_id = nearest_node(G_raw, loc.lat, loc.lon)
-    log("All addresses snapped to graph nodes", done=True)
+    all_nodes = [depot.node_id] + [st.node_id for st in stops]
 
-    all_nodes = [depot_loc.node_id] + [c.node_id for c in client_locs]
-
-    # Step 4 — Weighted graphs
-    log("Building travel-time graphs for all 3 modes…")
+    s("Building travel-time graphs…")
     mode_graphs = cached_mode_graphs(G_raw)
-    log("Travel-time graphs ready", done=True)
+    s("Mode graphs ready", done=True)
 
-    # Step 5 — TSP per mode
-    results: dict[str, ModeResult] = {}
+    labels = {depot.node_id: "Depot"}
+    for i, st_ in enumerate(stops, 1):
+        labels[st_.node_id] = f"Stop #{i}"
+
+    results = {}
     for mode, G_mode in mode_graphs.items():
-        log(f"Solving TSP [{mode}] via {tsp_method}…")
+        s(f"Solving TSP [{mode}]…")
         matrix = build_distance_matrix(G_mode, all_nodes, weight="travel_time")
         tsp_route, total_s = solve_tsp(all_nodes, matrix, method=tsp_method)
         full_route = reconstruct_full_route(G_mode, tsp_route, weight="travel_time")
 
-        # Build leg-by-leg breakdown
-        legs: list[LegInfo] = []
-        node_labels = {depot_loc.node_id: "Depot"}
-        for i, cl in enumerate(client_locs, 1):
-            node_labels[cl.node_id] = f"Stop #{i}"
-
-        cum = 0.0
+        legs, cum = [], 0.0
         for i in range(len(tsp_route) - 1):
-            src, dst = tsp_route[i], tsp_route[i + 1]
+            src, dst = tsp_route[i], tsp_route[i+1]
             t = matrix.get((src, dst), math.inf)
             path = get_full_path(G_mode, src, dst, weight="travel_time")
-            dist = leg_distance(G_mode, path)
+            dist = leg_dist(G_mode, path)
             cum += t
-            legs.append(LegInfo(
-                from_label=node_labels.get(src, f"Node {src}"),
-                to_label=node_labels.get(dst, f"Node {dst}"),
-                distance_m=dist,
-                travel_time_s=t,
-                cumulative_time_s=cum,
-            ))
-
+            legs.append(LegInfo(labels.get(src, str(src)), labels.get(dst, str(dst)),
+                                dist, t, cum))
         results[mode] = ModeResult(mode, tsp_route, full_route, total_s, legs)
-        log(f"[{mode}] optimized — {hms(total_s)}", done=True)
+        s(f"[{mode}] done — {hms(total_s)}", done=True)
 
-    status.empty()
-    return results, locations, mode_graphs
+    prog.empty()
+    return results, mode_graphs
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  MAP BUILDER
+#  MAP BUILDERS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_folium_map(
-    mode_graphs: dict,
-    results: dict[str, ModeResult],
-    depot_loc: Location,
-    client_locs: list[Location],
-) -> folium.Map:
+MODE_META = {
+    "drive": {"icon": "🚗", "colour": "#e74c3c", "label": "Car"},
+    "bike":  {"icon": "🚲", "colour": "#2ecc71", "label": "Bicycle"},
+    "walk":  {"icon": "🚶", "colour": "#3b82f6", "label": "Walking"},
+}
+
+
+def _stop_div_icon(idx: int) -> folium.DivIcon:
+    return folium.DivIcon(
+        html=(f'<div style="background:#dc2626;color:white;border-radius:50%;'
+              f'width:32px;height:32px;line-height:32px;text-align:center;'
+              f'font-weight:700;font-size:13px;font-family:Outfit,sans-serif;'
+              f'border:3px solid white;box-shadow:0 2px 8px rgba(0,0,0,.4)">'
+              f'{idx}</div>'),
+        icon_size=(32, 32), icon_anchor=(16, 16),
+    )
+
+
+def build_selection_map(city, depot, stops) -> folium.Map:
+    """Pre-optimisation map: green depot + red numbered stops."""
+    centre = CITY_CENTRES.get(city, (48.8566, 2.3522))
+    zoom = 13
+    if depot:
+        centre = (depot.lat, depot.lon)
+        zoom = 14
+
+    fmap = folium.Map(location=list(centre), zoom_start=zoom, tiles="CartoDB positron")
+
+    if depot:
+        folium.Marker(
+            location=[depot.lat, depot.lon],
+            tooltip="<b>📦 Depot</b>",
+            popup=folium.Popup(f"<b>Depot</b><br><small>{depot.address}</small>", max_width=240),
+            icon=folium.Icon(color="green", icon="home", prefix="fa"),
+        ).add_to(fmap)
+
+    for i, stop in enumerate(stops, 1):
+        src_icon = "🖱" if stop.source == "map_click" else "✏️"
+        folium.Marker(
+            location=[stop.lat, stop.lon],
+            tooltip=f"<b>Stop #{i}</b> {src_icon}",
+            popup=folium.Popup(f"<b>Stop #{i}</b><br><small>{stop.address}</small>", max_width=260),
+            icon=_stop_div_icon(i),
+        ).add_to(fmap)
+
+    return fmap
+
+
+def build_result_map(mode_graphs, results, depot, stops) -> folium.Map:
+    """Post-optimisation map: animated routes + coloured markers."""
     G_ref = mode_graphs["drive"]
-    dlat, dlon = depot_loc.lat, depot_loc.lon
-    fmap = folium.Map(location=[dlat, dlon], zoom_start=14, tiles="CartoDB positron")
+    fmap = folium.Map(location=[depot.lat, depot.lon], zoom_start=14, tiles="CartoDB positron")
 
-    # ── Routes ────────────────────────────────────────────────────────────────
     for mode, res in results.items():
         meta = MODE_META[mode]
-        coords = [node_coords(G_ref, n) for n in res.full_route]
+        coords = [n_coords(G_ref, n) for n in res.full_route]
         layer = folium.FeatureGroup(
-            name=f"{meta['icon']} {meta['label']} route — {hms(res.total_time_s)}",
+            name=f"{meta['icon']} {meta['label']} — {hms(res.total_time_s)}",
             show=(mode == "drive"),
         )
-        AntPath(
-            locations=coords,
-            color=meta["colour"],
-            weight=5,
-            opacity=0.85,
-            delay=600,
-            dash_array=[20, 35],
-            pulse_color="#ffffff",
-            tooltip=f"{meta['label']} — {hms(res.total_time_s)}",
-        ).add_to(layer)
+        AntPath(locations=coords, color=meta["colour"], weight=5, opacity=0.85,
+                delay=600, dash_array=[20, 35], pulse_color="#fff",
+                tooltip=f"{meta['label']} · {hms(res.total_time_s)}").add_to(layer)
         layer.add_to(fmap)
 
-    # ── Depot marker ──────────────────────────────────────────────────────────
+    # Depot — GREEN home icon
     folium.Marker(
-        location=[dlat, dlon],
-        tooltip="<b>📦 Depot / Start & End</b>",
-        popup=folium.Popup(
-            f"<b>Depot</b><br>{depot_loc.address}<br>"
-            f"<small>({dlat:.5f}, {dlon:.5f})</small>",
-            max_width=250),
-        icon=folium.Icon(color="darkblue", icon="home", prefix="fa"),
+        location=[depot.lat, depot.lon],
+        tooltip="<b>📦 Depot (Start &amp; End)</b>",
+        popup=folium.Popup(f"<b>Depot</b><br><small>{depot.address}</small>", max_width=260),
+        icon=folium.Icon(color="green", icon="home", prefix="fa"),
     ).add_to(fmap)
 
-    # ── Stop markers ─────────────────────────────────────────────────────────
-    stop_layer = folium.FeatureGroup(name="📍 Delivery stops", show=True)
+    # Stops in drive-route order — RED numbered
     drive_route = results["drive"].tsp_route
-    visit_order = [n for n in drive_route if n != results["drive"].tsp_route[0]]
-    # deduplicate while preserving order
-    seen = set()
-    ordered_stops = []
+    seen, ordered = set(), []
     for n in drive_route[1:-1]:
         if n not in seen:
-            seen.add(n)
-            ordered_stops.append(n)
+            seen.add(n); ordered.append(n)
 
-    node_to_loc = {cl.node_id: cl for cl in client_locs}
-
-    for idx, node in enumerate(ordered_stops, 1):
-        loc = node_to_loc.get(node)
-        addr = loc.address if loc else f"OSM node {node}"
-        lat = loc.lat if loc else node_coords(mode_graphs["drive"], node)[0]
-        lon = loc.lon if loc else node_coords(mode_graphs["drive"], node)[1]
-
+    node_to_stop = {s.node_id: s for s in stops}
+    stop_layer = folium.FeatureGroup(name="📍 Delivery stops", show=True)
+    for idx, node in enumerate(ordered, 1):
+        s = node_to_stop.get(node)
+        lat = s.lat if s else n_coords(G_ref, node)[0]
+        lon = s.lon if s else n_coords(G_ref, node)[1]
+        addr = s.address if s else f"Node {node}"
         folium.Marker(
             location=[lat, lon],
-            tooltip=f"<b>Stop #{idx}</b><br><small>{addr[:60]}</small>",
-            popup=folium.Popup(
-                f"<b>Stop #{idx}</b><br>{addr}<br><small>({lat:.5f}, {lon:.5f})</small>",
-                max_width=260),
-            icon=folium.DivIcon(
-                html=f"""
-                <div style="background:#e74c3c;color:white;border-radius:50%;
-                            width:30px;height:30px;line-height:30px;text-align:center;
-                            font-weight:700;font-size:13px;border:2.5px solid white;
-                            box-shadow:0 2px 6px rgba(0,0,0,0.35)">{idx}</div>""",
-                icon_size=(30, 30), icon_anchor=(15, 15)),
+            tooltip=f"<b>Stop #{idx}</b>",
+            popup=folium.Popup(f"<b>Stop #{idx}</b><br>{addr}", max_width=270),
+            icon=_stop_div_icon(idx),
         ).add_to(stop_layer)
     stop_layer.add_to(fmap)
 
@@ -527,57 +475,51 @@ def build_folium_map(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  STOP TABLE RENDERER
+#  HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
+
+def hms(s: float) -> str:
+    if not math.isfinite(s): return "N/A"
+    h, r = divmod(int(s), 3600); m, sc = divmod(r, 60)
+    return f"{h}h {m:02d}m {sc:02d}s" if h else f"{m}m {sc:02d}s" if m else f"{sc}s"
+
 
 def render_stop_table(result: ModeResult) -> str:
     rows = ""
-    departure = datetime.datetime.now().replace(second=0, microsecond=0)
+    dep_time = datetime.datetime.now().replace(second=0, microsecond=0)
+    for leg in result.legs:
+        arr = dep_time + datetime.timedelta(seconds=leg.cumulative_time_s)
+        ret = leg.to_label == "Depot"
 
-    for i, leg in enumerate(result.legs):
-        is_depot_start = i == 0
-        is_return = leg.to_label == "Depot"
-        arrival_dt = departure + datetime.timedelta(seconds=leg.cumulative_time_s)
-
-        if is_depot_start:
-            from_badge = '<span class="stop-num stop-depot">D</span>'
-            from_tag = '<span class="tag tag-depot">Depot</span>'
+        if leg.from_label == "Depot":
+            fb = '<span class="snum snum-depot">D</span>'
+            ft = '<span class="tag tag-depot">Depot</span>'
         else:
-            from_badge = f'<span class="stop-num stop-client">{i}</span>'
-            from_tag = f'<span class="tag tag-stop">Stop #{i}</span>'
+            n = leg.from_label.replace("Stop #","")
+            fb = f'<span class="snum snum-stop">{n}</span>'
+            ft = f'<span class="tag tag-stop">{leg.from_label}</span>'
 
-        if is_return:
-            to_badge = '<span class="stop-num stop-depot">D</span>'
-            to_tag = '<span class="tag tag-return">Return</span>'
+        if ret:
+            tb = '<span class="snum snum-depot">D</span>'
+            tt = '<span class="tag tag-return">Return</span>'
         else:
-            to_badge = f'<span class="stop-num stop-client">{i+1}</span>'
-            to_tag = f'<span class="tag tag-stop">Stop #{i+1}</span>'
+            n = leg.to_label.replace("Stop #","")
+            tb = f'<span class="snum snum-stop">{n}</span>'
+            tt = f'<span class="tag tag-stop">{leg.to_label}</span>'
 
-        dist_str = f"{leg.distance_m/1000:.2f} km" if leg.distance_m >= 100 else f"{leg.distance_m:.0f} m"
-        leg_t = hms(leg.travel_time_s)
-        arr_str = arrival_dt.strftime("%H:%M")
-        cum_str = hms(leg.cumulative_time_s)
+        d = f"{leg.distance_m/1000:.2f} km" if leg.distance_m >= 100 else f"{leg.distance_m:.0f} m"
+        rows += (f"<tr>"
+                 f"<td>{fb}&nbsp;{ft}</td><td>{tb}&nbsp;{tt}</td>"
+                 f'<td class="mono">{d}</td>'
+                 f'<td class="mono">{hms(leg.travel_time_s)}</td>'
+                 f'<td class="mono">{arr.strftime("%H:%M")}</td>'
+                 f'<td class="mono">{hms(leg.cumulative_time_s)}</td>'
+                 f"</tr>")
 
-        rows += f"""
-        <tr>
-          <td>{from_badge}&nbsp; {from_tag}</td>
-          <td>{to_badge}&nbsp; {to_tag}</td>
-          <td class="mono">{dist_str}</td>
-          <td class="mono">{leg_t}</td>
-          <td class="mono">{arr_str}</td>
-          <td class="mono">{cum_str}</td>
-        </tr>"""
-
-    return f"""
-    <table class="stop-table">
-      <thead>
-        <tr>
-          <th>From</th><th>To</th><th>Distance</th>
-          <th>Leg Time</th><th>Est. Arrival</th><th>Elapsed</th>
-        </tr>
-      </thead>
-      <tbody>{rows}</tbody>
-    </table>"""
+    return (f'<table class="stop-table"><thead><tr>'
+            f'<th>From</th><th>To</th><th>Distance</th>'
+            f'<th>Leg Time</th><th>Est. Arrival</th><th>Elapsed</th>'
+            f'</tr></thead><tbody>{rows}</tbody></table>')
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -586,210 +528,314 @@ def render_stop_table(result: ModeResult) -> str:
 
 with st.sidebar:
     st.markdown("""
-    <div style="padding:20px 0 8px 0">
-      <div style="font-size:1.4rem;font-weight:700;color:#f0f6ff">📦 DeliveryIQ</div>
-      <div style="font-size:0.75rem;color:#4a5568;letter-spacing:0.5px">Route Optimizer · v2.0</div>
+    <div style="padding:18px 0 6px">
+      <div style="font-size:1.3rem;font-weight:800;color:#f0f9ff">📦 DeliveryIQ</div>
+      <div style="font-size:.68rem;color:#334155;letter-spacing:.5px">Route Optimizer · v3.0</div>
     </div>
-    <hr style="border-color:#1e2130;margin:8px 0 20px 0">
+    <hr style="border-color:#161d2e;margin:6px 0 14px">
     """, unsafe_allow_html=True)
 
-    st.markdown('<div style="font-size:0.7rem;font-weight:600;letter-spacing:1px;color:#4a5568;text-transform:uppercase;margin-bottom:6px">🏢 Depot Address</div>', unsafe_allow_html=True)
-    depot_input = st.text_input(
-        label="depot",
-        value="Piazza del Duomo, Milan, Italy",
-        label_visibility="collapsed",
-        placeholder="e.g. 10 Downing Street, London",
+    # ── City lock ─────────────────────────────────────────────────────────────
+    st.markdown('<div style="font-size:.61rem;font-weight:700;letter-spacing:1.2px;color:#475569;text-transform:uppercase;margin-bottom:5px">🌆 City Lock</div>', unsafe_allow_html=True)
+    city_opts = list(CITY_CENTRES.keys()) + ["Custom…"]
+    sel_city = st.selectbox("city_sel", city_opts,
+                            index=city_opts.index(st.session_state.city)
+                            if st.session_state.city in city_opts else 0,
+                            label_visibility="collapsed")
+    if sel_city == "Custom…":
+        custom = st.text_input("custom_city", placeholder="e.g. Barcelona, Spain",
+                               label_visibility="collapsed")
+        if custom.strip():
+            sel_city = custom.strip()
+    if sel_city != "Custom…" and sel_city != st.session_state.city:
+        st.session_state.update(city=sel_city, depot=None, stops=[],
+                                opt_results=None, opt_graphs=None, last_click=None)
+        st.rerun()
+
+    city = st.session_state.city
+
+    # ── Network settings ──────────────────────────────────────────────────────
+    st.markdown('<div style="font-size:.61rem;font-weight:700;letter-spacing:1.2px;color:#475569;text-transform:uppercase;margin:12px 0 5px">⚙️ Settings</div>', unsafe_allow_html=True)
+    radius = st.slider("Radius (m)", 2000, 8000, 4000, 500)
+    tsp_method = st.selectbox("TSP solver",
+                              ["auto", "christofides", "2opt", "genetic", "nn"])
+
+    st.markdown('<hr style="border-color:#161d2e;margin:14px 0">', unsafe_allow_html=True)
+
+    # ── Depot ─────────────────────────────────────────────────────────────────
+    st.markdown('<div style="font-size:.61rem;font-weight:700;letter-spacing:1.2px;color:#475569;text-transform:uppercase;margin-bottom:5px">🏢 Depot Address</div>', unsafe_allow_html=True)
+    dc1, dc2 = st.columns([4, 1])
+    with dc1:
+        depot_txt = st.text_input("dep_txt",
+                                  placeholder=f"Street in {city.split(',')[0]}…",
+                                  label_visibility="collapsed")
+    with dc2:
+        dep_go = st.button("➜", key="dep_go")
+    if dep_go and depot_txt.strip():
+        with st.spinner("Geocoding…"):
+            r = forward_geocode(depot_txt.strip(), city)
+        if r:
+            st.session_state.depot = r
+            st.session_state.opt_results = None
+            st.rerun()
+        else:
+            st.error(f"Not found in {city}")
+
+    if st.session_state.depot:
+        dep = st.session_state.depot
+        st.markdown(f"""
+        <div class="delivery-item depot-item">
+          <div class="di-num depot">D</div>
+          <div>
+            <div class="di-addr">{dep.address[:65]}{"…" if len(dep.address)>65 else ""}</div>
+            <div class="di-coords">{dep.lat:.5f}, {dep.lon:.5f}</div>
+          </div>
+        </div>""", unsafe_allow_html=True)
+        if st.button("✕ Clear depot", key="clr_dep"):
+            st.session_state.depot = None
+            st.session_state.opt_results = None
+            st.rerun()
+
+    st.markdown('<hr style="border-color:#161d2e;margin:12px 0">', unsafe_allow_html=True)
+
+    # ── Add stop by typing ────────────────────────────────────────────────────
+    st.markdown('<div style="font-size:.61rem;font-weight:700;letter-spacing:1.2px;color:#475569;text-transform:uppercase;margin-bottom:5px">📍 Add Delivery Stop</div>', unsafe_allow_html=True)
+    sc1, sc2 = st.columns([4, 1])
+    with sc1:
+        stop_txt = st.text_input("stop_txt",
+                                 placeholder=f"Address in {city.split(',')[0]}…",
+                                 label_visibility="collapsed")
+    with sc2:
+        stop_go = st.button("➜", key="stop_go")
+    if stop_go and stop_txt.strip():
+        with st.spinner("Geocoding…"):
+            r = forward_geocode(stop_txt.strip(), city)
+        if r:
+            st.session_state.stops.append(r)
+            st.session_state.opt_results = None
+            st.rerun()
+        else:
+            st.error(f"Not found in {city}")
+
+    # ── Click-to-add toggle ───────────────────────────────────────────────────
+    click_label = "🖱 Disable Map Click" if st.session_state.click_mode else "🖱 Enable Map Click"
+    if st.button(click_label, key="click_tog", use_container_width=True):
+        st.session_state.click_mode = not st.session_state.click_mode
+        st.rerun()
+
+    if st.session_state.click_mode:
+        target = "depot" if st.session_state.depot is None else "stop"
+        st.markdown(f"""
+        <div class="click-active">
+          🖱 Click Mode <b>ON</b><br>
+          <span style="font-size:.75rem">Next click adds a <b>{target}</b></span>
+        </div>""", unsafe_allow_html=True)
+
+    st.markdown('<hr style="border-color:#161d2e;margin:12px 0">', unsafe_allow_html=True)
+
+    # ── Selected deliveries list ──────────────────────────────────────────────
+    n_stops = len(st.session_state.stops)
+    st.markdown(
+        f'<div style="font-size:.61rem;font-weight:700;letter-spacing:1.2px;'
+        f'color:#475569;text-transform:uppercase;margin-bottom:7px">'
+        f'📋 Selected Deliveries ({n_stops})</div>',
+        unsafe_allow_html=True)
+
+    if n_stops == 0:
+        st.markdown('<div style="font-size:.74rem;color:#374151;padding:4px 0">No stops yet.</div>',
+                    unsafe_allow_html=True)
+    else:
+        for i, stop in enumerate(st.session_state.stops):
+            src = "🖱" if stop.source == "map_click" else "✏️"
+            short = stop.address[:52] + ("…" if len(stop.address) > 52 else "")
+            st.markdown(f"""
+            <div class="delivery-item">
+              <div class="di-num">{i+1}</div>
+              <div style="flex:1">
+                <div class="di-addr">{src} {short}</div>
+                <div class="di-coords">{stop.lat:.5f}, {stop.lon:.5f}</div>
+              </div>
+            </div>""", unsafe_allow_html=True)
+            if st.button("✕", key=f"rm_{i}", help=f"Remove stop #{i+1}"):
+                st.session_state.stops.pop(i)
+                st.session_state.opt_results = None
+                st.rerun()
+
+    st.markdown('<hr style="border-color:#161d2e;margin:12px 0">', unsafe_allow_html=True)
+
+    # ── Run button ────────────────────────────────────────────────────────────
+    can_run = st.session_state.depot is not None and len(st.session_state.stops) >= 1
+    run_btn = st.button(
+        "🚀  Optimize Routes",
+        disabled=not can_run,
+        use_container_width=True,
+        help="Add a depot + at least 1 stop first" if not can_run else "Run route optimization",
     )
-
-    st.markdown('<div style="font-size:0.7rem;font-weight:600;letter-spacing:1px;color:#4a5568;text-transform:uppercase;margin:14px 0 6px 0">📍 Delivery Addresses</div>', unsafe_allow_html=True)
-    stops_input = st.text_area(
-        label="stops",
-        value=(
-            "Castello Sforzesco, Milan, Italy\n"
-            "Navigli, Milan, Italy\n"
-            "Brera, Milan, Italy\n"
-            "Porta Venezia, Milan, Italy\n"
-            "Stazione Centrale, Milan, Italy"
-        ),
-        label_visibility="collapsed",
-        placeholder="One address per line…",
-        height=180,
-    )
-
-    st.markdown('<div style="font-size:0.7rem;font-weight:600;letter-spacing:1px;color:#4a5568;text-transform:uppercase;margin:14px 0 6px 0">⚙️ Settings</div>', unsafe_allow_html=True)
-
-    radius = st.slider("Network radius (m)", 2000, 8000, 4000, step=500,
-                        help="OSM download radius around the depot")
-
-    tsp_method = st.selectbox(
-        "TSP solver",
-        options=["auto", "christofides", "2opt", "genetic", "nn"],
-        index=0,
-        help="auto = best method chosen by stop count",
-    )
-
-    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-    run_btn = st.button("🚀  Run Optimization", use_container_width=True)
 
     st.markdown("""
-    <hr style="border-color:#1e2130;margin:20px 0 12px 0">
-    <div style="font-size:0.72rem;color:#374151;line-height:1.7">
-      <b style="color:#6b7280">Algorithms used</b><br>
-      Dijkstra · Christofides · 2-opt · Genetic
-      <br><br>
-      <b style="color:#6b7280">Data source</b><br>
-      OpenStreetMap via OSMnx
-    </div>
-    """, unsafe_allow_html=True)
+    <div style="font-size:.63rem;color:#1e293b;line-height:1.8;margin-top:8px">
+      <b style="color:#334155">Algorithms</b><br>Dijkstra · Christofides · 2-opt · Genetic<br>
+      <b style="color:#334155">Geocoder</b><br>Nominatim (city-locked)<br>
+      <b style="color:#334155">Data</b><br>OpenStreetMap / OSMnx
+    </div>""", unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  MAIN CONTENT
 # ══════════════════════════════════════════════════════════════════════════════
 
-st.markdown("""
-<div class="app-header">
-  <div style="font-size:2.8rem">📦</div>
+city  = st.session_state.city
+depot = st.session_state.depot
+stops = st.session_state.stops
+
+st.markdown(f"""
+<div class="page-header">
+  <div style="font-size:2.5rem">📦</div>
   <div>
     <h1>DeliveryIQ · Route Optimizer</h1>
-    <p>Multi-modal delivery routing powered by OSM street data, Dijkstra shortest-paths &amp; TSP heuristics</p>
+    <p>City-locked routing · Click-to-Add markers · Real OSM street data · 3 travel modes</p>
+    <div class="city-pill">📍 Locked to: {city}</div>
   </div>
-</div>
-""", unsafe_allow_html=True)
+</div>""", unsafe_allow_html=True)
 
-# ── Idle state ────────────────────────────────────────────────────────────────
-if not run_btn and "results" not in st.session_state:
-    st.markdown("""
-    <div class="info-box">
-      👈 &nbsp;Configure your <b>depot</b> and <b>delivery stops</b> in the sidebar, then press
-      <b>Run Optimization</b> to calculate the fastest routes for Car, Bike, and Walking simultaneously.
-    </div>
-    """, unsafe_allow_html=True)
+# ══════════════════════════════════════════════════════════════════════════════
+#  COORDINATOR MAP  (shown before optimisation)
+# ══════════════════════════════════════════════════════════════════════════════
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.markdown("""
-        <div class="metric-card" style="text-align:left">
-          <div style="font-size:1.8rem">🗺️</div>
-          <div style="font-weight:600;margin:8px 0 4px">Real Street Data</div>
-          <div style="font-size:0.82rem;color:#64748b">Uses OpenStreetMap via OSMnx — real roads, one-ways, bike paths, and footways.</div>
+if st.session_state.opt_results is None:
+    st.markdown('<div class="sec-head">🗺️ Coordinator Map — Build Your Delivery List</div>',
+                unsafe_allow_html=True)
+
+    if st.session_state.click_mode:
+        target_hint = "depot location" if depot is None else "delivery stop"
+        st.markdown(f"""
+        <div class="click-active" style="text-align:left;padding:10px 18px;margin-bottom:10px">
+          🖱 <b>Click Mode Active</b> — click the map to place a
+          <b>{target_hint}</b>. Coordinates are reverse-geocoded automatically.
         </div>""", unsafe_allow_html=True)
-    with col2:
+    elif depot is None:
         st.markdown("""
-        <div class="metric-card" style="text-align:left">
-          <div style="font-size:1.8rem">🧬</div>
-          <div style="font-weight:600;margin:8px 0 4px">Smart TSP Solvers</div>
-          <div style="font-size:0.82rem;color:#64748b">Christofides, 2-opt refinement, and Genetic Algorithm — auto-selected by problem size.</div>
+        <div class="info-box">
+          👈 Set a <b>depot</b> in the sidebar or enable <b>Map Click</b> to place it
+          on the map, then add delivery stops to begin.
         </div>""", unsafe_allow_html=True)
-    with col3:
-        st.markdown("""
-        <div class="metric-card" style="text-align:left">
-          <div style="font-size:1.8rem">⚡</div>
-          <div style="font-weight:600;margin:8px 0 4px">3 Modes at Once</div>
-          <div style="font-size:0.82rem;color:#64748b">Car, Bike, and Walking routes calculated simultaneously. Each mode uses its own optimal path.</div>
-        </div>""", unsafe_allow_html=True)
-    st.stop()
 
+    sel_map = build_selection_map(city, depot, stops)
 
-# ── Run pipeline ──────────────────────────────────────────────────────────────
-if run_btn:
-    client_addresses = [a.strip() for a in stops_input.strip().splitlines() if a.strip()]
+    # ── Render map and capture clicks ─────────────────────────────────────────
+    map_output = st_folium(
+        sel_map,
+        width="100%",
+        height=510,
+        returned_objects=["last_clicked"],
+        key="coord_map",
+    )
 
-    if not depot_input.strip():
-        st.error("Please enter a depot address.")
-        st.stop()
-    if len(client_addresses) < 1:
-        st.error("Please enter at least one delivery address.")
-        st.stop()
+    # ── Process a new map click ───────────────────────────────────────────────
+    #  st_folium returns 'last_clicked' as {"lat":…,"lng":…} every render,
+    #  so we deduplicate by storing the rounded coords in session state.
+    #  The flow is:
+    #    1. User clicks  →  map_output["last_clicked"] updates
+    #    2. We compare against st.session_state.last_click
+    #    3. If new, reverse-geocode and append to depot / stops
+    #    4. st.rerun() causes Streamlit to re-render with the new marker
+    if (
+        st.session_state.click_mode
+        and map_output
+        and map_output.get("last_clicked")
+    ):
+        raw = map_output["last_clicked"]
+        ck = (round(raw["lat"], 5), round(raw["lng"], 5))
 
-    with st.spinner(""):
-        progress_container = st.container()
-        with progress_container:
-            st.markdown('<div class="section-header">⏳ Optimization in progress</div>', unsafe_allow_html=True)
-            try:
-                results, locations, mode_graphs = run_pipeline(
-                    depot_input.strip(), client_addresses, radius, tsp_method
-                )
-                st.session_state["results"] = results
-                st.session_state["locations"] = locations
-                st.session_state["mode_graphs"] = mode_graphs
-            except Exception as e:
-                st.error(f"❌ Optimization failed: {e}")
-                st.exception(e)
-                st.stop()
+        if ck != st.session_state.last_click:
+            st.session_state.last_click = ck
+            with st.spinner("Reverse geocoding…"):
+                new = reverse_geocode(raw["lat"], raw["lng"])
+            if new:
+                if st.session_state.depot is None:
+                    new.source = "map_click"
+                    st.session_state.depot = new
+                else:
+                    st.session_state.stops.append(new)
+                st.session_state.opt_results = None
+                st.rerun()
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  RUN OPTIMISATION
+# ══════════════════════════════════════════════════════════════════════════════
 
-# ── Render results ────────────────────────────────────────────────────────────
-if "results" in st.session_state:
-    results: dict[str, ModeResult] = st.session_state["results"]
-    locations: list[Location] = st.session_state["locations"]
-    mode_graphs: dict = st.session_state["mode_graphs"]
+if run_btn and can_run:
+    st.markdown('<div class="sec-head">⏳ Running Optimization</div>', unsafe_allow_html=True)
+    try:
+        res, mg = run_optimization(depot, stops, city, radius, tsp_method)
+        st.session_state.opt_results = res
+        st.session_state.opt_graphs  = mg
+        st.rerun()
+    except Exception as e:
+        st.error(f"Optimization failed: {e}")
+        st.exception(e)
 
-    depot_loc = locations[0]
-    client_locs = locations[1:]
+# ══════════════════════════════════════════════════════════════════════════════
+#  RESULTS DASHBOARD
+# ══════════════════════════════════════════════════════════════════════════════
 
-    best_mode = min(results, key=lambda m: results[m].total_time_s)
+if st.session_state.opt_results is not None:
+    results     = st.session_state.opt_results
+    mode_graphs = st.session_state.opt_graphs
+    best_mode   = min(results, key=lambda m: results[m].total_time_s)
 
-    # ── Metric row ────────────────────────────────────────────────────────────
-    st.markdown('<div class="section-header">📊 Mode Comparison</div>', unsafe_allow_html=True)
+    # ── Mode comparison ───────────────────────────────────────────────────────
+    st.markdown('<div class="sec-head">📊 Mode Comparison</div>', unsafe_allow_html=True)
     cols = st.columns(3)
     for col, mode in zip(cols, ["drive", "bike", "walk"]):
-        res = results[mode]
+        res  = results[mode]
         meta = MODE_META[mode]
-        is_winner = (mode == best_mode)
-        winner_html = '<div class="winner-badge">⚡ Most Efficient</div>' if is_winner else ""
-        card_cls = "metric-card winner" if is_winner else "metric-card"
-
-        stops_count = len(client_locs)
-        total_dist = sum(leg.distance_m for leg in res.legs)
-        dist_str = f"{total_dist/1000:.1f} km"
-
+        win  = mode == best_mode
+        tdist = sum(l.distance_m for l in res.legs)
+        badge = '<div class="winner-badge">⚡ Most Efficient</div>' if win else ""
         col.markdown(f"""
-        <div class="{card_cls}">
-          <div class="metric-icon">{meta['icon']}</div>
-          <div class="metric-mode">{meta['label']}</div>
-          <div class="metric-time">{hms(res.total_time_s)}</div>
-          <div class="metric-sub">{dist_str} &nbsp;·&nbsp; {SPEED_KMH[mode]:.0f} km/h avg &nbsp;·&nbsp; {stops_count} stop{"s" if stops_count != 1 else ""}</div>
-          {winner_html}
-        </div>
-        """, unsafe_allow_html=True)
+        <div class="metric-card {'winner' if win else ''}">
+          <div class="m-icon">{meta['icon']}</div>
+          <div class="m-mode">{meta['label']}</div>
+          <div class="m-time">{hms(res.total_time_s)}</div>
+          <div class="m-sub">{tdist/1000:.1f} km · {SPEED_KMH[mode]:.0f} km/h · {len(stops)} stop{"s" if len(stops)!=1 else ""}</div>
+          {badge}
+        </div>""", unsafe_allow_html=True)
 
-    # ── Map ───────────────────────────────────────────────────────────────────
-    st.markdown('<div class="section-header">🗺️ Interactive Route Map</div>', unsafe_allow_html=True)
+    # ── Optimised route map ───────────────────────────────────────────────────
+    st.markdown('<div class="sec-head">🗺️ Optimized Routes</div>', unsafe_allow_html=True)
     st.markdown("""
-    <div class="info-box" style="margin-bottom:10px">
-      Use the <b>layer control</b> (top-left of map) to toggle visibility between Car, Bike, and Walking routes.
-      Click any marker for stop details.
-    </div>
-    """, unsafe_allow_html=True)
+    <div class="info-box">
+      <b>Layer control</b> (top-left) toggles Car / Bike / Walk routes.
+      🟢 Green = Depot &nbsp;·&nbsp; 🔴 Red numbers = Delivery stops in optimized order.
+    </div>""", unsafe_allow_html=True)
+    rmap = build_result_map(mode_graphs, results, depot, stops)
+    st_folium(rmap, width="100%", height=530, returned_objects=[], key="result_map")
 
-    fmap = build_folium_map(mode_graphs, results, depot_loc, client_locs)
-    with st.container():
-        st_folium(fmap, width="100%", height=520, returned_objects=[])
-
-    # ── Stop tables ───────────────────────────────────────────────────────────
-    st.markdown('<div class="section-header">📋 Detailed Stop Breakdown</div>', unsafe_allow_html=True)
-
-    tab_drive, tab_bike, tab_walk = st.tabs(["🚗  Car Route", "🚲  Bike Route", "🚶  Walk Route"])
-
-    for tab, mode in zip([tab_drive, tab_bike, tab_walk], ["drive", "bike", "walk"]):
+    # ── Stop breakdown tabs ───────────────────────────────────────────────────
+    st.markdown('<div class="sec-head">📋 Detailed Stop Breakdown</div>',
+                unsafe_allow_html=True)
+    t1, t2, t3 = st.tabs(["🚗  Car", "🚲  Bike", "🚶  Walk"])
+    for tab, mode in zip([t1, t2, t3], ["drive", "bike", "walk"]):
         with tab:
-            res = results[mode]
-            meta = MODE_META[mode]
-            total_dist = sum(leg.distance_m for leg in res.legs)
-
+            res   = results[mode]
+            tdist = sum(l.distance_m for l in res.legs)
             c1, c2, c3 = st.columns(3)
-            c1.metric("Total Time", hms(res.total_time_s))
-            c2.metric("Total Distance", f"{total_dist/1000:.2f} km")
-            c3.metric("Avg Speed", f"{SPEED_KMH[mode]:.0f} km/h")
-
+            c1.metric("Total Time",     hms(res.total_time_s))
+            c2.metric("Total Distance", f"{tdist/1000:.2f} km")
+            c3.metric("Avg Speed",      f"{SPEED_KMH[mode]:.0f} km/h")
             st.markdown(render_stop_table(res), unsafe_allow_html=True)
 
-    # ── Re-run nudge ──────────────────────────────────────────────────────────
-    st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
-    st.markdown("""
-    <div class="warn-box">
-      🔄 &nbsp;Change addresses or settings in the sidebar and press <b>Run Optimization</b> again to recalculate.
-      The street network is cached — only the TSP is re-run on address changes.
-    </div>
-    """, unsafe_allow_html=True)
+    # ── Footer actions ────────────────────────────────────────────────────────
+    st.markdown('<div style="height:14px"></div>', unsafe_allow_html=True)
+    ca, cb = st.columns([3, 1])
+    with ca:
+        st.markdown("""
+        <div class="warn-box">
+          🔄 Add more stops via the sidebar or map click, then press
+          <b>Optimize Routes</b> again. The OSM network is cached automatically.
+        </div>""", unsafe_allow_html=True)
+    with cb:
+        if st.button("🗑 Clear & Restart", use_container_width=True):
+            st.session_state.update(opt_results=None, opt_graphs=None)
+            st.rerun()
