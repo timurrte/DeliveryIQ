@@ -31,12 +31,18 @@ from geopy.exc import GeocoderTimedOut
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from graph_builder import get_network, add_travel_times, nearest_node, SPEED_KMH
+from graph_builder import (
+    get_network, add_travel_times,
+    nearest_node, nearest_node_safe,
+    graph_summary, SPEED_KMH,
+)
 from route_solver import (
     build_distance_matrix,
     solve_tsp,
     reconstruct_full_route,
     get_full_path,
+    audit_reachability,
+    PENALTY as ROUTE_PENALTY,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -248,6 +254,7 @@ def _init():
         "last_click": None,
         "opt_results": None,
         "opt_graphs": None,
+        "opt_warnings": [],
     }
     for k, v in defs.items():
         if k not in st.session_state:
@@ -322,53 +329,144 @@ def n_coords(G, n):
 
 
 def run_optimization(depot, stops, city, radius, tsp_method):
+    """
+    Full pipeline with all v3.1 safety fixes applied:
+      1. OSM download → LSCC pruning (inside get_network)
+      2. Node snapping happens AFTER pruning so all node_ids are valid
+      3. Distance matrix uses per-pair nx.shortest_path_length with PENALTY fallback
+      4. Reachability audit runs before TSP; unreachable stops are surfaced to the UI
+      5. TSP method defaults to 2-opt (safe with PENALTY weights)
+
+    Returns (results, mode_graphs, warnings_list)
+    """
     prog = st.empty()
+    warnings_out: list[str] = []  # collects human-readable warnings for the UI
+
     def s(msg, done=False):
         icon = "✅" if done else "⏳"
-        prog.markdown(f'<p style="color:#64748b;font-size:.83rem">{icon} {msg}</p>',
-                      unsafe_allow_html=True)
+        prog.markdown(
+            f'<p style="color:#64748b;font-size:.83rem">{icon} {msg}</p>',
+            unsafe_allow_html=True,
+        )
 
-    s("Downloading OSM network…")
+    # ── Step 1: Download OSM + LSCC pruning ──────────────────────────────────
+    s("Downloading OSM network (largest strongly-connected component)…")
     G_raw = cached_network(city, radius)
-    s(f"Network ready — {G_raw.number_of_nodes():,} nodes", done=True)
+    summary = graph_summary(G_raw)
+    s(
+        f"Network ready — {summary['nodes']:,} nodes, {summary['edges']:,} edges "
+        f"({'✅ strongly connected' if summary['strongly_connected'] else '⚠️ not fully connected'})",
+        done=True,
+    )
 
+    # ── Step 2: Snap AFTER pruning (critical ordering) ────────────────────────
+    # nearest_node() is used for typed/geocoded addresses (always in-bounds).
+    # nearest_node_safe() is used for map-click coordinates (may be out-of-bounds).
     s("Snapping addresses to road nodes…")
-    depot.node_id = nearest_node(G_raw, depot.lat, depot.lon)
-    for stop in stops:
-        stop.node_id = nearest_node(G_raw, stop.lat, stop.lon)
-    s("All stops snapped", done=True)
+    snap_errors: list[str] = []
 
-    all_nodes = [depot.node_id] + [st.node_id for st in stops]
+    try:
+        depot.node_id = (
+            nearest_node_safe(G_raw, depot.lat, depot.lon)
+            if depot.source == "map_click"
+            else nearest_node(G_raw, depot.lat, depot.lon)
+        )
+    except ValueError as e:
+        snap_errors.append(f"Depot: {e}")
 
-    s("Building travel-time graphs…")
+    for i, stop in enumerate(stops, 1):
+        try:
+            stop.node_id = (
+                nearest_node_safe(G_raw, stop.lat, stop.lon)
+                if stop.source == "map_click"
+                else nearest_node(G_raw, stop.lat, stop.lon)
+            )
+        except ValueError as e:
+            snap_errors.append(f"Stop #{i} ({stop.address[:40]}…): {e}")
+            stop.node_id = None  # mark as unsnappable
+
+    if snap_errors:
+        for err in snap_errors:
+            warnings_out.append(f"⚠️ Out-of-bounds click ignored — {err}")
+
+    # Filter out stops that failed to snap
+    valid_stops = [st for st in stops if st.node_id is not None]
+    if len(valid_stops) < len(stops):
+        skipped = len(stops) - len(valid_stops)
+        warnings_out.append(
+            f"⚠️ {skipped} stop(s) were outside the graph area and will be skipped."
+        )
+
+    if depot.node_id is None:
+        raise RuntimeError(
+            "Depot could not be snapped to the road network — it may be outside "
+            f"the {radius} m download radius.  Try increasing the radius."
+        )
+    if len(valid_stops) == 0:
+        raise RuntimeError(
+            "No delivery stops could be snapped to the road network.  "
+            "All stops are outside the downloaded graph area."
+        )
+
+    s(f"Snapped depot + {len(valid_stops)} stop(s)", done=True)
+
+    all_nodes = [depot.node_id] + [st.node_id for st in valid_stops]
+    labels = {depot.node_id: "Depot"}
+    for i, st_ in enumerate(valid_stops, 1):
+        labels[st_.node_id] = f"Stop #{i} ({st_.address[:30]})"
+
+    # ── Step 3: Build mode graphs ─────────────────────────────────────────────
+    s("Building travel-time graphs (drive / bike / walk)…")
     mode_graphs = cached_mode_graphs(G_raw)
     s("Mode graphs ready", done=True)
 
-    labels = {depot.node_id: "Depot"}
-    for i, st_ in enumerate(stops, 1):
-        labels[st_.node_id] = f"Stop #{i}"
-
+    # ── Step 4: Distance matrix + reachability audit ──────────────────────────
     results = {}
     for mode, G_mode in mode_graphs.items():
-        s(f"Solving TSP [{mode}]…")
+        s(f"[{mode}] Building distance matrix…")
         matrix = build_distance_matrix(G_mode, all_nodes, weight="travel_time")
+
+        # Run audit and surface any unreachable stops
+        problems = audit_reachability(matrix, all_nodes, labels)
+        for problem in problems:
+            msg = (
+                f"⚠️ [{mode}] {problem.label} has connectivity issues — "
+                + problem.summary().split("] ", 1)[-1]
+            )
+            if msg not in warnings_out:
+                warnings_out.append(msg)
+
+        # ── Step 5: Solve TSP ─────────────────────────────────────────────────
+        s(f"[{mode}] Solving TSP ({tsp_method})…")
         tsp_route, total_s = solve_tsp(all_nodes, matrix, method=tsp_method)
+
+        if total_s >= ROUTE_PENALTY:
+            warnings_out.append(
+                f"⚠️ [{mode}] Route cost is unrealistically high — "
+                f"one or more stops are unreachable via this mode."
+            )
+
         full_route = reconstruct_full_route(G_mode, tsp_route, weight="travel_time")
 
+        # ── Build per-leg breakdown ───────────────────────────────────────────
         legs, cum = [], 0.0
         for i in range(len(tsp_route) - 1):
-            src, dst = tsp_route[i], tsp_route[i+1]
-            t = matrix.get((src, dst), math.inf)
+            src, dst = tsp_route[i], tsp_route[i + 1]
+            t = matrix.get((src, dst), ROUTE_PENALTY)
             path = get_full_path(G_mode, src, dst, weight="travel_time")
             dist = leg_dist(G_mode, path)
             cum += t
-            legs.append(LegInfo(labels.get(src, str(src)), labels.get(dst, str(dst)),
-                                dist, t, cum))
+            legs.append(LegInfo(
+                labels.get(src, str(src)),
+                labels.get(dst, str(dst)),
+                dist, t, cum,
+            ))
+
         results[mode] = ModeResult(mode, tsp_route, full_route, total_s, legs)
         s(f"[{mode}] done — {hms(total_s)}", done=True)
 
     prog.empty()
-    return results, mode_graphs
+    return results, mode_graphs, warnings_out
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -767,9 +865,10 @@ if st.session_state.opt_results is None:
 if run_btn and can_run:
     st.markdown('<div class="sec-head">⏳ Running Optimization</div>', unsafe_allow_html=True)
     try:
-        res, mg = run_optimization(depot, stops, city, radius, tsp_method)
-        st.session_state.opt_results = res
-        st.session_state.opt_graphs  = mg
+        res, mg, warnings = run_optimization(depot, stops, city, radius, tsp_method)
+        st.session_state.opt_results  = res
+        st.session_state.opt_graphs   = mg
+        st.session_state.opt_warnings = warnings
         st.rerun()
     except Exception as e:
         st.error(f"Optimization failed: {e}")
@@ -782,7 +881,18 @@ if run_btn and can_run:
 if st.session_state.opt_results is not None:
     results     = st.session_state.opt_results
     mode_graphs = st.session_state.opt_graphs
+    warnings    = st.session_state.get("opt_warnings", [])
     best_mode   = min(results, key=lambda m: results[m].total_time_s)
+
+    # ── Warnings panel ────────────────────────────────────────────────────────
+    if warnings:
+        st.markdown('<div class="sec-head">⚠️ Connectivity Warnings</div>',
+                    unsafe_allow_html=True)
+        for w in warnings:
+            st.markdown(
+                f'<div class="warn-box">{w}</div>',
+                unsafe_allow_html=True,
+            )
 
     # ── Mode comparison ───────────────────────────────────────────────────────
     st.markdown('<div class="sec-head">📊 Mode Comparison</div>', unsafe_allow_html=True)
@@ -837,5 +947,5 @@ if st.session_state.opt_results is not None:
         </div>""", unsafe_allow_html=True)
     with cb:
         if st.button("🗑 Clear & Restart", use_container_width=True):
-            st.session_state.update(opt_results=None, opt_graphs=None)
+            st.session_state.update(opt_results=None, opt_graphs=None, opt_warnings=[])
             st.rerun()

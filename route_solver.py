@@ -1,35 +1,142 @@
 """
 route_solver.py
 ---------------
-Solves the Travelling Salesman Problem (TSP) for delivery stops using a
-two-phase approach:
+TSP solver for the DeliveryIQ route optimizer.
 
-  Phase 1 – Pairwise shortest paths (Dijkstra)
-      Build a complete distance matrix between every pair of delivery nodes
-      using networkx's Dijkstra implementation weighted by 'travel_time'.
+Key fixes vs v2
+───────────────
+1. Robust distance matrix (the 0.0 s bug)
+   The old code used `single_source_dijkstra_path_length` which returns
+   a *generator-backed dict* — accessing a missing key silently returned
+   `math.inf`, but the real problem was that the raw graph contained
+   weakly-connected nodes whose 'travel_time' was never set (= 0).
+   The new `build_distance_matrix` uses `nx.shortest_path_length` with
+   an explicit per-pair try/except so a genuinely missing path always
+   inserts PENALTY (1e9 s) rather than 0.0.
 
-  Phase 2 – TSP heuristic (Nearest-Neighbour + 2-opt refinement)
-      Find a good (not necessarily optimal) visit order.
-      For small instances (≤ 10 stops) we also try a Christofides-style
-      greedy approach via networkx's approximation module.
+2. Unreachable-node reporting
+   `audit_reachability` inspects the finished matrix and returns a
+   structured list of {node_id, label, unreachable_from, unreachable_to}
+   objects.  The Streamlit UI renders these as named warnings
+   ("Stop #2 – Shevchenka St is unreachable") instead of a silent
+   0-cost route.
 
-Returns the ordered list of OSM node ids and the total travel time (seconds).
+3. Safe Christofides
+   The old fallback swallowed the exception and silently ran 2-opt on
+   whatever broken graph was passed in.  The new version:
+     a) Pre-checks that the TSP helper graph H is non-null and connected
+        before calling christofides().
+     b) If H has isolated nodes (from PENALTY edges that were excluded),
+        it logs them by name and falls back to 2-opt explicitly.
+     c) Never calls christofides on a graph with < 3 nodes.
+
+4. Auto-method selection now prefers 2-opt over Christofides by default
+   because Christofides requires a *complete* undirected graph — which
+   we cannot guarantee when some stops are truly unreachable.  2-opt
+   works fine with PENALTY weights.
 """
 
-import itertools
+from __future__ import annotations
+
 import logging
 import math
 import random
+from dataclasses import dataclass, field
 
 import networkx as nx
 from networkx.algorithms.approximation import christofides
 
 logger = logging.getLogger(__name__)
 
+# Sentinel for unreachable pairs — large enough to dominate any real path
+# but finite so TSP solvers can still form a valid (if bad) tour.
+PENALTY: float = 1e9
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  PHASE 1 – PAIRWISE SHORTEST PATHS
-# ─────────────────────────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  REACHABILITY AUDIT
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class UnreachableStop:
+    """Describes one stop that could not be reached from / to some other stop."""
+    node_id: int
+    label: str                        # "Depot", "Stop #2", …
+    unreachable_from: list[str] = field(default_factory=list)
+    unreachable_to:   list[str] = field(default_factory=list)
+
+    @property
+    def is_isolated(self) -> bool:
+        """True if the node cannot reach OR be reached from ANY other node."""
+        return bool(self.unreachable_from) or bool(self.unreachable_to)
+
+    def summary(self) -> str:
+        parts = []
+        if self.unreachable_to:
+            parts.append(f"cannot reach: {', '.join(self.unreachable_to)}")
+        if self.unreachable_from:
+            parts.append(f"unreachable from: {', '.join(self.unreachable_from)}")
+        return f"[{self.label}] " + "; ".join(parts)
+
+
+def audit_reachability(
+    matrix: dict[tuple[int, int], float],
+    nodes: list[int],
+    labels: dict[int, str],
+) -> list[UnreachableStop]:
+    """
+    Scan the distance matrix for PENALTY-weight entries and return one
+    UnreachableStop per affected node.
+
+    Parameters
+    ----------
+    matrix : distance matrix from build_distance_matrix()
+    nodes  : ordered list [depot_node, stop1_node, …]
+    labels : {node_id: "Depot" | "Stop #N"} mapping for human-readable output
+
+    Returns
+    -------
+    list[UnreachableStop]  — empty if every pair is reachable
+    """
+    # Build a per-node problem report
+    report: dict[int, UnreachableStop] = {}
+
+    for src in nodes:
+        for dst in nodes:
+            if src == dst:
+                continue
+            cost = matrix.get((src, dst), PENALTY)
+            if cost >= PENALTY:
+                # src cannot reach dst
+                if src not in report:
+                    report[src] = UnreachableStop(
+                        node_id=src, label=labels.get(src, str(src)))
+                report[src].unreachable_to.append(labels.get(dst, str(dst)))
+
+                # dst is unreachable from src — record on dst side too
+                if dst not in report:
+                    report[dst] = UnreachableStop(
+                        node_id=dst, label=labels.get(dst, str(dst)))
+                report[dst].unreachable_from.append(labels.get(src, str(src)))
+
+    # Deduplicate the lists
+    for us in report.values():
+        us.unreachable_to   = sorted(set(us.unreachable_to))
+        us.unreachable_from = sorted(set(us.unreachable_from))
+
+    problems = list(report.values())
+    if problems:
+        logger.warning(
+            "Reachability audit found %d problematic node(s):\n  %s",
+            len(problems),
+            "\n  ".join(p.summary() for p in problems),
+        )
+    return problems
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DISTANCE MATRIX  (Phase 1)
+# ══════════════════════════════════════════════════════════════════════════════
 
 def build_distance_matrix(
     G: nx.MultiDiGraph,
@@ -37,59 +144,105 @@ def build_distance_matrix(
     weight: str = "travel_time",
 ) -> dict[tuple[int, int], float]:
     """
-    Compute all-pairs shortest-path travel times (seconds) between *nodes*
-    using Dijkstra's algorithm on *G*.
+    Compute all-pairs shortest-path travel times (seconds) using Dijkstra.
+
+    Design decisions
+    ────────────────
+    • We call `nx.shortest_path_length(G, src, dst, weight=weight)` for
+      every (src, dst) pair individually rather than using the
+      single-source variant.  This is slightly slower for large graphs
+      but makes the per-pair exception handling trivial and guarantees
+      that a missing path is always caught — even if the node exists in
+      the graph but lies in a disconnected component that slipped through
+      the LSCC filter (e.g. when the user manually overrides the radius).
+
+    • On `nx.NetworkXNoPath` we insert PENALTY (1e9 s ≈ 277 hours) so
+      the TSP solver still receives a finite, complete matrix.  PENALTY
+      is large enough that no optimal tour will choose to traverse the
+      missing leg, but finite so the solver never crashes.
+
+    • On `nx.NodeNotFound` we raise a clear RuntimeError immediately —
+      this means a node_id that was snapped to the graph before SCC
+      pruning no longer exists in the pruned graph, which indicates a
+      bug in the snapping order (nodes should be snapped *after* pruning).
 
     Parameters
     ----------
-    G : nx.MultiDiGraph
-    nodes : list[int]
-        OSM node ids for depot + all delivery stops (depot is nodes[0]).
-    weight : str
-        Edge attribute to use as cost (default ``"travel_time"``).
+    G      : weighted MultiDiGraph (output of add_travel_times)
+    nodes  : [depot_node_id, stop1_node_id, …]
+    weight : edge attribute to minimise (default "travel_time")
 
     Returns
     -------
-    dict[(src, dst) -> float]
-        Travel time in seconds for every ordered pair.
+    dict[(src, dst) → float]
     """
-    logger.info("Building %dx%d distance matrix …", len(nodes), len(nodes))
+    n = len(nodes)
+    logger.info("Building %d×%d distance matrix (weight='%s')…", n, n, weight)
     matrix: dict[tuple[int, int], float] = {}
 
     for src in nodes:
-        try:
-            lengths = nx.single_source_dijkstra_path_length(G, src, weight=weight)
-        except nx.NetworkXError as exc:
-            raise RuntimeError(f"Dijkstra failed from node {src}: {exc}") from exc
+        # Validate the source node exists before the inner loop
+        if src not in G:
+            raise RuntimeError(
+                f"Node {src} is not present in the optimisation graph.  "
+                f"This usually means the node was snapped before the graph was "
+                f"pruned to its largest strongly connected component.  "
+                f"Re-snap all nodes after calling get_network()."
+            )
 
         for dst in nodes:
             if src == dst:
                 matrix[(src, dst)] = 0.0
-            else:
-                matrix[(src, dst)] = lengths.get(dst, math.inf)
+                continue
 
-    _warn_disconnected(matrix, nodes)
+            if dst not in G:
+                raise RuntimeError(
+                    f"Destination node {dst} is not in the optimisation graph. "
+                    f"Same cause as above — re-snap after get_network()."
+                )
+
+            try:
+                cost = nx.shortest_path_length(G, src, dst, weight=weight)
+                # Guard against a 0-cost path that still somehow slipped through
+                # (e.g. an edge whose travel_time was not stamped correctly).
+                if cost == 0.0 and src != dst:
+                    logger.warning(
+                        "  Dijkstra returned 0.0 s between nodes %s and %s — "
+                        "the '%s' attribute may be missing on some edges. "
+                        "Inserting penalty weight.",
+                        src, dst, weight,
+                    )
+                    cost = PENALTY
+                matrix[(src, dst)] = float(cost)
+
+            except nx.NetworkXNoPath:
+                # The two nodes are in the same graph but no directed path
+                # connects them.  This should not happen inside the LSCC but
+                # can occur if the user bumps the radius and fetches a
+                # partially-connected 'all' graph.
+                logger.warning(
+                    "  No directed path from %s to %s — inserting penalty weight.",
+                    src, dst,
+                )
+                matrix[(src, dst)] = PENALTY
+
+            except nx.NodeNotFound as exc:
+                raise RuntimeError(f"Node lookup failed: {exc}") from exc
+
+    reachable_pairs  = sum(1 for v in matrix.values() if 0 < v < PENALTY)
+    penalty_pairs    = sum(1 for v in matrix.values() if v >= PENALTY)
+    diagonal_pairs   = n  # src == dst zeros
+
+    logger.info(
+        "  Matrix complete — %d reachable pairs, %d penalty pairs, %d diagonal.",
+        reachable_pairs, penalty_pairs, diagonal_pairs,
+    )
     return matrix
 
 
-def _warn_disconnected(
-    matrix: dict[tuple[int, int], float],
-    nodes: list[int],
-) -> None:
-    """Log a warning for any node pair that is unreachable."""
-    bad = [(s, d) for (s, d), v in matrix.items() if v == math.inf and s != d]
-    if bad:
-        logger.warning(
-            "%d node pairs are unreachable in the graph "
-            "(consider increasing the download radius). Pairs: %s",
-            len(bad),
-            bad[:5],
-        )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  PHASE 2 – TSP SOLVERS
-# ─────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  TSP SOLVERS  (Phase 2)
+# ══════════════════════════════════════════════════════════════════════════════
 
 def solve_tsp(
     nodes: list[int],
@@ -100,38 +253,52 @@ def solve_tsp(
     """
     Find a near-optimal visit order for *nodes* (nodes[0] is the depot).
 
-    Parameters
-    ----------
-    nodes : list[int]
-        Full list: [depot, stop1, stop2, …].
-    matrix : dict
-        All-pairs travel-time matrix.
-    method : str
-        ``"nn"``         – Nearest-Neighbour heuristic (fast, any size).
-        ``"2opt"``       – Nearest-Neighbour + 2-opt refinement.
-        ``"christofides"`` – NetworkX Christofides approximation (small graphs).
-        ``"genetic"``    – Simple Genetic Algorithm (medium graphs).
-        ``"auto"``       – Choose automatically based on number of stops.
-    seed : int
-        Random seed for stochastic methods.
+    Method selection
+    ────────────────
+    "auto"          Choose based on stop count (see table below).
+    "nn"            Nearest-Neighbour greedy (O(n²), any size).
+    "2opt"          NN + 2-opt edge-swap refinement (O(n³) per pass).
+    "christofides"  NetworkX Christofides (½-approx, needs complete graph).
+    "genetic"       Order-crossover Genetic Algorithm (large instances).
+
+    Auto-selection table
+    ┌──────────────┬──────────────┐
+    │  Stop count  │  Method      │
+    ├──────────────┼──────────────┤
+    │  1–2         │  nn          │
+    │  3–20        │  2opt        │  ← changed: was christofides
+    │  21–60       │  genetic     │
+    │  61+         │  genetic     │
+    └──────────────┴──────────────┘
+
+    Why 2opt instead of Christofides for small graphs?
+    Christofides requires a *complete*, *connected*, *undirected* helper
+    graph.  When even one pair has a PENALTY weight (unreachable stop)
+    the helper graph becomes disconnected and christofides() raises
+    "Connectivity is undefined for the null graph".  2-opt handles
+    PENALTY weights gracefully — it will simply never choose to traverse
+    a PENALTY edge if any finite alternative exists.
 
     Returns
     -------
-    (ordered_nodes, total_time_seconds)
-        ``ordered_nodes`` starts and ends at the depot.
+    (ordered_node_ids, total_travel_time_seconds)
+        ordered_node_ids starts and ends at nodes[0] (the depot).
     """
     n = len(nodes)
+    if n == 0:
+        raise ValueError("Cannot solve TSP: node list is empty.")
+    if n == 1:
+        return [nodes[0], nodes[0]], 0.0
+
     if method == "auto":
         if n <= 2:
             method = "nn"
-        elif n <= 12:
-            method = "christofides"
-        elif n <= 40:
+        elif n <= 20:
             method = "2opt"
         else:
             method = "genetic"
 
-    logger.info("Solving TSP for %d stops with method='%s' …", n - 1, method)
+    logger.info("Solving TSP for %d stop(s) with method='%s'…", n - 1, method)
 
     if method == "nn":
         route = _nearest_neighbour(nodes, matrix)
@@ -145,74 +312,151 @@ def solve_tsp(
         raise ValueError(f"Unknown TSP method: {method!r}")
 
     total = _route_cost(route, matrix)
-    logger.info("  Best route cost: %.1f s (%.2f min)", total, total / 60)
+    logger.info("  Route cost: %.1f s (%.2f min)", total, total / 60.0)
+
+    if total >= PENALTY:
+        logger.error(
+            "  Route cost is ≥ PENALTY — at least one stop is unreachable. "
+            "Check the unreachability audit output above for the specific address."
+        )
+
     return route, total
 
 
 # ── Nearest-Neighbour ─────────────────────────────────────────────────────────
 
 def _nearest_neighbour(nodes: list[int], matrix: dict) -> list[int]:
+    """
+    Classic greedy nearest-neighbour starting at the depot.
+    Always produces a complete tour even when some edges are PENALTY-weight.
+    """
     depot = nodes[0]
     unvisited = set(nodes[1:])
     route = [depot]
     current = depot
 
     while unvisited:
-        nearest = min(unvisited, key=lambda n: matrix[(current, n)])
+        nearest = min(unvisited, key=lambda n: matrix.get((current, n), PENALTY))
         route.append(nearest)
         unvisited.remove(nearest)
         current = nearest
 
-    route.append(depot)   # return to depot
+    route.append(depot)
     return route
 
 
-# ── 2-opt refinement ──────────────────────────────────────────────────────────
+# ── 2-opt ─────────────────────────────────────────────────────────────────────
 
-def _two_opt(route: list[int], matrix: dict, max_iter: int = 1_000) -> list[int]:
-    """Standard 2-opt swap; keeps depot fixed at start/end."""
+def _two_opt(
+    route: list[int],
+    matrix: dict,
+    max_iter: int = 2_000,
+) -> list[int]:
+    """
+    Standard 2-opt local-search improvement.
+    Depot is pinned at index 0 and len-1 and is never swapped.
+    Handles PENALTY weights correctly — a swap is only accepted if it
+    genuinely reduces total cost, so PENALTY edges are avoided whenever
+    a finite-cost alternative exists.
+    """
     best = route[:]
+    best_cost = _route_cost(best, matrix)
     improved = True
     iterations = 0
 
     while improved and iterations < max_iter:
         improved = False
         iterations += 1
-        # route[0] and route[-1] are depot – don't swap them
         for i in range(1, len(best) - 2):
             for j in range(i + 1, len(best) - 1):
-                new_route = best[:i] + best[i:j + 1][::-1] + best[j + 1:]
-                if _route_cost(new_route, matrix) < _route_cost(best, matrix):
-                    best = new_route
+                candidate = best[:i] + best[i:j + 1][::-1] + best[j + 1:]
+                candidate_cost = _route_cost(candidate, matrix)
+                if candidate_cost < best_cost:
+                    best = candidate
+                    best_cost = candidate_cost
                     improved = True
+
+    logger.debug("  2-opt: %d iteration(s), final cost=%.1f s", iterations, best_cost)
     return best
 
 
-# ── Christofides (via NetworkX) ───────────────────────────────────────────────
+# ── Christofides ──────────────────────────────────────────────────────────────
 
 def _christofides_tsp(nodes: list[int], matrix: dict) -> list[int]:
     """
-    Build a complete weighted graph and call NetworkX's Christofides
-    approximation.  Falls back to 2-opt if the library call fails.
+    Attempt NetworkX Christofides approximation.
+
+    Safety checks before calling christofides():
+    1. Exclude all PENALTY-weight edges from the helper graph H.
+    2. If H has isolated nodes (nodes with no finite-cost neighbour),
+       log them by name and fall back to 2-opt immediately — calling
+       christofides on a disconnected graph raises
+       "Connectivity is undefined for the null graph".
+    3. If H has fewer than 3 nodes, fall back to 2-opt (trivial case).
+
+    Falls back to 2-opt on ANY exception so the user always gets a result.
     """
     try:
+        # Build undirected complete helper graph with only finite edges
         H = nx.Graph()
+        H.add_nodes_from(nodes)
         for (u, v), w in matrix.items():
-            if u != v and w < math.inf:
-                H.add_edge(u, v, weight=w)
+            if u != v and w < PENALTY:
+                # Use the minimum of the two directions for the undirected edge
+                existing = H.get_edge_data(u, v)
+                if existing is None or w < existing["weight"]:
+                    H.add_edge(u, v, weight=w)
 
-        # christofides returns a cycle as a list of nodes
+        # Check 1: need at least 3 nodes for Christofides
+        if H.number_of_nodes() < 3:
+            logger.info(
+                "  Christofides: graph has < 3 nodes — falling back to 2-opt."
+            )
+            return _two_opt(_nearest_neighbour(nodes, matrix), matrix)
+
+        # Check 2: every node must have at least one finite-weight neighbour
+        isolated = [n for n in nodes if H.degree(n) == 0]
+        if isolated:
+            logger.warning(
+                "  Christofides: %d isolated node(s) found (no finite-cost "
+                "path to any other stop): %s.  Falling back to 2-opt.",
+                len(isolated), isolated,
+            )
+            return _two_opt(_nearest_neighbour(nodes, matrix), matrix)
+
+        # Check 3: the helper graph must be connected
+        if not nx.is_connected(H):
+            components = nx.number_connected_components(H)
+            logger.warning(
+                "  Christofides: helper graph has %d disconnected component(s) "
+                "— this means some stops cannot be linked with finite-cost edges. "
+                "Falling back to 2-opt.",
+                components,
+            )
+            return _two_opt(_nearest_neighbour(nodes, matrix), matrix)
+
+        # All checks passed — run Christofides
         cycle = christofides(H, weight="weight")
+
         # Rotate so depot is first
         depot = nodes[0]
         if depot in cycle:
             idx = cycle.index(depot)
             cycle = cycle[idx:] + cycle[1:idx + 1]
         else:
+            # Christofides returned a cycle that doesn't include the depot —
+            # this should not happen but handle it defensively
             cycle = cycle + [cycle[0]]
+
+        logger.debug("  Christofides succeeded — %d-node cycle.", len(cycle))
         return cycle
+
     except Exception as exc:
-        logger.warning("Christofides failed (%s); falling back to 2-opt.", exc)
+        logger.warning(
+            "  Christofides raised an unexpected exception (%s: %s). "
+            "Falling back to 2-opt.",
+            type(exc).__name__, exc,
+        )
         return _two_opt(_nearest_neighbour(nodes, matrix), matrix)
 
 
@@ -227,9 +471,10 @@ def _genetic_algorithm(
     seed: int = 42,
 ) -> list[int]:
     """
-    A simple order-based Genetic Algorithm for the TSP.
-    Chromosome = permutation of delivery nodes (depot excluded from permutation,
-    always prepended/appended).
+    Order-crossover (OX) Genetic Algorithm.
+    Depot is always at position 0 / −1 and excluded from the chromosome.
+    Works with PENALTY weights — the fitness function naturally penalises
+    routes that include an unreachable leg.
     """
     random.seed(seed)
     depot = nodes[0]
@@ -244,54 +489,49 @@ def _genetic_algorithm(
     def fitness(chrom: list[int]) -> float:
         route = [depot] + chrom + [depot]
         cost = _route_cost(route, matrix)
-        return 1.0 / (cost + 1e-9)
+        # Reciprocal fitness — lower cost = higher fitness
+        # Add small epsilon so PENALTY routes don't divide by zero
+        return 1.0 / (cost + 1.0)
 
-    def crossover(p1: list[int], p2: list[int]) -> list[int]:
-        """Order crossover (OX)."""
+    def ox_crossover(p1: list[int], p2: list[int]) -> list[int]:
+        """Order crossover: preserve a slice of p1, fill rest from p2."""
         a, b = sorted(random.sample(range(n), 2))
-        child = [None] * n
+        child: list[int | None] = [None] * n
         child[a:b] = p1[a:b]
         fill = [g for g in p2 if g not in child]
-        idx = 0
+        fill_idx = 0
         for i in range(n):
             if child[i] is None:
-                child[i] = fill[idx]
-                idx += 1
-        return child
+                child[i] = fill[fill_idx]
+                fill_idx += 1
+        return child  # type: ignore[return-value]
 
     def mutate(chrom: list[int]) -> list[int]:
-        """Swap mutation."""
+        """Swap mutation: exchange two random positions."""
         if random.random() < mutation_rate and n >= 2:
             i, j = random.sample(range(n), 2)
             chrom[i], chrom[j] = chrom[j], chrom[i]
         return chrom
 
-    # Initialise population
+    # Initialise with random permutations
     population = [random.sample(stops, n) for _ in range(population_size)]
 
-    for gen in range(generations):
+    for _ in range(generations):
         population.sort(key=fitness, reverse=True)
         elites = population[:max(2, population_size // 10)]
-        children = elites[:]
+        children: list[list[int]] = elites[:]
         while len(children) < population_size:
             p1, p2 = random.choices(elites, k=2)
-            child = mutate(crossover(p1, p2))
-            children.append(child)
+            children.append(mutate(ox_crossover(p1, p2)))
         population = children
 
     best_chrom = max(population, key=fitness)
     return [depot] + best_chrom + [depot]
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _route_cost(route: list[int], matrix: dict) -> float:
-    return sum(matrix.get((route[i], route[i + 1]), math.inf) for i in range(len(route) - 1))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  PHASE 1b – RECONSTRUCT FULL OSM PATHS
-# ─────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  PATH RECONSTRUCTION  (Phase 1b)
+# ══════════════════════════════════════════════════════════════════════════════
 
 def get_full_path(
     G: nx.MultiDiGraph,
@@ -301,14 +541,24 @@ def get_full_path(
 ) -> list[int]:
     """
     Return the list of OSM node ids for the shortest path from *src* to *dst*.
-    Returns [src] if src == dst.
+
+    Returns ``[src]`` if src == dst.
+    Returns ``[src, dst]`` with a warning if no path exists (graceful
+    degradation — the polyline will be a straight line on the map).
     """
     if src == dst:
         return [src]
     try:
         return nx.shortest_path(G, src, dst, weight=weight)
     except nx.NetworkXNoPath:
-        logger.warning("No path found between %d and %d.", src, dst)
+        logger.warning(
+            "get_full_path: no path from %s to %s — route segment will be "
+            "a straight line.  This stop may need to be removed.",
+            src, dst,
+        )
+        return [src, dst]
+    except nx.NodeNotFound as exc:
+        logger.error("get_full_path: node not found — %s", exc)
         return [src, dst]
 
 
@@ -318,13 +568,13 @@ def reconstruct_full_route(
     weight: str = "travel_time",
 ) -> list[int]:
     """
-    Expand a TSP node sequence into a full sequence of OSM nodes
-    (including all intermediate nodes on each leg).
+    Expand a TSP node sequence into a full sequence of OSM nodes,
+    including all intermediate road nodes between each pair of stops.
     """
     full: list[int] = []
     for i in range(len(tsp_route) - 1):
         leg = get_full_path(G, tsp_route[i], tsp_route[i + 1], weight)
         if full:
-            leg = leg[1:]   # avoid duplicating the shared node
+            leg = leg[1:]   # drop the shared boundary node
         full.extend(leg)
     return full
