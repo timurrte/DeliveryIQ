@@ -83,8 +83,9 @@ PENALTY: float = 1e9
 
 # ── OSM tags we must retain on every edge ────────────────────────────────────
 # OSMnx only preserves tags listed in useful_tags_way.  Any tag absent from
-# this list is silently dropped during graph construction.  We extend the
-# default set with every tag the modal filter reads.
+# this list is silently dropped during graph construction.  Call
+# _configure_osmnx_tags() before ANY download (ox.graph_from_place,
+# ox.graph_from_address, etc.) so these tags are kept.
 _REQUIRED_TAGS: list[str] = [
     # already in most OSMnx defaults
     "access",
@@ -96,8 +97,8 @@ _REQUIRED_TAGS: list[str] = [
     "oneway",
     "service",
     "width",
-    # modal tags we specifically need
-    "bicycle",          # bicycle access: yes/no/designated/permissive/dismount
+    # modal tags we specifically need (Walk/Bike/Car differentiation)
+    "bicycle",          # bicycle access: yes/no/designated/two_way/dismount
     "cycleway",         # cycling facility; "opposite*" = contra-flow allowed
     "cycleway:left",    # contra-flow lane/track on left side of road
     "cycleway:right",   # contra-flow lane/track on right side
@@ -164,7 +165,8 @@ def _bike_contraflow_allowed(data: dict) -> bool:
 
     OSM uses several overlapping tag schemes for this:
 
-      * oneway:bicycle = no           modern primary scheme
+      * oneway:bicycle = no           modern primary scheme (bikes two-way)
+      * bicycle = two_way             explicit two-way for bicycles
       * bicycle:oneway = no           alternate key order (less common)
       * cycleway = opposite           deprecated but widespread
       * cycleway = opposite_lane      physical contra-flow lane exists
@@ -179,6 +181,7 @@ def _bike_contraflow_allowed(data: dict) -> bool:
     _OPPOSITE = frozenset({"opposite", "opposite_lane", "opposite_track"})
     return (
         _osm_tag(data, "oneway:bicycle")  == "no"       or
+        _osm_tag(data, "bicycle")         == "two_way"  or
         _osm_tag(data, "bicycle:oneway")  == "no"       or
         _osm_tag_in(data, "cycleway",       _OPPOSITE)  or
         _osm_tag_in(data, "cycleway:left",  _OPPOSITE)  or
@@ -261,12 +264,13 @@ def _compute_travel_time(
     # the reverse direction of a one-way road for non-car modes.
     is_reversed = bool(data.get("reversed", False))
 
-    # ── DRIVE (motor vehicles) ────────────────────────────────────────────────
+    # ── DRIVE (motor vehicles / Car-Accessible) ───────────────────────────────
     if mode == "drive":
-        # 1. Highway type physically prevents cars (stairs, footpaths, etc.)
+        # 1. Walk-Only / pedestrian infrastructure: footway, steps, pedestrian
+        #    (and path, corridor, etc.) — set impassable (PENALTY).
         if _osm_tag_in(data, "highway", _DRIVE_BLOCKED_HW):
             return PENALTY
-        # 2. motor_vehicle tag explicitly forbids cars
+        # 2. motor_vehicle=no (or private/destination) — car impassable.
         if mv in _MOTOR_NO:
             return PENALTY
         # 3. Generic access restriction — cars inherit access=no unless
@@ -275,45 +279,38 @@ def _compute_travel_time(
             return PENALTY
         return length_m / speed_ms
 
-    # ── BIKE (bicycles) ───────────────────────────────────────────────────────
+    # ── BIKE (bicycles / Bike-Only and shared) ─────────────────────────────────
     elif mode == "bike":
         # 1. Explicit bicycle prohibition always blocks cycling.
         if bicycle in _BIKE_FORBIDDEN:
             return PENALTY
-        # 2. Dedicated cycling infrastructure — unconditionally accessible.
-        #    Cycleways are bidirectional by default in OSM unless
-        #    oneway:bicycle=yes is explicitly set (handled by graph topology).
+        # 2. Cycleway or path: fully accessible to bikes.
         if hw == "cycleway" or bicycle in _BIKE_ALLOWED:
             return length_m / speed_ms
-        # 3. Paths and bridleways are accessible to bikes by default
-        #    (bicycle=no already handled above in rule 1).
         if hw in {"path", "bridleway"}:
             return length_m / speed_ms
-        # 4. Steps are physically impassable for bikes.
+        # 3. Steps are physically impassable for bikes.
         if hw == "steps":
             return PENALTY
-        # 5. One-way reversed synthetic edge.
-        #    OSMnx adds reversed=True on edges representing the forbidden
-        #    direction of a one-way road so pedestrians can still traverse it.
-        #    Bikes may only use this reversed edge if a contra-flow exception
-        #    is explicitly tagged (oneway:bicycle=no, cycleway=opposite, etc.).
+        # 4. One-way (for cars): if this edge is the reversed direction,
+        #    allow bike only if bicycle=two_way / oneway:bicycle=no /
+        #    cycleway=opposite* etc. (contra-flow permitted).
         if oneway and is_reversed and not _bike_contraflow_allowed(data):
             return PENALTY
         return length_m / speed_ms
 
     # ── WALK (pedestrians) ────────────────────────────────────────────────────
     elif mode == "walk":
+        # All edges are accessible to walk unless explicitly forbidden.
         # 1. Explicit "no pedestrians" via foot= tag.
         if foot in _FOOT_NO:
             return PENALTY
         # 2. Generic access=no / private blocks walking UNLESS foot= overrides.
         if access in _FOOT_NO and foot not in {"yes", "designated", "permissive"}:
             return PENALTY
-        # 3. Steps: physically walkable but significantly slower.
-        #    50% speed penalty — climbing stairs is ~half the pace of flat walking.
+        # 3. highway=steps: walkable but 50% speed penalty.
         if hw == "steps":
             return length_m / (speed_ms * _STEPS_WALK_MULTIPLIER)
-        # All other highway types are walkable at normal speed.
         return length_m / speed_ms
 
     raise ValueError(
@@ -327,22 +324,22 @@ def _compute_travel_time(
 
 def _configure_osmnx_tags() -> None:
     """
-    Tell OSMnx to retain all tags the modal filter needs.
+    Tell OSMnx to retain all tags the modal filter needs (highway, access,
+    oneway, bicycle, motor_vehicle, foot, cycleway*, etc.).
 
     OSMnx only preserves tags listed in useful_tags_way on the final edge
     attributes — any tag absent from this list is silently dropped during
-    graph construction and simplification.  By default, 'bicycle',
-    'motor_vehicle', 'foot', and the cycleway:* sub-keys are NOT kept.
+    graph construction and simplification.  Call this before any download:
+    ox.graph_from_place(), ox.graph_from_address(), or equivalent.
 
-    This function extends the current useful_tags_way list with every tag
-    in _REQUIRED_TAGS, then applies the result using whichever API the
-    installed OSMnx version exposes:
+    This function extends the current useful_tags_way list with _REQUIRED_TAGS
+    and applies the result using whichever API the installed OSMnx exposes:
 
       OSMnx 2.x:  ox.settings.useful_tags_way = [...]
       OSMnx 1.x:  ox.config(useful_tags_way=[...])
 
-    It is safe to call multiple times — deduplication is applied.
-    It MUST be called before any graph_from_* download call.
+    It is safe to call multiple times.  get_network() and get_network_from_place()
+    call it automatically before downloading.
     """
     # Collect the current default list so we extend rather than replace it.
     current: list[str] = []
@@ -491,6 +488,42 @@ def _log_scc_stats(raw_n: int, raw_e: int, G_lscc: nx.MultiDiGraph) -> None:
             "no nodes removed (%d nodes, %d edges).",
             lscc_n, lscc_e,
         )
+
+
+def _graph_from_place_compat(
+    place: str,
+    network_type: str = "all",
+    which_result: Optional[int] = None,
+) -> nx.MultiDiGraph:
+    """
+    Call ox.graph_from_place with a version-safe parameter set.
+
+    Use this when you want to download by place name (e.g. "Dnipro, Ukraine")
+    instead of address + radius.  _configure_osmnx_tags() must be called
+    before this so highway, access, oneway, bicycle (and other modal tags)
+    are retained on edges.
+
+    Tries 2.0+ signature first; falls back to 1.x if retain_all is required.
+    """
+    kwargs: dict = {"network_type": network_type, "simplify": True}
+    if which_result is not None:
+        kwargs["which_result"] = which_result
+    try:
+        G = ox.graph_from_place(place, **kwargs)
+        logger.debug("  graph_from_place: used 2.0+ signature.")
+        return G
+    except TypeError as exc:
+        msg = str(exc).lower()
+        if "retain_all" not in msg and "simplify" not in msg:
+            raise
+        logger.debug(
+            "  graph_from_place 2.0+ raised TypeError (%s); "
+            "retrying with legacy 1.x signature.", exc,
+        )
+    kwargs["retain_all"] = False
+    G = ox.graph_from_place(place, **kwargs)
+    logger.debug("  graph_from_place: used legacy 1.x signature.")
+    return G
 
 
 def _graph_from_address_compat(
@@ -644,6 +677,77 @@ def get_network(location: str, dist: int = 3_000) -> nx.MultiDiGraph:
     return G
 
 
+def get_network_from_place(
+    place: str,
+    which_result: Optional[int] = None,
+) -> nx.MultiDiGraph:
+    """
+    Download an OSM 'all' network for a named *place* and return its
+    Largest Strongly Connected Component (LSCC).
+
+    Use this when you have a place name (e.g. "Dnipro, Ukraine") rather
+    than an address + radius.  Tag retention is configured automatically
+    so highway, access, oneway, and bicycle (and other modal tags) are
+    kept on every edge.
+
+    Parameters
+    ----------
+    place         : str   Nominatim query string (place name, city, region).
+    which_result  : int, optional
+                    Which Nominatim result to use (1-based).  None = default.
+
+    Returns
+    -------
+    nx.MultiDiGraph  — LSCC-pruned, ready for add_travel_times().
+    """
+    _configure_osmnx_tags()
+
+    logger.info(
+        "get_network_from_place: downloading OSM 'all' graph — place='%s', "
+        "OSMnx=%s", place, _OSMNX_VERSION,
+    )
+
+    try:
+        G_raw = _graph_from_place_compat(place, network_type="all", which_result=which_result)
+    except Exception as exc:
+        logger.error(
+            "graph_from_place failed for '%s' (OSMnx %s): %s",
+            place, _OSMNX_VERSION, exc,
+        )
+        raise
+
+    logger.info(
+        "  Raw graph: %d nodes, %d edges",
+        G_raw.number_of_nodes(), G_raw.number_of_edges(),
+    )
+
+    if G_raw.number_of_nodes() == 0:
+        raise RuntimeError(
+            f"OSMnx returned an empty graph for '{place}'.  "
+            "Try a different place name or check Nominatim coverage."
+        )
+
+    try:
+        G = _largest_strongly_connected_component(G_raw)
+    except Exception as exc:
+        logger.error(
+            "LSCC extraction failed (OSMnx %s): %s — returning raw graph.",
+            _OSMNX_VERSION, exc,
+        )
+        G = G_raw
+
+    if G.number_of_nodes() == 0:
+        raise RuntimeError(
+            f"After LSCC pruning the graph for '{place}' is empty."
+        )
+
+    logger.info(
+        "  Final graph: %d nodes, %d edges (strongly_connected=%s)",
+        G.number_of_nodes(), G.number_of_edges(), nx.is_strongly_connected(G),
+    )
+    return G
+
+
 def add_travel_times(G: nx.MultiDiGraph) -> dict[str, nx.MultiDiGraph]:
     """
     Build three independent mode-specific copies of *G* and stamp every edge
@@ -652,28 +756,20 @@ def add_travel_times(G: nx.MultiDiGraph) -> dict[str, nx.MultiDiGraph]:
 
     Modal logic summary
     ────────────────────
-    Each mode has a base speed (SPEED_KMH) and OSM tag rules that either
-    block the edge entirely (travel_time = PENALTY = 1e9 s) or apply a
-    speed multiplier.  Full rule table:
+    Car: footway, steps, pedestrian, or motor_vehicle=no → PENALTY (impassable).
+    Bike: cycleway/path fully accessible; one-way reversed edge allowed only if
+          bicycle=two_way or oneway:bicycle=no or cycleway=opposite*.
+    Walk: all edges accessible; highway=steps gets 50% speed penalty.
 
     Edge characteristic            drive        bike         walk
     ─────────────────────────────  ───────────  ───────────  ────────────
-    highway=footway                PENALTY      passable     passable
-    highway=path                   PENALTY      passable*    passable
-    highway=pedestrian             PENALTY      passable     passable
-    highway=steps                  PENALTY      PENALTY      x0.5 speed
-    highway=cycleway               passable     passable     passable
-    highway=bridleway              PENALTY      passable     passable
-    motor_vehicle=no               PENALTY      passable     passable
-    motor_vehicle=destination      PENALTY      passable     passable
-    access=private (no mv ovrd)    PENALTY      passable     PENALTY
-    bicycle=no / dismount          —            PENALTY      —
-    bicycle=yes/designated/…       —            passable     —
-    foot=no / private              —            —            PENALTY
-    oneway reversed edge (bike)    —            PENALTY**    passable
-
-    *  path + bicycle=no -> PENALTY for bike
-    ** unless oneway:bicycle=no / cycleway=opposite* is tagged
+    highway=footway               PENALTY      passable      passable
+    highway=steps                 PENALTY      PENALTY      50% speed
+    highway=pedestrian            PENALTY      passable      passable
+    motor_vehicle=no              PENALTY      passable      passable
+    highway=cycleway / path       passable     passable      passable
+    oneway reversed (bike)        —            PENALTY*      passable
+    * unless bicycle=two_way / oneway:bicycle=no / cycleway=opposite*
 
     Sentinel value
     ──────────────
@@ -686,7 +782,9 @@ def add_travel_times(G: nx.MultiDiGraph) -> dict[str, nx.MultiDiGraph]:
     -------
     dict[str, nx.MultiDiGraph]   keys: "drive", "bike", "walk"
         Three independent deep copies of G, each with modal travel_time
-        stamped on every edge.
+        stamped on every edge.  For a single graph with three weight
+        attributes use add_travel_times_to_single_graph() and pass
+        weight="travel_time_drive" (or _bike / _walk) to the route solver.
     """
     mode_graphs: dict[str, nx.MultiDiGraph] = {}
 
@@ -731,6 +829,48 @@ def add_travel_times(G: nx.MultiDiGraph) -> dict[str, nx.MultiDiGraph]:
         mode_graphs[mode] = H
 
     return mode_graphs
+
+
+def add_travel_times_to_single_graph(G: nx.MultiDiGraph) -> nx.MultiDiGraph:
+    """
+    Add three mode-specific travel-time attributes to every edge of *G*
+    (in place on a copy), so the route solver can use one graph with
+    weight="travel_time_drive" | "travel_time_bike" | "travel_time_walk".
+
+    Same modal logic as add_travel_times(); use this when you prefer one
+    graph and three weight attributes over three separate graph copies.
+
+    Parameters
+    ----------
+    G : nx.MultiDiGraph  — LSCC-pruned graph from get_network() or
+                           get_network_from_place().
+
+    Returns
+    -------
+    nx.MultiDiGraph  — Copy of G with each edge having:
+        travel_time_drive, travel_time_bike, travel_time_walk (seconds).
+    """
+    H = G.copy()
+    speed_ms = {
+        "drive": SPEED_KMH["drive"] * 1_000.0 / 3_600.0,
+        "bike":  SPEED_KMH["bike"]  * 1_000.0 / 3_600.0,
+        "walk":  SPEED_KMH["walk"]  * 1_000.0 / 3_600.0,
+    }
+    for u, v, key, data in H.edges(keys=True, data=True):
+        H[u][v][key]["travel_time_drive"] = _compute_travel_time(
+            data, "drive", speed_ms["drive"]
+        )
+        H[u][v][key]["travel_time_bike"] = _compute_travel_time(
+            data, "bike", speed_ms["bike"]
+        )
+        H[u][v][key]["travel_time_walk"] = _compute_travel_time(
+            data, "walk", speed_ms["walk"]
+        )
+    logger.info(
+        "  Single graph: added travel_time_drive, travel_time_bike, "
+        "travel_time_walk to %d edges.", H.number_of_edges(),
+    )
+    return H
 
 
 def nearest_node(G: nx.MultiDiGraph, lat: float, lon: float) -> int:
