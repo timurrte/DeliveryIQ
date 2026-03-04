@@ -50,10 +50,10 @@ logging.basicConfig(level=logging.INFO)
 # ══════════════════════════════════════════════════════════════════════════════
 #  CITY LOCK  — change this one line to re-scope the whole app
 # ══════════════════════════════════════════════════════════════════════════════
-DEFAULT_CITY = "Dnipro, Ukraine"
+DEFAULT_CITY = "Milan, Italy"
 
 CITY_CENTRES: dict[str, tuple[float, float]] = {
-    "Dnipro, Ukraine": (48.4639, 35.0480),
+    "Milan, Italy":    (45.4654,  9.1859),
     "London, UK":      (51.5074, -0.1278),
     "Paris, France":   (48.8566,  2.3522),
     "Berlin, Germany": (52.5200, 13.4050),
@@ -311,8 +311,19 @@ def cached_network(city: str, radius: int):
 
 
 @st.cache_resource(show_spinner=False)
-def cached_mode_graphs(_G):
-    return add_travel_times(_G)
+def cached_mode_graphs(city: str, radius: int):
+    """
+    Build travel-time graphs for all three modes, keyed by (city, radius).
+
+    WHY not cached_mode_graphs(_G):
+    Streamlit excludes underscore-prefixed parameters from the cache hash.
+    The old `_G` signature meant this function was called ONCE ever — all
+    subsequent calls returned stale mode-graphs built from the first graph
+    object regardless of city/radius changes.  That caused every address to
+    snap to the same node as the original graph's centre.
+    """
+    G = cached_network(city, radius)
+    return add_travel_times(G)
 
 
 def leg_dist(G, path):
@@ -330,19 +341,33 @@ def n_coords(G, n):
 
 def run_optimization(depot, stops, city, radius, tsp_method):
     """
-    Full pipeline with all v3.1 safety fixes applied:
-      1. OSM download → LSCC pruning (inside get_network)
-      2. Node snapping happens AFTER pruning so all node_ids are valid
-      3. Distance matrix uses per-pair nx.shortest_path_length with PENALTY fallback
-      4. Reachability audit runs before TSP; unreachable stops are surfaced to the UI
-      5. TSP method defaults to 2-opt (safe with PENALTY weights)
+    Full optimization pipeline — v3.2.
+
+    Fixes applied in this version
+    ──────────────────────────────
+    1. SNAP LOGGING  — every address, its (lat, lon), and its resolved
+       node ID are printed to the Python logger at INFO level before any
+       matrix work begins.  This makes it immediately visible in the
+       terminal when two addresses collapse to the same node.
+
+    2. DEDUPLICATION — after snapping, duplicate node IDs are removed
+       from all_nodes using dict.fromkeys() which preserves insertion
+       order (depot stays at index 0).  The labels dict is rebuilt so
+       colliding stops share a single merged label.  The UI receives a
+       named warning for every collision.
+
+    3. FIXED MODE-GRAPH CACHE — cached_mode_graphs() is now keyed by
+       (city, radius) instead of the graph object.  The old `_G` parameter
+       name bypassed Streamlit's cache hash so stale mode-graphs from a
+       previous city/radius were silently reused, causing every nearest-node
+       call to return the same node from the old graph's bounding area.
 
     Returns (results, mode_graphs, warnings_list)
     """
     prog = st.empty()
-    warnings_out: list[str] = []  # collects human-readable warnings for the UI
+    warnings_out: list[str] = []
 
-    def s(msg, done=False):
+    def status(msg: str, done: bool = False) -> None:
         icon = "✅" if done else "⏳"
         prog.markdown(
             f'<p style="color:#64748b;font-size:.83rem">{icon} {msg}</p>',
@@ -350,19 +375,21 @@ def run_optimization(depot, stops, city, radius, tsp_method):
         )
 
     # ── Step 1: Download OSM + LSCC pruning ──────────────────────────────────
-    s("Downloading OSM network (largest strongly-connected component)…")
+    status("Downloading OSM network (largest strongly-connected component)…")
     G_raw = cached_network(city, radius)
     summary = graph_summary(G_raw)
-    s(
+    status(
         f"Network ready — {summary['nodes']:,} nodes, {summary['edges']:,} edges "
         f"({'✅ strongly connected' if summary['strongly_connected'] else '⚠️ not fully connected'})",
         done=True,
     )
 
-    # ── Step 2: Snap AFTER pruning (critical ordering) ────────────────────────
-    # nearest_node() is used for typed/geocoded addresses (always in-bounds).
-    # nearest_node_safe() is used for map-click coordinates (may be out-of-bounds).
-    s("Snapping addresses to road nodes…")
+    # ── Step 2: Snap every address to its nearest OSM node ───────────────────
+    # Snapping happens AFTER get_network() so every node_id is guaranteed
+    # to exist in the LSCC-pruned graph.
+    # nearest_node()      — for typed/geocoded addresses (always in-bounds)
+    # nearest_node_safe() — for map-click coordinates (may be out-of-bounds)
+    status("Snapping addresses to road nodes…")
     snap_errors: list[str] = []
 
     try:
@@ -371,63 +398,151 @@ def run_optimization(depot, stops, city, radius, tsp_method):
             if depot.source == "map_click"
             else nearest_node(G_raw, depot.lat, depot.lon)
         )
-    except ValueError as e:
-        snap_errors.append(f"Depot: {e}")
+    except ValueError as exc:
+        snap_errors.append(f"Depot: {exc}")
 
-    for i, stop in enumerate(stops, 1):
+    for idx, stop in enumerate(stops, 1):
         try:
             stop.node_id = (
                 nearest_node_safe(G_raw, stop.lat, stop.lon)
                 if stop.source == "map_click"
                 else nearest_node(G_raw, stop.lat, stop.lon)
             )
-        except ValueError as e:
-            snap_errors.append(f"Stop #{i} ({stop.address[:40]}…): {e}")
-            stop.node_id = None  # mark as unsnappable
+        except ValueError as exc:
+            snap_errors.append(f"Stop #{idx} ({stop.address[:40]}…): {exc}")
+            stop.node_id = None
 
-    if snap_errors:
-        for err in snap_errors:
-            warnings_out.append(f"⚠️ Out-of-bounds click ignored — {err}")
+    for err in snap_errors:
+        warnings_out.append(f"⚠️ Out-of-bounds address skipped — {err}")
 
-    # Filter out stops that failed to snap
-    valid_stops = [st for st in stops if st.node_id is not None]
+    # ── Step 2a: DEBUG — log every snap result to the terminal ───────────────
+    # This is the primary diagnostic tool when all addresses map to the same
+    # node: run `streamlit run app.py` in a terminal and watch the output.
+    logging.getLogger(__name__).info(
+        "=== NODE SNAP REPORT (city=%s, radius=%d m) ===", city, radius
+    )
+    logging.getLogger(__name__).info(
+        "  DEPOT  lat=%.6f  lon=%.6f  →  node_id=%s  [%s]",
+        depot.lat, depot.lon, depot.node_id, depot.address[:60],
+    )
+    for idx, stop in enumerate(stops, 1):
+        logging.getLogger(__name__).info(
+            "  STOP #%d  lat=%.6f  lon=%.6f  →  node_id=%s  [%s]",
+            idx, stop.lat, stop.lon, stop.node_id, stop.address[:60],
+        )
+
+    # Print to stdout as well so it is visible even when the log level
+    # is set above INFO (e.g. in production deployments).
+    print("\n" + "=" * 60)
+    print(f"NODE SNAP REPORT  city={city!r}  radius={radius}m")
+    print("=" * 60)
+    print(f"  DEPOT  ({depot.lat:.6f}, {depot.lon:.6f})  →  {depot.node_id}  [{depot.address[:55]}]")
+    for idx, stop in enumerate(stops, 1):
+        marker = "⚠️ NONE" if stop.node_id is None else str(stop.node_id)
+        print(f"  STOP #{idx}  ({stop.lat:.6f}, {stop.lon:.6f})  →  {marker}  [{stop.address[:55]}]")
+    print("=" * 60 + "\n")
+
+    # ── Step 2b: Filter unsnappable stops ────────────────────────────────────
+    valid_stops = [s for s in stops if s.node_id is not None]
     if len(valid_stops) < len(stops):
         skipped = len(stops) - len(valid_stops)
         warnings_out.append(
-            f"⚠️ {skipped} stop(s) were outside the graph area and will be skipped."
+            f"⚠️ {skipped} stop(s) could not be snapped to the road network "
+            f"and will be skipped."
         )
 
     if depot.node_id is None:
         raise RuntimeError(
-            "Depot could not be snapped to the road network — it may be outside "
-            f"the {radius} m download radius.  Try increasing the radius."
+            "Depot could not be snapped to the road network.  "
+            f"It may be outside the {radius} m download radius — "
+            "try increasing the network radius in Settings."
         )
-    if len(valid_stops) == 0:
+    if not valid_stops:
         raise RuntimeError(
             "No delivery stops could be snapped to the road network.  "
             "All stops are outside the downloaded graph area."
         )
 
-    s(f"Snapped depot + {len(valid_stops)} stop(s)", done=True)
+    # ── Step 2c: Build raw node list and detect duplicate snaps ──────────────
+    # Two addresses are "co-located" when Nominatim geocodes them to the same
+    # (lat, lon) — e.g. a vague query returns the city centroid — and both
+    # therefore snap to the same OSM node.  We:
+    #   a) warn the user by name for each collision
+    #   b) deduplicate all_nodes so build_distance_matrix never sees
+    #      src==dst for what should be two different stops (which produces
+    #      a 0.0 s cost and makes the whole route cost 0.0 s)
+    #   c) merge their labels so the leg table still shows both addresses
 
-    all_nodes = [depot.node_id] + [st.node_id for st in valid_stops]
-    labels = {depot.node_id: "Depot"}
-    for i, st_ in enumerate(valid_stops, 1):
-        labels[st_.node_id] = f"Stop #{i} ({st_.address[:30]})"
+    # Map: node_id → list of human labels that share it
+    node_label_map: dict[int, list[str]] = {}
+    node_label_map[depot.node_id] = ["Depot"]
+    for idx, stop in enumerate(valid_stops, 1):
+        short = stop.address[:30]
+        lbl = f"Stop #{idx} ({short})"
+        node_label_map.setdefault(stop.node_id, []).append(lbl)
+
+    # Report collisions
+    for node_id, lbls in node_label_map.items():
+        if len(lbls) > 1:
+            collision_str = " + ".join(lbls)
+            msg = (
+                f"⚠️ Node collision: {collision_str} all snap to OSM node "
+                f"{node_id}.  These addresses are too close together to be "
+                f"distinguished on the road network (or Nominatim returned "
+                f"the same coordinates for both).  They will be treated as a "
+                f"single stop."
+            )
+            warnings_out.append(msg)
+            logging.getLogger(__name__).warning(
+                "NODE COLLISION: node=%d  labels=%s", node_id, lbls
+            )
+            print(f"⚠️  {msg}")
+
+    # Deduplicated node list — dict.fromkeys preserves insertion order,
+    # guaranteeing depot stays at index 0.
+    raw_nodes  = [depot.node_id] + [s.node_id for s in valid_stops]
+    unique_nodes: list[int] = list(dict.fromkeys(raw_nodes))
+
+    # Merged labels: if two stops share a node, join their names
+    labels: dict[int, str] = {
+        node_id: " & ".join(lbls)
+        for node_id, lbls in node_label_map.items()
+    }
+
+    n_unique = len(unique_nodes)
+    n_raw    = len(raw_nodes)
+    status(
+        f"Snapped {n_raw} addresses → {n_unique} unique node(s)"
+        + (f" ({n_raw - n_unique} collision(s) merged)" if n_raw != n_unique else ""),
+        done=True,
+    )
+
+    if n_unique < 2:
+        raise RuntimeError(
+            f"After deduplication only {n_unique} unique road node(s) remain.  "
+            f"All addresses resolve to the same location — please use more "
+            f"specific street addresses, or increase the network radius."
+        )
 
     # ── Step 3: Build mode graphs ─────────────────────────────────────────────
-    s("Building travel-time graphs (drive / bike / walk)…")
-    mode_graphs = cached_mode_graphs(G_raw)
-    s("Mode graphs ready", done=True)
+    # Uses (city, radius) cache key — NOT _G — so the cache correctly
+    # invalidates when the city or radius changes.
+    status("Building travel-time graphs (drive / bike / walk)…")
+    mode_graphs = cached_mode_graphs(city, radius)
+    status("Mode graphs ready", done=True)
 
     # ── Step 4: Distance matrix + reachability audit ──────────────────────────
-    results = {}
+    results: dict[str, ModeResult] = {}
     for mode, G_mode in mode_graphs.items():
-        s(f"[{mode}] Building distance matrix…")
-        matrix = build_distance_matrix(G_mode, all_nodes, weight="travel_time")
+        status(f"[{mode}] Building distance matrix ({n_unique}×{n_unique})…")
 
-        # Run audit and surface any unreachable stops
-        problems = audit_reachability(matrix, all_nodes, labels)
+        # build_distance_matrix receives UNIQUE nodes only.
+        # Passing duplicates would cause every duplicate pair to evaluate as
+        # src==dst → cost 0.0 → total route cost 0.0 s.
+        matrix = build_distance_matrix(G_mode, unique_nodes, weight="travel_time")
+
+        # Surface unreachable stops by name
+        problems = audit_reachability(matrix, unique_nodes, labels)
         for problem in problems:
             msg = (
                 f"⚠️ [{mode}] {problem.label} has connectivity issues — "
@@ -436,23 +551,24 @@ def run_optimization(depot, stops, city, radius, tsp_method):
             if msg not in warnings_out:
                 warnings_out.append(msg)
 
-        # ── Step 5: Solve TSP ─────────────────────────────────────────────────
-        s(f"[{mode}] Solving TSP ({tsp_method})…")
-        tsp_route, total_s = solve_tsp(all_nodes, matrix, method=tsp_method)
+        # ── Step 5: TSP ───────────────────────────────────────────────────────
+        status(f"[{mode}] Solving TSP ({tsp_method}, {n_unique} nodes)…")
+        tsp_route, total_s = solve_tsp(unique_nodes, matrix, method=tsp_method)
 
         if total_s >= ROUTE_PENALTY:
             warnings_out.append(
-                f"⚠️ [{mode}] Route cost is unrealistically high — "
-                f"one or more stops are unreachable via this mode."
+                f"⚠️ [{mode}] Route cost is ≥ PENALTY — "
+                f"at least one stop is unreachable via this mode."
             )
 
         full_route = reconstruct_full_route(G_mode, tsp_route, weight="travel_time")
 
-        # ── Build per-leg breakdown ───────────────────────────────────────────
-        legs, cum = [], 0.0
-        for i in range(len(tsp_route) - 1):
-            src, dst = tsp_route[i], tsp_route[i + 1]
-            t = matrix.get((src, dst), ROUTE_PENALTY)
+        # ── Per-leg breakdown ─────────────────────────────────────────────────
+        legs: list[LegInfo] = []
+        cum = 0.0
+        for leg_idx in range(len(tsp_route) - 1):
+            src, dst = tsp_route[leg_idx], tsp_route[leg_idx + 1]
+            t    = matrix.get((src, dst), ROUTE_PENALTY)
             path = get_full_path(G_mode, src, dst, weight="travel_time")
             dist = leg_dist(G_mode, path)
             cum += t
@@ -463,7 +579,7 @@ def run_optimization(depot, stops, city, radius, tsp_method):
             ))
 
         results[mode] = ModeResult(mode, tsp_route, full_route, total_s, legs)
-        s(f"[{mode}] done — {hms(total_s)}", done=True)
+        status(f"[{mode}] done — {hms(total_s)}", done=True)
 
     prog.empty()
     return results, mode_graphs, warnings_out

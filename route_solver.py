@@ -146,97 +146,187 @@ def build_distance_matrix(
     """
     Compute all-pairs shortest-path travel times (seconds) using Dijkstra.
 
-    Design decisions
-    ────────────────
-    • We call `nx.shortest_path_length(G, src, dst, weight=weight)` for
-      every (src, dst) pair individually rather than using the
-      single-source variant.  This is slightly slower for large graphs
-      but makes the per-pair exception handling trivial and guarantees
-      that a missing path is always caught — even if the node exists in
-      the graph but lies in a disconnected component that slipped through
-      the LSCC filter (e.g. when the user manually overrides the radius).
+    Input deduplication (defence-in-depth)
+    ───────────────────────────────────────
+    The function immediately deduplicates *nodes* using dict.fromkeys(),
+    which preserves insertion order (Python 3.7+) so the depot stays at
+    index 0.  This is a safety net on top of the deduplication performed
+    in run_optimization().
 
-    • On `nx.NetworkXNoPath` we insert PENALTY (1e9 s ≈ 277 hours) so
-      the TSP solver still receives a finite, complete matrix.  PENALTY
-      is large enough that no optimal tour will choose to traverse the
-      missing leg, but finite so the solver never crashes.
+    WHY deduplication is critical
+    ──────────────────────────────
+    If two or more OSM node IDs in *nodes* are identical (because two
+    addresses geocoded to the same lat/lon and snapped to the same road
+    node), the inner loop evaluates ``src == dst`` for those pairs and
+    writes ``0.0`` into the matrix.  The TSP then accumulates
+    0 + 0 + … = 0.0 s total cost.  That is the sole cause of the
+    "every address maps to node 7651745427, route cost = 0.0 s" bug.
 
-    • On `nx.NodeNotFound` we raise a clear RuntimeError immediately —
-      this means a node_id that was snapped to the graph before SCC
-      pruning no longer exists in the pruned graph, which indicates a
-      bug in the snapping order (nodes should be snapped *after* pruning).
+    Deduplication turns [A, A, B, A, C] → [A, B, C] so every off-diagonal
+    pair (A,B), (A,C), (B,C) etc. is computed with a real Dijkstra path.
+
+    Debug logging
+    ─────────────
+    Every (src → dst) cost is logged at DEBUG level.  To see it, set the
+    log level to DEBUG before running:
+        import logging; logging.basicConfig(level=logging.DEBUG)
+    or start Streamlit with:
+        PYTHONPATH=. python -m streamlit run app.py --logger.level=debug
+
+    A compact summary line is also printed to stdout at INFO level — it
+    shows the original node count, the deduplicated count, and the count
+    of reachable vs penalty pairs, which is the first place to look when
+    diagnosing a 0.0 s route cost.
 
     Parameters
     ----------
     G      : weighted MultiDiGraph (output of add_travel_times)
-    nodes  : [depot_node_id, stop1_node_id, …]
-    weight : edge attribute to minimise (default "travel_time")
+    nodes  : ordered list  [depot_node_id, stop1_node_id, …]
+             duplicates are silently removed; depot stays first
+    weight : edge attribute to minimise (default ``"travel_time"``)
 
     Returns
     -------
-    dict[(src, dst) → float]
-    """
-    n = len(nodes)
-    logger.info("Building %d×%d distance matrix (weight='%s')…", n, n, weight)
-    matrix: dict[tuple[int, int], float] = {}
+    dict[(src_node_id, dst_node_id) → travel_time_seconds]
+        Keys cover every ordered pair in the deduplicated node list.
+        Diagonal entries (src == dst) are always 0.0.
+        Unreachable pairs carry PENALTY (1e9 s).
 
-    for src in nodes:
-        # Validate the source node exists before the inner loop
-        if src not in G:
+    Raises
+    ------
+    RuntimeError
+        If a node ID is absent from *G* (indicates snapping before LSCC
+        pruning — always snap *after* calling get_network()).
+    ValueError
+        If fewer than 2 unique nodes remain after deduplication.
+    """
+    # ── Step 1: Deduplicate while preserving order ────────────────────────────
+    n_raw = len(nodes)
+    unique_nodes: list[int] = list(dict.fromkeys(nodes))
+    n = len(unique_nodes)
+    n_dupes = n_raw - n
+
+    if n_dupes > 0:
+        # Log every duplicate so the terminal output reveals which addresses
+        # are collapsing to the same node.
+        seen: set[int] = set()
+        for pos, node_id in enumerate(nodes):
+            if node_id in seen:
+                logger.warning(
+                    "  build_distance_matrix: duplicate node %d at position %d "
+                    "removed.  Two or more addresses snapped to the same OSM "
+                    "node — check the NODE SNAP REPORT printed above for the "
+                    "specific lat/lon values.",
+                    node_id, pos,
+                )
+                print(
+                    f"  ⚠️  Duplicate node {node_id} at position {pos} removed "
+                    f"from distance matrix input."
+                )
+            seen.add(node_id)
+
+    if n < 2:
+        raise ValueError(
+            f"build_distance_matrix requires at least 2 unique nodes; "
+            f"got {n_raw} input node(s) that deduplicate to {n} unique node(s).  "
+            f"All delivery addresses have resolved to the same road node.  "
+            f"Use more specific street addresses (include building numbers), "
+            f"verify the city lock is correct, or increase the network radius."
+        )
+
+    logger.info(
+        "Building distance matrix: %d input node(s) → %d unique (weight='%s')…",
+        n_raw, n, weight,
+    )
+    print(
+        f"  Building {n}×{n} distance matrix"
+        + (f" ({n_dupes} duplicate(s) removed)" if n_dupes else "")
+        + f"  weight='{weight}'"
+    )
+
+    # ── Step 2: Validate every node exists in the graph ───────────────────────
+    # Do this up front (before the O(n²) Dijkstra loop) so the error fires
+    # immediately with a clear message rather than mid-way through the matrix.
+    for node_id in unique_nodes:
+        if node_id not in G:
             raise RuntimeError(
-                f"Node {src} is not present in the optimisation graph.  "
-                f"This usually means the node was snapped before the graph was "
-                f"pruned to its largest strongly connected component.  "
-                f"Re-snap all nodes after calling get_network()."
+                f"Node {node_id} is not present in the travel-time graph.  "
+                f"This means the address was snapped to an OSM node BEFORE "
+                f"the graph was pruned to its Largest Strongly Connected "
+                f"Component.  Always call nearest_node() / nearest_node_safe() "
+                f"using the graph returned by get_network(), not the raw download."
             )
 
-        for dst in nodes:
+    # ── Step 3: All-pairs Dijkstra ────────────────────────────────────────────
+    matrix: dict[tuple[int, int], float] = {}
+
+    for src in unique_nodes:
+        for dst in unique_nodes:
+            # Diagonal: a node's distance to itself is always 0.
             if src == dst:
                 matrix[(src, dst)] = 0.0
                 continue
 
-            if dst not in G:
-                raise RuntimeError(
-                    f"Destination node {dst} is not in the optimisation graph. "
-                    f"Same cause as above — re-snap after get_network()."
-                )
-
             try:
                 cost = nx.shortest_path_length(G, src, dst, weight=weight)
-                # Guard against a 0-cost path that still somehow slipped through
-                # (e.g. an edge whose travel_time was not stamped correctly).
-                if cost == 0.0 and src != dst:
+
+                # Guard: a 0.0 cost between two DIFFERENT nodes means the
+                # travel_time attribute was not stamped on the intermediate
+                # edges (add_travel_times() should prevent this, but defend).
+                if cost == 0.0:
                     logger.warning(
-                        "  Dijkstra returned 0.0 s between nodes %s and %s — "
-                        "the '%s' attribute may be missing on some edges. "
-                        "Inserting penalty weight.",
+                        "  Dijkstra: %s → %s returned 0.0 s — "
+                        "'%s' attribute missing on one or more edges.  "
+                        "Inserting PENALTY.",
                         src, dst, weight,
                     )
+                    print(
+                        f"  ⚠️  Dijkstra returned 0.0 s for {src}→{dst}.  "
+                        f"The '{weight}' edge attribute may be missing.  "
+                        f"PENALTY inserted."
+                    )
                     cost = PENALTY
+
                 matrix[(src, dst)] = float(cost)
+                logger.debug("    %s → %s : %.2f s", src, dst, cost)
 
             except nx.NetworkXNoPath:
-                # The two nodes are in the same graph but no directed path
-                # connects them.  This should not happen inside the LSCC but
-                # can occur if the user bumps the radius and fetches a
-                # partially-connected 'all' graph.
+                # Both nodes are in the same graph but no directed path joins
+                # them.  Inside the LSCC this should not happen; it can occur
+                # if the radius was manually overridden after snapping.
                 logger.warning(
-                    "  No directed path from %s to %s — inserting penalty weight.",
-                    src, dst,
+                    "  No directed path %s → %s — inserting PENALTY.", src, dst
                 )
                 matrix[(src, dst)] = PENALTY
 
             except nx.NodeNotFound as exc:
-                raise RuntimeError(f"Node lookup failed: {exc}") from exc
+                # Should never reach here after the validation loop above,
+                # but re-raise with context just in case.
+                raise RuntimeError(
+                    f"Node lookup failed during Dijkstra ({src} → {dst}): {exc}"
+                ) from exc
 
-    reachable_pairs  = sum(1 for v in matrix.values() if 0 < v < PENALTY)
-    penalty_pairs    = sum(1 for v in matrix.values() if v >= PENALTY)
-    diagonal_pairs   = n  # src == dst zeros
+    # ── Step 4: Summary ───────────────────────────────────────────────────────
+    reachable = sum(1 for (s, d), v in matrix.items() if s != d and v < PENALTY)
+    penalised = sum(1 for (s, d), v in matrix.items() if s != d and v >= PENALTY)
+    diagonal  = n
 
     logger.info(
-        "  Matrix complete — %d reachable pairs, %d penalty pairs, %d diagonal.",
-        reachable_pairs, penalty_pairs, diagonal_pairs,
+        "  Matrix complete — %d×%d — reachable=%d  penalty=%d  diagonal=%d",
+        n, n, reachable, penalised, diagonal,
     )
+    print(
+        f"  Matrix complete: {n}×{n}  |  "
+        f"reachable={reachable}  penalty={penalised}  diagonal={diagonal}"
+    )
+
+    if penalised > 0:
+        logger.warning(
+            "  %d off-diagonal pair(s) are unreachable (PENALTY weight).  "
+            "The reachability audit will identify the specific stop names.",
+            penalised,
+        )
+
     return matrix
 
 
