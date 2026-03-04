@@ -34,10 +34,13 @@ sys.path.insert(0, os.path.dirname(__file__))
 from graph_builder import (
     get_network, add_travel_times,
     nearest_node, nearest_node_safe,
+    distance_m_between_nodes,
+    nearest_car_accessible_node,
     graph_summary, SPEED_KMH,
 )
 from route_solver import (
     build_distance_matrix,
+    build_drive_matrix_hybrid,
     solve_tsp,
     reconstruct_full_route,
     get_full_path,
@@ -226,6 +229,8 @@ class ModeResult:
     full_route: list
     total_time_s: float
     legs: list = field(default_factory=list)
+    # For drive (hybrid last-meter): stops in visit order for map markers.
+    stop_visit_order: Optional[list] = None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -255,6 +260,7 @@ def _init():
         "opt_results": None,
         "opt_graphs": None,
         "opt_warnings": [],
+        "opt_car_unreachable": [],
     }
     for k, v in defs.items():
         if k not in st.session_state:
@@ -339,6 +345,10 @@ def n_coords(G, n):
     return G.nodes[n]["y"], G.nodes[n]["x"]
 
 
+# Hybrid last-meter: max walking distance from parked car to delivery (metres).
+LAST_METER_THRESHOLD_M: float = 100.0
+
+
 def run_optimization(depot, stops, city, radius, tsp_method):
     """
     Full optimization pipeline — v3.2.
@@ -362,7 +372,8 @@ def run_optimization(depot, stops, city, radius, tsp_method):
        previous city/radius were silently reused, causing every nearest-node
        call to return the same node from the old graph's bounding area.
 
-    Returns (results, mode_graphs, warnings_list)
+    Returns (results, mode_graphs, warnings_list, car_unreachable_notes).
+    car_unreachable_notes: addresses > 100 m from nearest car-accessible road.
     """
     prog = st.empty()
     warnings_out: list[str] = []
@@ -525,23 +536,107 @@ def run_optimization(depot, stops, city, radius, tsp_method):
         )
 
     # ── Step 3: Build mode graphs ─────────────────────────────────────────────
-    # Uses (city, radius) cache key — NOT _G — so the cache correctly
-    # invalidates when the city or radius changes.
     status("Building travel-time graphs (drive / bike / walk)…")
     mode_graphs = cached_mode_graphs(city, radius)
     status("Mode graphs ready", done=True)
 
-    # ── Step 4: Distance matrix + reachability audit ──────────────────────────
+    # ── Step 3b: Hybrid last-meter — dual-node mapping for car ─────────────────
+    # N_ped = current node_id (nearest in full graph). N_car = nearest car-accessible.
+    # d = distance(N_ped, N_car). If d > 100 m → car unreachable; else use N_car + walk time.
+    G_drive = mode_graphs["drive"]
+    walk_speed_ms = SPEED_KMH["walk"] * 1_000.0 / 3_600.0
+    car_unreachable_notes: list[str] = []
+    car_reachable: list[tuple[int, float, object, str]] = []  # (n_car, walk_time_s, stop, label)
+
+    for idx, stop in enumerate(valid_stops, 1):
+        n_ped = stop.node_id
+        n_car = nearest_car_accessible_node(G_drive, stop.lat, stop.lon)
+        d_m = distance_m_between_nodes(G_drive, n_ped, n_car)
+        short = stop.address[:30]
+        label = f"Stop #{idx} ({short})"
+        if d_m > LAST_METER_THRESHOLD_M:
+            car_unreachable_notes.append(
+                f"Address [{stop.address[:50]}{'…' if len(stop.address) > 50 else ''}] "
+                f"is {d_m:.0f} m from the nearest road and is inaccessible for vehicle delivery."
+            )
+        else:
+            walk_time_s = d_m / walk_speed_ms
+            car_reachable.append((n_car, walk_time_s, stop, label))
+
+    # Build drive labels (merge when multiple stops share same n_car)
+    labels_drive: dict[int, str] = {depot.node_id: "Depot"}
+    for (n_car, _wt, _stop, lbl) in car_reachable:
+        labels_drive[n_car] = labels_drive.get(n_car, "") + (" & " + lbl if n_car in labels_drive else lbl)
+    node_to_stops_drive: dict[int, list] = {}
+    for (n_car, _wt, stop, _lbl) in car_reachable:
+        node_to_stops_drive.setdefault(n_car, []).append(stop)
+
+    # ── Step 4: Distance matrix + TSP per mode ─────────────────────────────────
     results: dict[str, ModeResult] = {}
+
     for mode, G_mode in mode_graphs.items():
+        if mode == "drive":
+            # Hybrid last-meter: only car-reachable stops; cost = drive to N_car + walk d.
+            if len(car_reachable) < 1:
+                status("[drive] No car-reachable stops (all beyond 100 m) — skipping TSP")
+                results["drive"] = ModeResult(
+                    "drive",
+                    tsp_route=[depot.node_id, depot.node_id],
+                    full_route=[(depot.node_id, depot.node_id)],
+                    total_time_s=0.0,
+                    legs=[],
+                    stop_visit_order=[],
+                )
+                status("[drive] done — 0 stops", done=True)
+                continue
+            car_stops = [(n_car, wt) for (n_car, wt, _s, _l) in car_reachable]
+            status(f"[drive] Building hybrid matrix (depot + {len(car_stops)} stops, last-meter walk)…")
+            matrix_drive_idx, nodes_drive = build_drive_matrix_hybrid(
+                G_drive, depot.node_id, car_stops, weight="travel_time"
+            )
+            n_drive = len(nodes_drive)
+            indices_drive = list(range(n_drive))
+            labels_drive_list = ["Depot"] + [lbl for (_n, _w, _s, lbl) in car_reachable]
+            status(f"[drive] Solving TSP ({tsp_method}, {n_drive} nodes)…")
+            tsp_route_indices, total_s_d = solve_tsp(
+                indices_drive, matrix_drive_idx, method=tsp_method
+            )
+            tsp_route_d = [nodes_drive[i] for i in tsp_route_indices]
+            if total_s_d >= ROUTE_PENALTY:
+                warnings_out.append(
+                    "⚠️ [Car] Route cost is ≥ PENALTY — at least one stop unreachable."
+                )
+            full_route_d = reconstruct_full_route(G_drive, tsp_route_d, weight="travel_time")
+            legs_d = []
+            cum = 0.0
+            for leg_idx in range(len(tsp_route_d) - 1):
+                i, j = tsp_route_indices[leg_idx], tsp_route_indices[leg_idx + 1]
+                t = matrix_drive_idx.get((i, j), ROUTE_PENALTY)
+                path = get_full_path(
+                    G_drive, tsp_route_d[leg_idx], tsp_route_d[leg_idx + 1],
+                    weight="travel_time",
+                )
+                dist = leg_dist(G_drive, path)
+                cum += t
+                legs_d.append(LegInfo(
+                    labels_drive_list[i],
+                    labels_drive_list[j],
+                    dist, t, cum,
+                ))
+            # Route indices: 0 = depot, 1..n_drive-1 = stops; car_reachable[k] = (k+1)-th stop
+            stop_visit_order_d = [
+                car_reachable[i - 1][2] for i in tsp_route_indices[1:-1]
+            ]
+            results["drive"] = ModeResult(
+                "drive", tsp_route_d, full_route_d, total_s_d, legs_d,
+                stop_visit_order=stop_visit_order_d,
+            )
+            status(f"[drive] done — {hms(total_s_d)}", done=True)
+            continue
+
+        # Bike and Walk: same node set for all stops (matrix consistency).
         status(f"[{mode}] Building distance matrix ({n_unique}×{n_unique})…")
-
-        # build_distance_matrix receives UNIQUE nodes only.
-        # Passing duplicates would cause every duplicate pair to evaluate as
-        # src==dst → cost 0.0 → total route cost 0.0 s.
         matrix = build_distance_matrix(G_mode, unique_nodes, weight="travel_time")
-
-        # Surface unreachable stops by name
         problems = audit_reachability(matrix, unique_nodes, labels)
         for problem in problems:
             msg = (
@@ -550,25 +645,19 @@ def run_optimization(depot, stops, city, radius, tsp_method):
             )
             if msg not in warnings_out:
                 warnings_out.append(msg)
-
-        # ── Step 5: TSP ───────────────────────────────────────────────────────
         status(f"[{mode}] Solving TSP ({tsp_method}, {n_unique} nodes)…")
         tsp_route, total_s = solve_tsp(unique_nodes, matrix, method=tsp_method)
-
         if total_s >= ROUTE_PENALTY:
             warnings_out.append(
                 f"⚠️ [{mode}] Route cost is ≥ PENALTY — "
                 f"at least one stop is unreachable via this mode."
             )
-
         full_route = reconstruct_full_route(G_mode, tsp_route, weight="travel_time")
-
-        # ── Per-leg breakdown ─────────────────────────────────────────────────
-        legs: list[LegInfo] = []
+        legs = []
         cum = 0.0
         for leg_idx in range(len(tsp_route) - 1):
             src, dst = tsp_route[leg_idx], tsp_route[leg_idx + 1]
-            t    = matrix.get((src, dst), ROUTE_PENALTY)
+            t = matrix.get((src, dst), ROUTE_PENALTY)
             path = get_full_path(G_mode, src, dst, weight="travel_time")
             dist = leg_dist(G_mode, path)
             cum += t
@@ -577,12 +666,11 @@ def run_optimization(depot, stops, city, radius, tsp_method):
                 labels.get(dst, str(dst)),
                 dist, t, cum,
             ))
-
         results[mode] = ModeResult(mode, tsp_route, full_route, total_s, legs)
         status(f"[{mode}] done — {hms(total_s)}", done=True)
 
     prog.empty()
-    return results, mode_graphs, warnings_out
+    return results, mode_graphs, warnings_out, car_unreachable_notes
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -662,26 +750,36 @@ def build_result_map(mode_graphs, results, depot, stops) -> folium.Map:
         icon=folium.Icon(color="green", icon="home", prefix="fa"),
     ).add_to(fmap)
 
-    # Stops in drive-route order — RED numbered
-    drive_route = results["drive"].tsp_route
-    seen, ordered = set(), []
-    for n in drive_route[1:-1]:
-        if n not in seen:
-            seen.add(n); ordered.append(n)
-
-    node_to_stop = {s.node_id: s for s in stops}
+    # Stops in route order — RED numbered (drive uses stop_visit_order when set)
+    drive_res = results["drive"]
     stop_layer = folium.FeatureGroup(name="📍 Delivery stops", show=True)
-    for idx, node in enumerate(ordered, 1):
-        s = node_to_stop.get(node)
-        lat = s.lat if s else n_coords(G_ref, node)[0]
-        lon = s.lon if s else n_coords(G_ref, node)[1]
-        addr = s.address if s else f"Node {node}"
-        folium.Marker(
-            location=[lat, lon],
-            tooltip=f"<b>Stop #{idx}</b>",
-            popup=folium.Popup(f"<b>Stop #{idx}</b><br>{addr}", max_width=270),
-            icon=_stop_div_icon(idx),
-        ).add_to(stop_layer)
+    if getattr(drive_res, "stop_visit_order", None):
+        for idx, s in enumerate(drive_res.stop_visit_order, 1):
+            folium.Marker(
+                location=[s.lat, s.lon],
+                tooltip=f"<b>Stop #{idx}</b>",
+                popup=folium.Popup(f"<b>Stop #{idx}</b><br>{s.address}", max_width=270),
+                icon=_stop_div_icon(idx),
+            ).add_to(stop_layer)
+    else:
+        drive_route = drive_res.tsp_route
+        seen, ordered = set(), []
+        for n in drive_route[1:-1]:
+            if n not in seen:
+                seen.add(n)
+                ordered.append(n)
+        node_to_stop = {s.node_id: s for s in stops}
+        for idx, node in enumerate(ordered, 1):
+            s = node_to_stop.get(node)
+            lat = s.lat if s else n_coords(G_ref, node)[0]
+            lon = s.lon if s else n_coords(G_ref, node)[1]
+            addr = s.address if s else f"Node {node}"
+            folium.Marker(
+                location=[lat, lon],
+                tooltip=f"<b>Stop #{idx}</b>",
+                popup=folium.Popup(f"<b>Stop #{idx}</b><br>{addr}", max_width=270),
+                icon=_stop_div_icon(idx),
+            ).add_to(stop_layer)
     stop_layer.add_to(fmap)
 
     folium.LayerControl(collapsed=False, position="topleft").add_to(fmap)
@@ -981,10 +1079,13 @@ if st.session_state.opt_results is None:
 if run_btn and can_run:
     st.markdown('<div class="sec-head">⏳ Running Optimization</div>', unsafe_allow_html=True)
     try:
-        res, mg, warnings = run_optimization(depot, stops, city, radius, tsp_method)
+        res, mg, warnings, car_unreachable = run_optimization(
+            depot, stops, city, radius, tsp_method
+        )
         st.session_state.opt_results  = res
         st.session_state.opt_graphs   = mg
         st.session_state.opt_warnings = warnings
+        st.session_state.opt_car_unreachable = car_unreachable
         st.rerun()
     except Exception as e:
         st.error(f"Optimization failed: {e}")
@@ -998,6 +1099,7 @@ if st.session_state.opt_results is not None:
     results     = st.session_state.opt_results
     mode_graphs = st.session_state.opt_graphs
     warnings    = st.session_state.get("opt_warnings", [])
+    car_unreachable_notes = st.session_state.get("opt_car_unreachable", [])
     best_mode   = min(results, key=lambda m: results[m].total_time_s)
 
     # ── Warnings panel ────────────────────────────────────────────────────────
@@ -1045,6 +1147,13 @@ if st.session_state.opt_results is not None:
     for tab, mode in zip([t1, t2, t3], ["drive", "bike", "walk"]):
         with tab:
             res   = results[mode]
+            if mode == "drive" and car_unreachable_notes:
+                st.markdown(
+                    '<div class="warn-box"><strong>⚠️ Unreachable by car (last-meter)</strong><br>'
+                    + "<br>".join(car_unreachable_notes)
+                    + "</div>",
+                    unsafe_allow_html=True,
+                )
             tdist = sum(l.distance_m for l in res.legs)
             c1, c2, c3 = st.columns(3)
             c1.metric("Total Time",     hms(res.total_time_s))
@@ -1063,5 +1172,8 @@ if st.session_state.opt_results is not None:
         </div>""", unsafe_allow_html=True)
     with cb:
         if st.button("🗑 Clear & Restart", use_container_width=True):
-            st.session_state.update(opt_results=None, opt_graphs=None, opt_warnings=[])
+            st.session_state.update(
+                opt_results=None, opt_graphs=None, opt_warnings=[],
+                opt_car_unreachable=[],
+            )
             st.rerun()

@@ -873,6 +873,119 @@ def add_travel_times_to_single_graph(G: nx.MultiDiGraph) -> nx.MultiDiGraph:
     return H
 
 
+def distance_m_between_nodes(
+    G: nx.MultiDiGraph,
+    node_a: int,
+    node_b: int,
+) -> float:
+    """
+    Return the great-circle distance in metres between two graph nodes.
+
+    Uses OSMnx's great_circle when available; otherwise a haversine fallback.
+    """
+    try:
+        y1, x1 = G.nodes[node_a]["y"], G.nodes[node_a]["x"]
+        y2, x2 = G.nodes[node_b]["y"], G.nodes[node_b]["x"]
+    except KeyError as e:
+        raise ValueError(f"Node missing x/y: {e}") from e
+    for fn_name in ("great_circle", "great_circle_vec"):
+        fn = getattr(getattr(ox, "distance", None), fn_name, None)
+        if fn is not None:
+            try:
+                return float(fn(y1, x1, y2, x2))
+            except (TypeError, ValueError):
+                pass
+    # OSMnx distance submodule may be missing or use different signature
+    # Fallback: haversine (metres)
+    R = 6_371_000.0
+    phi1, phi2 = math.radians(y1), math.radians(y2)
+    dphi = math.radians(y2 - y1)
+    dlam = math.radians(x2 - x1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
+    return 2 * R * math.asin(math.sqrt(min(1.0, a)))
+
+
+def nearest_car_accessible_node(
+    G_drive: nx.MultiDiGraph,
+    lat: float,
+    lon: float,
+    *,
+    weight: str = "travel_time",
+    penalty: float = PENALTY,
+) -> int:
+    """
+    Return the nearest node to (lat, lon) that is car-accessible (has at least
+    one incident edge with travel_time < penalty).
+
+    Used for hybrid last-meter logic: N_car is the nearest drive node for
+    the driver to park; the pedestrian node N_ped is from the full graph.
+    """
+    best_node: Optional[int] = None
+    best_dist: float = float("inf")
+
+    def _point_to_node_dist_m(ny: float, nx_: float) -> float:
+        for fn_name in ("great_circle", "great_circle_vec"):
+            fn = getattr(getattr(ox, "distance", None), fn_name, None)
+            if fn is not None:
+                try:
+                    return float(fn(lat, lon, ny, nx_))
+                except (TypeError, ValueError, AttributeError):
+                    pass
+        # Fallback: haversine (metres)
+        R = 6_371_000.0
+        phi1, phi2 = math.radians(lat), math.radians(ny)
+        dphi = math.radians(ny - lat)
+        dlam = math.radians(lon - nx_)
+        a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
+        return 2 * R * math.asin(math.sqrt(min(1.0, a)))
+
+    try:
+        nn = ox.nearest_nodes(G_drive, X=lon, Y=lat)
+        if _node_car_accessible(G_drive, nn, weight=weight, penalty=penalty):
+            return nn
+    except (TypeError, AttributeError):
+        pass
+
+    # Fallback: scan car-accessible nodes and minimise distance from (lat, lon)
+    for node in G_drive.nodes():
+        if not _node_car_accessible(G_drive, node, weight=weight, penalty=penalty):
+            continue
+        try:
+            ny, nx_ = G_drive.nodes[node]["y"], G_drive.nodes[node]["x"]
+        except KeyError:
+            continue
+        d = _point_to_node_dist_m(ny, nx_)
+        if d < best_dist:
+            best_dist = d
+            best_node = node
+
+    if best_node is None:
+        # No car-accessible node found; return geometric nearest (caller may treat as unreachable)
+        return _nearest_nodes_compat(G_drive, lon, lat)
+    return best_node
+
+
+def _node_car_accessible(
+    G: nx.MultiDiGraph,
+    node: int,
+    *,
+    weight: str = "travel_time",
+    penalty: float = PENALTY,
+) -> bool:
+    """True if node has at least one incident edge with weight < penalty."""
+    for u, v, key, data in G.edges(node, keys=True, data=True):
+        if u != node and v != node:
+            continue
+        w = data.get(weight)
+        if w is not None and isinstance(w, (int, float)) and float(w) < penalty:
+            return True
+    for u, v, key, data in G.in_edges(node, keys=True, data=True):
+        w = data.get(weight)
+        if w is not None and isinstance(w, (int, float)) and float(w) < penalty:
+            return True
+    return False
+
+
 def nearest_node(G: nx.MultiDiGraph, lat: float, lon: float) -> int:
     """
     Snap a geocoded (lat, lon) coordinate to the nearest OSM node in *G*.

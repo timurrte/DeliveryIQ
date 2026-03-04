@@ -330,6 +330,67 @@ def build_distance_matrix(
     return matrix
 
 
+def build_drive_matrix_hybrid(
+    G_drive: nx.MultiDiGraph,
+    depot_node: int,
+    car_stops: list[tuple[int, float]],
+    *,
+    weight: str = "travel_time",
+) -> tuple[dict[tuple[int, int], float], list[int]]:
+    """
+    Build the drive-mode distance matrix for hybrid last-meter logic.
+
+    Each car-reachable stop is represented by its N_car (nearest car-accessible
+    node). The cost to reach stop j is: drive time to N_car_j + walk_time_j.
+    Matrix is keyed by (i, j) indices so duplicate N_car nodes (same parking
+    spot for multiple stops) get distinct columns with different walk times.
+
+    Parameters
+    ----------
+    G_drive    : Drive graph (travel_time on edges).
+    depot_node : Single depot node ID.
+    car_stops  : List of (n_car, walk_time_s) for each car-reachable stop.
+
+    Returns
+    -------
+    matrix     : dict[(i, j), float] — i, j are indices into nodes_drive.
+    nodes_drive: [depot_node, n_car_1, n_car_2, …] — node IDs for route/labels.
+    """
+    nodes_drive: list[int] = [depot_node] + [n_car for (n_car, _) in car_stops]
+    walk_times: list[float] = [0.0] + [wt for (_, wt) in car_stops]
+    n = len(nodes_drive)
+
+    for node_id in nodes_drive:
+        if node_id not in G_drive:
+            raise RuntimeError(
+                f"Node {node_id} is not in the drive graph.  "
+                "Snap addresses after get_network() and use car-accessible nodes."
+            )
+
+    matrix: dict[tuple[int, int], float] = {}
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                matrix[(i, j)] = 0.0
+                continue
+            src_id, dst_id = nodes_drive[i], nodes_drive[j]
+            try:
+                drive_s = nx.shortest_path_length(
+                    G_drive, src_id, dst_id, weight=weight
+                )
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                drive_s = PENALTY
+            if isinstance(drive_s, (int, float)) and drive_s == 0.0:
+                drive_s = PENALTY
+            total = float(drive_s) + walk_times[j]
+            matrix[(i, j)] = min(total, PENALTY)
+    logger.info(
+        "  Drive hybrid matrix: %d×%d (depot + %d stops, last-meter walk added)",
+        n, n, len(car_stops),
+    )
+    return matrix, nodes_drive
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  TSP SOLVERS  (Phase 2)
 # ══════════════════════════════════════════════════════════════════════════════
