@@ -2,6 +2,7 @@
 # Install with: pip install -r requirements.txt
 
 osmnx>=2.1
+requests>=2.31
 networkx>=3.2
 folium>=0.16
 geopy>=2.4

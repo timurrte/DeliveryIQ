@@ -41,6 +41,7 @@ from graph_builder import (
 from route_solver import (
     build_distance_matrix,
     build_drive_matrix_hybrid,
+    build_drive_matrix_mapbox,
     solve_tsp,
     reconstruct_full_route,
     get_full_path,
@@ -50,6 +51,8 @@ from route_solver import (
 
 logging.basicConfig(level=logging.INFO)
 
+MAPBOX_API_KEY: str = os.getenv("MAPBOX_API_KEY", "")
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  CITY LOCK  — change this one line to re-scope the whole app
 # ══════════════════════════════════════════════════════════════════════════════
@@ -57,12 +60,9 @@ DEFAULT_CITY = "Dnipro, Ukraine"
 
 CITY_CENTRES: dict[str, tuple[float, float]] = {
     "Dnipro, Ukraine": (48.4647, 35.0462),
-    "Milan, Italy":    (45.4654,  9.1859),
-    "London, UK":      (51.5074, -0.1278),
-    "Paris, France":   (48.8566,  2.3522),
-    "Berlin, Germany": (52.5200, 13.4050),
-    "Rome, Italy":     (41.9028, 12.4964),
-    "Madrid, Spain":   (40.4168, -3.7038),
+    "Kyiv, Ukraine":   (50.4501, 30.5234),
+    "Lviv, Ukraine":   (49.8397, 24.0297),
+    "Odesa, Ukraine":  (46.4825, 30.7233),
 }
 
 _geolocator = Nominatim(user_agent="deliveryiq_v3", timeout=10)
@@ -606,11 +606,40 @@ def run_optimization(depot, stops, city, radius, tsp_method):
                 status("[drive] done — 0 stops", done=True)
                 continue
             car_stops = [(n_car, wt) for (n_car, wt, _s, _l) in car_reachable]
-            status(f"[drive] Building hybrid matrix (depot + {len(car_stops)} stops, last-meter walk)…")
-            matrix_drive_idx, nodes_drive = build_drive_matrix_hybrid(
-                G_drive, depot.node_id, car_stops, weight="travel_time"
-            )
-            n_drive = len(nodes_drive)
+            n_drive = 1 + len(car_stops)
+
+            if MAPBOX_API_KEY:
+                drive_latlons = (
+                    [(depot.lat, depot.lon)]
+                    + [(s.lat, s.lon) for (_n, _w, s, _l) in car_reachable]
+                )
+                status(
+                    f"[drive] Fetching traffic-aware matrix from Mapbox "
+                    f"({n_drive} stops)…"
+                )
+                try:
+                    matrix_drive_idx = build_drive_matrix_mapbox(
+                        drive_latlons, MAPBOX_API_KEY
+                    )
+                    nodes_drive = [depot.node_id] + [
+                        n_car for (n_car, _w, _s, _l) in car_reachable
+                    ]
+                except Exception as exc:
+                    warnings_out.append(
+                        f"⚠️ Mapbox API error ({exc}) — "
+                        f"falling back to static travel times."
+                    )
+                    matrix_drive_idx, nodes_drive = build_drive_matrix_hybrid(
+                        G_drive, depot.node_id, car_stops, weight="travel_time"
+                    )
+            else:
+                status(
+                    f"[drive] Building static matrix "
+                    f"(depot + {len(car_stops)} stops, last-meter walk)…"
+                )
+                matrix_drive_idx, nodes_drive = build_drive_matrix_hybrid(
+                    G_drive, depot.node_id, car_stops, weight="travel_time"
+                )
             indices_drive = list(range(n_drive))
             labels_drive_list = ["Depot"] + [lbl for (_n, _w, _s, lbl) in car_reachable]
             status(f"[drive] Solving TSP ({tsp_method}, {n_drive} nodes)…")

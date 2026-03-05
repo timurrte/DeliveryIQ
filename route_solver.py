@@ -44,6 +44,7 @@ import random
 from dataclasses import dataclass, field
 
 import networkx as nx
+import requests
 from networkx.algorithms.approximation import christofides
 
 logger = logging.getLogger(__name__)
@@ -389,6 +390,109 @@ def build_drive_matrix_hybrid(
         n, n, len(car_stops),
     )
     return matrix, nodes_drive
+
+
+_MAPBOX_MATRIX_URL = (
+    "https://api.mapbox.com/directions-matrix/v1/mapbox/driving-traffic/{coords}"
+)
+# Mapbox Matrix allows at most 25 coordinates per request.
+# We use chunks of 12 so that each request contains at most 24 unique
+# coordinates (12 sources + 12 destinations, with possible overlap).
+_MAPBOX_CHUNK = 12
+
+
+def build_drive_matrix_mapbox(
+    stops: list[tuple[float, float]],
+    api_key: str,
+) -> dict[tuple[int, int], float]:
+    """
+    Build an n×n drive-time matrix (seconds) using the Mapbox Directions
+    Matrix API with the ``driving-traffic`` profile.
+
+    Mapbox uses historical traffic patterns (speed profiles by time-of-day
+    and day-of-week) rather than a fixed speed constant, giving more realistic
+    car travel times than the OSMnx-based Dijkstra approach.
+
+    Parameters
+    ----------
+    stops   : [(lat, lon), …]  Depot at index 0, delivery stops follow.
+    api_key : Mapbox public access token (sk.* or pk.*).
+
+    Returns
+    -------
+    dict[(i, j) → float]
+        Travel time in seconds.  Diagonal is 0.0.
+        Unreachable pairs carry PENALTY (1e9).
+
+    Raises
+    ------
+    requests.HTTPError   if Mapbox returns a non-2xx response.
+    ValueError           if fewer than 2 stops are provided.
+    """
+    n = len(stops)
+    if n < 2:
+        raise ValueError("build_drive_matrix_mapbox requires at least 2 stops.")
+
+    matrix: dict[tuple[int, int], float] = {(i, i): 0.0 for i in range(n)}
+
+    def _request_chunk(
+        src_indices: list[int],
+        dst_indices: list[int],
+    ) -> None:
+        """Make one Mapbox Matrix API call for a subset of source/dest pairs."""
+        # Build a deduplicated coordinate list for this request.
+        # Mapbox sources/destinations are expressed as indices into this list.
+        coord_pos: dict[int, int] = {}   # global stop index → position in coord_list
+        coord_list: list[tuple[float, float]] = []
+
+        for idx in dict.fromkeys(src_indices + dst_indices):  # stable-dedup order
+            coord_pos[idx] = len(coord_list)
+            coord_list.append(stops[idx])
+
+        coords_str = ";".join(f"{lon},{lat}" for lat, lon in coord_list)
+        url = _MAPBOX_MATRIX_URL.format(coords=coords_str)
+
+        resp = requests.get(
+            url,
+            params={
+                "access_token": api_key,
+                "annotations":  "duration",
+                "sources":      ";".join(str(coord_pos[i]) for i in src_indices),
+                "destinations": ";".join(str(coord_pos[j]) for j in dst_indices),
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        durations = data.get("durations") or []
+        for r, row in enumerate(durations):
+            for c, val in enumerate(row):
+                gi, gj = src_indices[r], dst_indices[c]
+                if gi == gj:
+                    matrix[(gi, gj)] = 0.0
+                elif val is None:
+                    matrix[(gi, gj)] = PENALTY
+                else:
+                    matrix[(gi, gj)] = float(val)
+
+    # Iterate over (source_chunk × destination_chunk) pairs.
+    # Each chunk is at most _MAPBOX_CHUNK indices, so the total unique
+    # coordinates per request is at most 2 × _MAPBOX_CHUNK = 24 ≤ 25.
+    all_indices = list(range(n))
+    for src_start in range(0, n, _MAPBOX_CHUNK):
+        src_chunk = all_indices[src_start : src_start + _MAPBOX_CHUNK]
+        for dst_start in range(0, n, _MAPBOX_CHUNK):
+            dst_chunk = all_indices[dst_start : dst_start + _MAPBOX_CHUNK]
+            _request_chunk(src_chunk, dst_chunk)
+
+    reachable = sum(1 for (i, j), v in matrix.items() if i != j and v < PENALTY)
+    penalised = sum(1 for (i, j), v in matrix.items() if i != j and v >= PENALTY)
+    logger.info(
+        "  Mapbox drive matrix: %d×%d — reachable=%d  penalty=%d",
+        n, n, reachable, penalised,
+    )
+    return matrix
 
 
 # ══════════════════════════════════════════════════════════════════════════════
