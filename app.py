@@ -32,7 +32,7 @@ from geopy.exc import GeocoderTimedOut
 sys.path.insert(0, os.path.dirname(__file__))
 
 from graph_builder import (
-    get_network, add_travel_times,
+    get_network, get_network_from_point, add_travel_times,
     nearest_node, nearest_node_safe,
     distance_m_between_nodes,
     nearest_car_accessible_node,
@@ -53,9 +53,10 @@ logging.basicConfig(level=logging.INFO)
 # ══════════════════════════════════════════════════════════════════════════════
 #  CITY LOCK  — change this one line to re-scope the whole app
 # ══════════════════════════════════════════════════════════════════════════════
-DEFAULT_CITY = "Milan, Italy"
+DEFAULT_CITY = "Dnipro, Ukraine"
 
 CITY_CENTRES: dict[str, tuple[float, float]] = {
+    "Dnipro, Ukraine": (48.4647, 35.0462),
     "Milan, Italy":    (45.4654,  9.1859),
     "London, UK":      (51.5074, -0.1278),
     "Paris, France":   (48.8566,  2.3522),
@@ -317,6 +318,12 @@ def cached_network(city: str, radius: int):
 
 
 @st.cache_resource(show_spinner=False)
+def cached_network_at(lat: float, lon: float, radius: int):
+    """Network centred on explicit coordinates (used during optimization)."""
+    return get_network_from_point(lat, lon, dist=radius)
+
+
+@st.cache_resource(show_spinner=False)
 def cached_mode_graphs(city: str, radius: int):
     """
     Build travel-time graphs for all three modes, keyed by (city, radius).
@@ -329,6 +336,13 @@ def cached_mode_graphs(city: str, radius: int):
     snap to the same node as the original graph's centre.
     """
     G = cached_network(city, radius)
+    return add_travel_times(G)
+
+
+@st.cache_resource(show_spinner=False)
+def cached_mode_graphs_at(lat: float, lon: float, radius: int):
+    """Mode graphs centred on explicit coordinates (used during optimization)."""
+    G = cached_network_at(lat, lon, radius)
     return add_travel_times(G)
 
 
@@ -386,8 +400,11 @@ def run_optimization(depot, stops, city, radius, tsp_method):
         )
 
     # ── Step 1: Download OSM + LSCC pruning ──────────────────────────────────
+    # Download centred on the depot's geocoded coordinates, not the city-name
+    # string.  Nominatim may place a city label far from the actual depot
+    # location, which causes the entire graph to miss the delivery area.
     status("Downloading OSM network (largest strongly-connected component)…")
-    G_raw = cached_network(city, radius)
+    G_raw = cached_network_at(depot.lat, depot.lon, radius)
     summary = graph_summary(G_raw)
     status(
         f"Network ready — {summary['nodes']:,} nodes, {summary['edges']:,} edges "
@@ -401,30 +418,29 @@ def run_optimization(depot, stops, city, radius, tsp_method):
     # nearest_node()      — for typed/geocoded addresses (always in-bounds)
     # nearest_node_safe() — for map-click coordinates (may be out-of-bounds)
     status("Snapping addresses to road nodes…")
-    snap_errors: list[str] = []
 
-    try:
-        depot.node_id = (
-            nearest_node_safe(G_raw, depot.lat, depot.lon)
-            if depot.source == "map_click"
-            else nearest_node(G_raw, depot.lat, depot.lon)
-        )
-    except ValueError as exc:
-        snap_errors.append(f"Depot: {exc}")
+    def _snap(obj, label: str) -> None:
+        """
+        Snap a DeliveryStop to its nearest OSM node.
+        For map-click sources, try bbox-validated snapping first; if the click
+        landed slightly outside the downloaded area, fall back to unchecked
+        nearest_node() and emit a warning rather than failing outright.
+        """
+        if obj.source == "map_click":
+            try:
+                obj.node_id = nearest_node_safe(G_raw, obj.lat, obj.lon)
+            except ValueError:
+                obj.node_id = nearest_node(G_raw, obj.lat, obj.lon)
+                warnings_out.append(
+                    f"⚠️ {label} was clicked slightly outside the downloaded "
+                    f"network area — snapped to the nearest road node."
+                )
+        else:
+            obj.node_id = nearest_node(G_raw, obj.lat, obj.lon)
 
+    _snap(depot, "Depot")
     for idx, stop in enumerate(stops, 1):
-        try:
-            stop.node_id = (
-                nearest_node_safe(G_raw, stop.lat, stop.lon)
-                if stop.source == "map_click"
-                else nearest_node(G_raw, stop.lat, stop.lon)
-            )
-        except ValueError as exc:
-            snap_errors.append(f"Stop #{idx} ({stop.address[:40]}…): {exc}")
-            stop.node_id = None
-
-    for err in snap_errors:
-        warnings_out.append(f"⚠️ Out-of-bounds address skipped — {err}")
+        _snap(stop, f"Stop #{idx}")
 
     # ── Step 2a: DEBUG — log every snap result to the terminal ───────────────
     # This is the primary diagnostic tool when all addresses map to the same
@@ -537,7 +553,7 @@ def run_optimization(depot, stops, city, radius, tsp_method):
 
     # ── Step 3: Build mode graphs ─────────────────────────────────────────────
     status("Building travel-time graphs (drive / bike / walk)…")
-    mode_graphs = cached_mode_graphs(city, radius)
+    mode_graphs = cached_mode_graphs_at(depot.lat, depot.lon, radius)
     status("Mode graphs ready", done=True)
 
     # ── Step 3b: Hybrid last-meter — dual-node mapping for car ─────────────────

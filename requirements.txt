@@ -1,7 +1,7 @@
 # requirements.txt — DeliveryIQ Route Optimizer v3
 # Install with: pip install -r requirements.txt
 
-osmnx>=1.9.1
+osmnx>=2.1
 networkx>=3.2
 folium>=0.16
 geopy>=2.4
