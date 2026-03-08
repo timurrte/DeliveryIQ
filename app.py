@@ -48,6 +48,7 @@ from route_solver import (
     audit_reachability,
     PENALTY as ROUTE_PENALTY,
 )
+from vrp_solver import Vehicle, VehicleRoute, solve_vrp, VEHICLE_COLORS
 
 logging.basicConfig(level=logging.INFO)
 
@@ -262,6 +263,10 @@ def _init():
         "opt_graphs": None,
         "opt_warnings": [],
         "opt_car_unreachable": [],
+        # Multi-vehicle fleet (VRP)
+        "fleet": [Vehicle("Vehicle 1", "drive", 50, VEHICLE_COLORS[0])],
+        "opt_vrp_results": None,
+        "opt_vrp_warnings": [],
     }
     for k, v in defs.items():
         if k not in st.session_state:
@@ -718,6 +723,119 @@ def run_optimization(depot, stops, city, radius, tsp_method):
     return results, mode_graphs, warnings_out, car_unreachable_notes
 
 
+def run_vrp_optimization(depot, stops, fleet, radius, tsp_method):
+    """
+    Multi-vehicle routing pipeline (VRP).
+
+    Downloads the OSM network centred on the depot, snaps every stop,
+    builds modal graphs, then calls solve_vrp() to partition stops across
+    the fleet and find the optimal route per vehicle.
+
+    Returns (vrp_routes, mode_graphs, warnings).
+    """
+    prog = st.empty()
+    warnings_out: list[str] = []
+
+    def status(msg: str, done: bool = False) -> None:
+        icon = "✅" if done else "⏳"
+        prog.markdown(
+            f'<p style="color:#64748b;font-size:.83rem">{icon} {msg}</p>',
+            unsafe_allow_html=True,
+        )
+
+    # ── Step 1: OSM network ───────────────────────────────────────────────────
+    status("Downloading OSM network…")
+    G_raw = cached_network_at(depot.lat, depot.lon, radius)
+    summary = graph_summary(G_raw)
+    status(
+        f"Network ready — {summary['nodes']:,} nodes, {summary['edges']:,} edges",
+        done=True,
+    )
+
+    # ── Step 2: Snap addresses to road nodes ─────────────────────────────────
+    status("Snapping addresses to road nodes…")
+
+    def _snap(obj, label: str) -> None:
+        if obj.source == "map_click":
+            try:
+                obj.node_id = nearest_node_safe(G_raw, obj.lat, obj.lon)
+            except ValueError:
+                obj.node_id = nearest_node(G_raw, obj.lat, obj.lon)
+                warnings_out.append(
+                    f"⚠️ {label} was clicked slightly outside the network — "
+                    f"snapped to the nearest road node."
+                )
+        else:
+            obj.node_id = nearest_node(G_raw, obj.lat, obj.lon)
+
+    _snap(depot, "Depot")
+    for idx, stop in enumerate(stops, 1):
+        _snap(stop, f"Stop #{idx}")
+
+    if depot.node_id is None:
+        raise RuntimeError("Depot could not be snapped to the road network.")
+
+    valid_stops = [s for s in stops if s.node_id is not None]
+    if len(valid_stops) < len(stops):
+        warnings_out.append(
+            f"⚠️ {len(stops) - len(valid_stops)} stop(s) could not be snapped "
+            f"and will be skipped."
+        )
+    if not valid_stops:
+        raise RuntimeError("No delivery stops could be snapped to the road network.")
+
+    status(f"Snapped {len(valid_stops)} stop(s)", done=True)
+
+    # ── Step 3: Modal graphs ──────────────────────────────────────────────────
+    status("Building modal travel-time graphs…")
+    mode_graphs = cached_mode_graphs_at(depot.lat, depot.lon, radius)
+    status("Modal graphs ready", done=True)
+
+    # ── Step 4: Total fleet capacity check ───────────────────────────────────
+    total_cap = sum(v.capacity for v in fleet)
+    if total_cap < len(valid_stops):
+        raise ValueError(
+            f"Total fleet capacity ({total_cap}) is less than the number of stops "
+            f"({len(valid_stops)}). Increase vehicle capacities or add more vehicles."
+        )
+
+    # ── Step 5: Solve VRP ─────────────────────────────────────────────────────
+    status(f"Running VRP for {len(fleet)} vehicle(s), {len(valid_stops)} stop(s)…")
+    vrp_routes, vrp_warnings = solve_vrp(
+        valid_stops, depot, fleet, mode_graphs, tsp_method
+    )
+    warnings_out.extend(vrp_warnings)
+
+    # ── Step 6: Build leg info for each vehicle route ────────────────────────
+    for vr in vrp_routes:
+        G = mode_graphs[vr.vehicle.mode]
+        label_map = {depot.node_id: "Depot"}
+        for idx, s in enumerate(vr.stops, 1):
+            label_map[s.node_id] = f"Stop #{idx}"
+        legs = []
+        cum = 0.0
+        for i in range(len(vr.tsp_route) - 1):
+            src, dst = vr.tsp_route[i], vr.tsp_route[i + 1]
+            try:
+                t = nx.shortest_path_length(G, src, dst, weight="travel_time")
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                t = ROUTE_PENALTY
+            path = get_full_path(G, src, dst, weight="travel_time")
+            dist = leg_dist(G, path)
+            cum += t
+            legs.append(LegInfo(
+                label_map.get(src, f"Node {src}"),
+                label_map.get(dst, f"Node {dst}"),
+                dist, t, cum,
+            ))
+        vr.legs = legs
+
+    n_active = len(vrp_routes)
+    status(f"VRP solved — {n_active} active vehicle(s)", done=True)
+    prog.empty()
+    return vrp_routes, mode_graphs, warnings_out
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  MAP BUILDERS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -831,6 +949,75 @@ def build_result_map(mode_graphs, results, depot, stops) -> folium.Map:
     return fmap
 
 
+def build_vrp_result_map(mode_graphs, vrp_routes, depot) -> folium.Map:
+    """Post-VRP map: one colour-coded animated route per vehicle."""
+    fmap = folium.Map(location=[depot.lat, depot.lon], zoom_start=14, tiles="CartoDB positron")
+
+    mode_icons = {"drive": "🚗", "bike": "🚲", "walk": "🚶"}
+
+    for vr in vrp_routes:
+        # Use the vehicle's own modal graph for coordinate lookup — bike/walk routes
+        # may include nodes absent from the drive graph copy.
+        G_veh = mode_graphs[vr.vehicle.mode]
+        coords = [n_coords(G_veh, n) for n in vr.full_route]
+        icon = mode_icons.get(vr.vehicle.mode, "🚛")
+        total_time_label = hms(vr.total_time_s)
+        layer = folium.FeatureGroup(
+            name=f"{icon} {vr.vehicle.name} — {total_time_label}",
+            show=True,
+        )
+        AntPath(
+            locations=coords,
+            color=vr.vehicle.color,
+            weight=5,
+            opacity=0.85,
+            delay=600,
+            dash_array=[20, 35],
+            pulse_color="#fff",
+            tooltip=f"{vr.vehicle.name} · {vr.vehicle.mode} · {total_time_label}",
+        ).add_to(layer)
+
+        # Stop markers in this vehicle's colour
+        stop_layer = folium.FeatureGroup(
+            name=f"📍 {vr.vehicle.name} stops",
+            show=True,
+        )
+        for idx, s in enumerate(vr.stops, 1):
+            marker_html = (
+                f'<div style="background:{vr.vehicle.color};color:white;border-radius:50%;'
+                f'width:32px;height:32px;line-height:32px;text-align:center;'
+                f'font-weight:700;font-size:13px;font-family:Outfit,sans-serif;'
+                f'border:3px solid white;box-shadow:0 2px 8px rgba(0,0,0,.4)">'
+                f'{idx}</div>'
+            )
+            folium.Marker(
+                location=[s.lat, s.lon],
+                tooltip=f"<b>[{vr.vehicle.name}] Stop #{idx}</b>",
+                popup=folium.Popup(
+                    f"<b>[{vr.vehicle.name}] Stop #{idx}</b><br>{s.address}",
+                    max_width=270,
+                ),
+                icon=folium.DivIcon(
+                    html=marker_html,
+                    icon_size=(32, 32),
+                    icon_anchor=(16, 16),
+                ),
+            ).add_to(stop_layer)
+        stop_layer.add_to(fmap)
+        layer.add_to(fmap)
+
+    # Depot marker — always visible
+    folium.Marker(
+        location=[depot.lat, depot.lon],
+        tooltip="<b>📦 Depot (Start &amp; End)</b>",
+        popup=folium.Popup(f"<b>Depot</b><br><small>{depot.address}</small>", max_width=260),
+        icon=folium.Icon(color="green", icon="home", prefix="fa"),
+    ).add_to(fmap)
+
+    folium.LayerControl(collapsed=False, position="topleft").add_to(fmap)
+    return fmap
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -906,7 +1093,8 @@ with st.sidebar:
             sel_city = custom.strip()
     if sel_city != "Custom…" and sel_city != st.session_state.city:
         st.session_state.update(city=sel_city, depot=None, stops=[],
-                                opt_results=None, opt_graphs=None, last_click=None)
+                                opt_results=None, opt_graphs=None, last_click=None,
+                                opt_vrp_results=None, opt_vrp_warnings=[])
         st.rerun()
 
     city = st.session_state.city
@@ -934,6 +1122,7 @@ with st.sidebar:
         if r:
             st.session_state.depot = r
             st.session_state.opt_results = None
+            st.session_state.opt_vrp_results = None
             st.rerun()
         else:
             st.error(f"Not found in {city}")
@@ -951,6 +1140,7 @@ with st.sidebar:
         if st.button("✕ Clear depot", key="clr_dep"):
             st.session_state.depot = None
             st.session_state.opt_results = None
+            st.session_state.opt_vrp_results = None
             st.rerun()
 
     st.markdown('<hr style="border-color:#161d2e;margin:12px 0">', unsafe_allow_html=True)
@@ -970,6 +1160,7 @@ with st.sidebar:
         if r:
             st.session_state.stops.append(r)
             st.session_state.opt_results = None
+            st.session_state.opt_vrp_results = None
             st.rerun()
         else:
             st.error(f"Not found in {city}")
@@ -1016,6 +1207,7 @@ with st.sidebar:
             if st.button("✕", key=f"rm_{i}", help=f"Remove stop #{i+1}"):
                 st.session_state.stops.pop(i)
                 st.session_state.opt_results = None
+                st.session_state.opt_vrp_results = None
                 st.rerun()
 
     st.markdown('<hr style="border-color:#161d2e;margin:12px 0">', unsafe_allow_html=True)
@@ -1044,6 +1236,7 @@ with st.sidebar:
 city  = st.session_state.city
 depot = st.session_state.depot
 stops = st.session_state.stops
+fleet = st.session_state.fleet
 
 st.markdown(f"""
 <div class="page-header">
@@ -1055,170 +1248,345 @@ st.markdown(f"""
   </div>
 </div>""", unsafe_allow_html=True)
 
+map_tab, fleet_tab = st.tabs(["🗺️ Map & Optimize", "🚛 Fleet Settings"])
+
 # ══════════════════════════════════════════════════════════════════════════════
-#  COORDINATOR MAP  (shown before optimisation)
+#  MAP & OPTIMIZE TAB
 # ══════════════════════════════════════════════════════════════════════════════
 
-if st.session_state.opt_results is None:
-    st.markdown('<div class="sec-head">🗺️ Coordinator Map — Build Your Delivery List</div>',
-                unsafe_allow_html=True)
+with map_tab:
 
-    if st.session_state.click_mode:
-        target_hint = "depot location" if depot is None else "delivery stop"
-        st.markdown(f"""
-        <div class="click-active" style="text-align:left;padding:10px 18px;margin-bottom:10px">
-          🖱 <b>Click Mode Active</b> — click the map to place a
-          <b>{target_hint}</b>. Coordinates are reverse-geocoded automatically.
-        </div>""", unsafe_allow_html=True)
-    elif depot is None:
+    # ── Coordinator map (shown when no results yet) ───────────────────────────
+    no_results = (
+        st.session_state.opt_results is None
+        and st.session_state.opt_vrp_results is None
+    )
+    if no_results:
+        st.markdown('<div class="sec-head">🗺️ Coordinator Map — Build Your Delivery List</div>',
+                    unsafe_allow_html=True)
+
+        if st.session_state.click_mode:
+            target_hint = "depot location" if depot is None else "delivery stop"
+            st.markdown(f"""
+            <div class="click-active" style="text-align:left;padding:10px 18px;margin-bottom:10px">
+              🖱 <b>Click Mode Active</b> — click the map to place a
+              <b>{target_hint}</b>. Coordinates are reverse-geocoded automatically.
+            </div>""", unsafe_allow_html=True)
+        elif depot is None:
+            st.markdown("""
+            <div class="info-box">
+              👈 Set a <b>depot</b> in the sidebar or enable <b>Map Click</b> to place it
+              on the map, then add delivery stops to begin.
+            </div>""", unsafe_allow_html=True)
+
+        sel_map = build_selection_map(city, depot, stops)
+        map_output = st_folium(
+            sel_map,
+            width="100%",
+            height=510,
+            returned_objects=["last_clicked"],
+            key="coord_map",
+        )
+
+        if (
+            st.session_state.click_mode
+            and map_output
+            and map_output.get("last_clicked")
+        ):
+            raw = map_output["last_clicked"]
+            ck = (round(raw["lat"], 5), round(raw["lng"], 5))
+            if ck != st.session_state.last_click:
+                st.session_state.last_click = ck
+                with st.spinner("Reverse geocoding…"):
+                    new = reverse_geocode(raw["lat"], raw["lng"])
+                if new:
+                    if st.session_state.depot is None:
+                        new.source = "map_click"
+                        st.session_state.depot = new
+                    else:
+                        st.session_state.stops.append(new)
+                    st.session_state.opt_results = None
+                    st.session_state.opt_vrp_results = None
+                    st.rerun()
+
+    # ── Run optimisation ──────────────────────────────────────────────────────
+    if run_btn and can_run:
+        st.markdown('<div class="sec-head">⏳ Running Optimization</div>', unsafe_allow_html=True)
+        if len(st.session_state.fleet) >= 2:
+            # VRP mode — multi-vehicle fleet
+            try:
+                vrp_routes, mg, vrp_warnings = run_vrp_optimization(
+                    depot, stops, st.session_state.fleet, radius, tsp_method
+                )
+                st.session_state.opt_vrp_results = vrp_routes
+                st.session_state.opt_graphs      = mg
+                st.session_state.opt_vrp_warnings = vrp_warnings
+                st.session_state.opt_results     = None
+                st.rerun()
+            except ValueError as e:
+                st.error(f"Fleet configuration error: {e}")
+            except Exception as e:
+                st.error(f"VRP optimization failed: {e}")
+                st.exception(e)
+        else:
+            # Single-vehicle mode — existing 3-mode comparison
+            try:
+                res, mg, warnings, car_unreachable = run_optimization(
+                    depot, stops, city, radius, tsp_method
+                )
+                st.session_state.opt_results         = res
+                st.session_state.opt_graphs          = mg
+                st.session_state.opt_warnings        = warnings
+                st.session_state.opt_car_unreachable = car_unreachable
+                st.session_state.opt_vrp_results     = None
+                st.rerun()
+            except Exception as e:
+                st.error(f"Optimization failed: {e}")
+                st.exception(e)
+
+    # ── Single-vehicle results dashboard ─────────────────────────────────────
+    if st.session_state.opt_results is not None:
+        results     = st.session_state.opt_results
+        mode_graphs = st.session_state.opt_graphs
+        warnings    = st.session_state.get("opt_warnings", [])
+        car_unreachable_notes = st.session_state.get("opt_car_unreachable", [])
+        best_mode   = min(results, key=lambda m: results[m].total_time_s)
+
+        if warnings:
+            st.markdown('<div class="sec-head">⚠️ Connectivity Warnings</div>',
+                        unsafe_allow_html=True)
+            for w in warnings:
+                st.markdown(f'<div class="warn-box">{w}</div>', unsafe_allow_html=True)
+
+        st.markdown('<div class="sec-head">📊 Mode Comparison</div>', unsafe_allow_html=True)
+        cols = st.columns(3)
+        for col, mode in zip(cols, ["drive", "bike", "walk"]):
+            res  = results[mode]
+            meta = MODE_META[mode]
+            win  = mode == best_mode
+            tdist = sum(l.distance_m for l in res.legs)
+            badge = '<div class="winner-badge">⚡ Most Efficient</div>' if win else ""
+            col.markdown(f"""
+            <div class="metric-card {'winner' if win else ''}">
+              <div class="m-icon">{meta['icon']}</div>
+              <div class="m-mode">{meta['label']}</div>
+              <div class="m-time">{hms(res.total_time_s)}</div>
+              <div class="m-sub">{tdist/1000:.1f} km · {SPEED_KMH[mode]:.0f} km/h · {len(stops)} stop{"s" if len(stops)!=1 else ""}</div>
+              {badge}
+            </div>""", unsafe_allow_html=True)
+
+        st.markdown('<div class="sec-head">🗺️ Optimized Routes</div>', unsafe_allow_html=True)
         st.markdown("""
         <div class="info-box">
-          👈 Set a <b>depot</b> in the sidebar or enable <b>Map Click</b> to place it
-          on the map, then add delivery stops to begin.
+          <b>Layer control</b> (top-left) toggles Car / Bike / Walk routes.
+          🟢 Green = Depot &nbsp;·&nbsp; 🔴 Red numbers = Delivery stops in optimized order.
         </div>""", unsafe_allow_html=True)
+        rmap = build_result_map(mode_graphs, results, depot, stops)
+        st_folium(rmap, width="100%", height=530, returned_objects=[], key="result_map")
 
-    sel_map = build_selection_map(city, depot, stops)
+        st.markdown('<div class="sec-head">📋 Detailed Stop Breakdown</div>',
+                    unsafe_allow_html=True)
+        t1, t2, t3 = st.tabs(["🚗  Car", "🚲  Bike", "🚶  Walk"])
+        for tab, mode in zip([t1, t2, t3], ["drive", "bike", "walk"]):
+            with tab:
+                res = results[mode]
+                if mode == "drive" and car_unreachable_notes:
+                    st.markdown(
+                        '<div class="warn-box"><strong>⚠️ Unreachable by car (last-meter)</strong><br>'
+                        + "<br>".join(car_unreachable_notes)
+                        + "</div>",
+                        unsafe_allow_html=True,
+                    )
+                tdist = sum(l.distance_m for l in res.legs)
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Total Time",     hms(res.total_time_s))
+                c2.metric("Total Distance", f"{tdist/1000:.2f} km")
+                c3.metric("Avg Speed",      f"{SPEED_KMH[mode]:.0f} km/h")
+                st.markdown(render_stop_table(res), unsafe_allow_html=True)
 
-    # ── Render map and capture clicks ─────────────────────────────────────────
-    map_output = st_folium(
-        sel_map,
-        width="100%",
-        height=510,
-        returned_objects=["last_clicked"],
-        key="coord_map",
-    )
+        st.markdown('<div style="height:14px"></div>', unsafe_allow_html=True)
+        ca, cb = st.columns([3, 1])
+        with ca:
+            st.markdown("""
+            <div class="warn-box">
+              🔄 Add more stops via the sidebar or map click, then press
+              <b>Optimize Routes</b> again. The OSM network is cached automatically.
+            </div>""", unsafe_allow_html=True)
+        with cb:
+            if st.button("🗑 Clear & Restart", key="clear_single", use_container_width=True):
+                st.session_state.update(
+                    opt_results=None, opt_graphs=None, opt_warnings=[],
+                    opt_car_unreachable=[], opt_vrp_results=None, opt_vrp_warnings=[],
+                )
+                st.rerun()
 
-    # ── Process a new map click ───────────────────────────────────────────────
-    #  st_folium returns 'last_clicked' as {"lat":…,"lng":…} every render,
-    #  so we deduplicate by storing the rounded coords in session state.
-    #  The flow is:
-    #    1. User clicks  →  map_output["last_clicked"] updates
-    #    2. We compare against st.session_state.last_click
-    #    3. If new, reverse-geocode and append to depot / stops
-    #    4. st.rerun() causes Streamlit to re-render with the new marker
-    if (
-        st.session_state.click_mode
-        and map_output
-        and map_output.get("last_clicked")
-    ):
-        raw = map_output["last_clicked"]
-        ck = (round(raw["lat"], 5), round(raw["lng"], 5))
+    # ── VRP results dashboard ─────────────────────────────────────────────────
+    elif st.session_state.opt_vrp_results is not None:
+        vrp_routes  = st.session_state.opt_vrp_results
+        mode_graphs = st.session_state.opt_graphs
+        vrp_warnings = st.session_state.get("opt_vrp_warnings", [])
 
-        if ck != st.session_state.last_click:
-            st.session_state.last_click = ck
-            with st.spinner("Reverse geocoding…"):
-                new = reverse_geocode(raw["lat"], raw["lng"])
-            if new:
-                if st.session_state.depot is None:
-                    new.source = "map_click"
-                    st.session_state.depot = new
-                else:
-                    st.session_state.stops.append(new)
-                st.session_state.opt_results = None
+        if vrp_warnings:
+            st.markdown('<div class="sec-head">⚠️ Routing Warnings</div>',
+                        unsafe_allow_html=True)
+            for w in vrp_warnings:
+                st.markdown(f'<div class="warn-box">{w}</div>', unsafe_allow_html=True)
+
+        # Per-vehicle summary cards
+        st.markdown('<div class="sec-head">🚛 Fleet Summary</div>', unsafe_allow_html=True)
+        mode_icons = {"drive": "🚗", "bike": "🚲", "walk": "🚶"}
+        n_cols = min(len(vrp_routes), 4)
+        vcols = st.columns(n_cols)
+        for col, vr in zip(vcols, vrp_routes):
+            icon = mode_icons.get(vr.vehicle.mode, "🚛")
+            n_stops = len(vr.stops)
+            col.markdown(f"""
+            <div class="metric-card" style="border-top:4px solid {vr.vehicle.color}">
+              <div class="m-icon">{icon}</div>
+              <div class="m-mode">{vr.vehicle.name}</div>
+              <div class="m-time">{hms(vr.total_time_s)}</div>
+              <div class="m-sub">
+                {vr.total_dist_m/1000:.1f} km · {n_stops} stop{"s" if n_stops != 1 else ""}
+                · {vr.vehicle.mode}
+              </div>
+            </div>""", unsafe_allow_html=True)
+
+        # Multi-vehicle map
+        st.markdown('<div class="sec-head">🗺️ Vehicle Routes</div>', unsafe_allow_html=True)
+        st.markdown("""
+        <div class="info-box">
+          <b>Layer control</b> (top-left) toggles individual vehicle routes and stop markers.
+          🟢 Green = Depot &nbsp;·&nbsp; Numbered markers show stop visit order per vehicle.
+        </div>""", unsafe_allow_html=True)
+        vmap = build_vrp_result_map(mode_graphs, vrp_routes, depot)
+        st_folium(vmap, width="100%", height=560, returned_objects=[], key="vrp_result_map")
+
+        # Per-vehicle stop breakdown expanders
+        st.markdown('<div class="sec-head">📋 Per-Vehicle Stop Breakdown</div>',
+                    unsafe_allow_html=True)
+        for vr in vrp_routes:
+            icon = mode_icons.get(vr.vehicle.mode, "🚛")
+            n_s = len(vr.stops)
+            with st.expander(
+                f"{icon} {vr.vehicle.name} — {n_s} stop{'s' if n_s != 1 else ''} · {hms(vr.total_time_s)}",
+                expanded=False,
+            ):
+                tdist = vr.total_dist_m
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Total Time",     hms(vr.total_time_s))
+                c2.metric("Total Distance", f"{tdist/1000:.2f} km")
+                c3.metric("Mode",           vr.vehicle.mode.capitalize())
+                if vr.legs:
+                    # Reuse existing render_stop_table by wrapping in a ModeResult-like object
+                    pseudo = ModeResult(vr.vehicle.mode, vr.tsp_route, vr.full_route,
+                                        vr.total_time_s, vr.legs)
+                    st.markdown(render_stop_table(pseudo), unsafe_allow_html=True)
+
+        st.markdown('<div style="height:14px"></div>', unsafe_allow_html=True)
+        ca, cb = st.columns([3, 1])
+        with ca:
+            st.markdown("""
+            <div class="warn-box">
+              🔄 Add more stops via the sidebar or adjust the fleet in
+              <b>Fleet Settings</b>, then press <b>Optimize Routes</b> again.
+            </div>""", unsafe_allow_html=True)
+        with cb:
+            if st.button("🗑 Clear & Restart", key="clear_vrp", use_container_width=True):
+                st.session_state.update(
+                    opt_results=None, opt_graphs=None, opt_warnings=[],
+                    opt_car_unreachable=[], opt_vrp_results=None, opt_vrp_warnings=[],
+                )
                 st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  RUN OPTIMISATION
+#  FLEET SETTINGS TAB
 # ══════════════════════════════════════════════════════════════════════════════
 
-if run_btn and can_run:
-    st.markdown('<div class="sec-head">⏳ Running Optimization</div>', unsafe_allow_html=True)
-    try:
-        res, mg, warnings, car_unreachable = run_optimization(
-            depot, stops, city, radius, tsp_method
+with fleet_tab:
+    st.markdown('<div class="sec-head">🚛 Fleet Configuration</div>', unsafe_allow_html=True)
+
+    n_vehicles = len(fleet)
+    mode_badge = {"drive": "🚗 Drive", "bike": "🚲 Bike", "walk": "🚶 Walk"}
+    if n_vehicles >= 2:
+        st.markdown(
+            f'<div class="info-box">Fleet has <b>{n_vehicles} vehicles</b> — '
+            f'<b>Optimize Routes</b> will use <b>multi-vehicle VRP mode</b>.</div>',
+            unsafe_allow_html=True,
         )
-        st.session_state.opt_results  = res
-        st.session_state.opt_graphs   = mg
-        st.session_state.opt_warnings = warnings
-        st.session_state.opt_car_unreachable = car_unreachable
-        st.rerun()
-    except Exception as e:
-        st.error(f"Optimization failed: {e}")
-        st.exception(e)
+    else:
+        st.markdown(
+            '<div class="info-box">Fleet has <b>1 vehicle</b> — '
+            '<b>Optimize Routes</b> uses single-vehicle mode (3-mode comparison). '
+            'Add a second vehicle to enable VRP.</div>',
+            unsafe_allow_html=True,
+        )
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  RESULTS DASHBOARD
-# ══════════════════════════════════════════════════════════════════════════════
+    # Edit existing vehicles
+    st.markdown("**Edit vehicles:**")
+    updated_fleet = list(fleet)
+    changed = False
+    for i, v in enumerate(fleet):
+        c1, c2, c3, c4 = st.columns([2, 2, 1, 0.4])
+        with c1:
+            new_name = st.text_input("Name", value=v.name, key=f"v_name_{i}",
+                                     label_visibility="collapsed")
+        with c2:
+            mode_opts = ["drive", "bike", "walk"]
+            new_mode = st.selectbox("Mode", mode_opts,
+                                    index=mode_opts.index(v.mode),
+                                    key=f"v_mode_{i}",
+                                    label_visibility="collapsed")
+        with c3:
+            new_cap = st.number_input("Cap", min_value=1, max_value=500,
+                                      value=v.capacity, step=1,
+                                      key=f"v_cap_{i}",
+                                      label_visibility="collapsed")
+        with c4:
+            rm = st.button("✕", key=f"v_rm_{i}",
+                           disabled=(len(fleet) <= 1),
+                           help="Remove this vehicle")
 
-if st.session_state.opt_results is not None:
-    results     = st.session_state.opt_results
-    mode_graphs = st.session_state.opt_graphs
-    warnings    = st.session_state.get("opt_warnings", [])
-    car_unreachable_notes = st.session_state.get("opt_car_unreachable", [])
-    best_mode   = min(results, key=lambda m: results[m].total_time_s)
-
-    # ── Warnings panel ────────────────────────────────────────────────────────
-    if warnings:
-        st.markdown('<div class="sec-head">⚠️ Connectivity Warnings</div>',
-                    unsafe_allow_html=True)
-        for w in warnings:
-            st.markdown(
-                f'<div class="warn-box">{w}</div>',
-                unsafe_allow_html=True,
-            )
-
-    # ── Mode comparison ───────────────────────────────────────────────────────
-    st.markdown('<div class="sec-head">📊 Mode Comparison</div>', unsafe_allow_html=True)
-    cols = st.columns(3)
-    for col, mode in zip(cols, ["drive", "bike", "walk"]):
-        res  = results[mode]
-        meta = MODE_META[mode]
-        win  = mode == best_mode
-        tdist = sum(l.distance_m for l in res.legs)
-        badge = '<div class="winner-badge">⚡ Most Efficient</div>' if win else ""
-        col.markdown(f"""
-        <div class="metric-card {'winner' if win else ''}">
-          <div class="m-icon">{meta['icon']}</div>
-          <div class="m-mode">{meta['label']}</div>
-          <div class="m-time">{hms(res.total_time_s)}</div>
-          <div class="m-sub">{tdist/1000:.1f} km · {SPEED_KMH[mode]:.0f} km/h · {len(stops)} stop{"s" if len(stops)!=1 else ""}</div>
-          {badge}
-        </div>""", unsafe_allow_html=True)
-
-    # ── Optimised route map ───────────────────────────────────────────────────
-    st.markdown('<div class="sec-head">🗺️ Optimized Routes</div>', unsafe_allow_html=True)
-    st.markdown("""
-    <div class="info-box">
-      <b>Layer control</b> (top-left) toggles Car / Bike / Walk routes.
-      🟢 Green = Depot &nbsp;·&nbsp; 🔴 Red numbers = Delivery stops in optimized order.
-    </div>""", unsafe_allow_html=True)
-    rmap = build_result_map(mode_graphs, results, depot, stops)
-    st_folium(rmap, width="100%", height=530, returned_objects=[], key="result_map")
-
-    # ── Stop breakdown tabs ───────────────────────────────────────────────────
-    st.markdown('<div class="sec-head">📋 Detailed Stop Breakdown</div>',
-                unsafe_allow_html=True)
-    t1, t2, t3 = st.tabs(["🚗  Car", "🚲  Bike", "🚶  Walk"])
-    for tab, mode in zip([t1, t2, t3], ["drive", "bike", "walk"]):
-        with tab:
-            res   = results[mode]
-            if mode == "drive" and car_unreachable_notes:
-                st.markdown(
-                    '<div class="warn-box"><strong>⚠️ Unreachable by car (last-meter)</strong><br>'
-                    + "<br>".join(car_unreachable_notes)
-                    + "</div>",
-                    unsafe_allow_html=True,
-                )
-            tdist = sum(l.distance_m for l in res.legs)
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Total Time",     hms(res.total_time_s))
-            c2.metric("Total Distance", f"{tdist/1000:.2f} km")
-            c3.metric("Avg Speed",      f"{SPEED_KMH[mode]:.0f} km/h")
-            st.markdown(render_stop_table(res), unsafe_allow_html=True)
-
-    # ── Footer actions ────────────────────────────────────────────────────────
-    st.markdown('<div style="height:14px"></div>', unsafe_allow_html=True)
-    ca, cb = st.columns([3, 1])
-    with ca:
-        st.markdown("""
-        <div class="warn-box">
-          🔄 Add more stops via the sidebar or map click, then press
-          <b>Optimize Routes</b> again. The OSM network is cached automatically.
-        </div>""", unsafe_allow_html=True)
-    with cb:
-        if st.button("🗑 Clear & Restart", use_container_width=True):
-            st.session_state.update(
-                opt_results=None, opt_graphs=None, opt_warnings=[],
-                opt_car_unreachable=[],
-            )
+        if rm:
+            updated_fleet.pop(i)
+            # Reassign colours in order
+            for j, u in enumerate(updated_fleet):
+                updated_fleet[j] = Vehicle(u.name, u.mode, u.capacity,
+                                           VEHICLE_COLORS[j % len(VEHICLE_COLORS)])
+            st.session_state.fleet = updated_fleet
+            st.session_state.opt_vrp_results = None
+            st.session_state.opt_results = None
             st.rerun()
+
+        if new_name != v.name or new_mode != v.mode or int(new_cap) != v.capacity:
+            updated_fleet[i] = Vehicle(new_name, new_mode, int(new_cap),
+                                       VEHICLE_COLORS[i % len(VEHICLE_COLORS)])
+            changed = True
+
+    if changed:
+        st.session_state.fleet = updated_fleet
+        st.session_state.opt_vrp_results = None
+        st.session_state.opt_results = None
+
+    st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
+    col_add, _ = st.columns([1, 3])
+    with col_add:
+        if st.button("＋ Add Vehicle", use_container_width=True):
+            new_idx = len(st.session_state.fleet)
+            st.session_state.fleet.append(
+                Vehicle(f"Vehicle {new_idx + 1}", "drive", 50,
+                        VEHICLE_COLORS[new_idx % len(VEHICLE_COLORS)])
+            )
+            st.session_state.opt_vrp_results = None
+            st.rerun()
+
+    # Fleet summary table
+    if fleet:
+        st.markdown('<div style="height:16px"></div>', unsafe_allow_html=True)
+        st.markdown("**Current fleet:**")
+        header = "| # | Vehicle | Mode | Max Stops | Colour |"
+        sep    = "|---|---|---|---|---|"
+        rows = [header, sep]
+        for i, v in enumerate(st.session_state.fleet, 1):
+            swatch = f'<span style="color:{v.color}">■</span>'
+            rows.append(f"| {i} | {v.name} | {mode_badge.get(v.mode, v.mode)} | {v.capacity} | {swatch} |")
+        st.markdown("\n".join(rows), unsafe_allow_html=True)
