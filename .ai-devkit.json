@@ -1,0 +1,21 @@
+{
+  "version": "0.16.0",
+  "environments": [
+    "claude"
+  ],
+  "phases": [
+    "requirements",
+    "design",
+    "planning",
+    "implementation",
+    "monitoring"
+  ],
+  "createdAt": "2026-03-07T23:26:33.617Z",
+  "updatedAt": "2026-03-07T23:44:51.784Z",
+  "skills": [
+    {
+      "registry": "codeaholicguy/ai-devkit",
+      "name": "dev-lifecycle"
+    }
+  ]
+}

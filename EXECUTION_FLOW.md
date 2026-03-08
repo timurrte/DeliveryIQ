@@ -9,7 +9,7 @@ in execution order.
 ## Table of Contents
 
 1. [UI — Input and Geocoding](#1-ui--input-and-geocoding)
-2. [Optimization Pipeline](#2-optimization-pipeline)
+2. [Single-Vehicle Optimization Pipeline](#2-single-vehicle-optimization-pipeline)
    - [Step 1 — OSM Network Download](#step-1--osm-network-download)
    - [Step 2 — Address Snapping](#step-2--address-snapping)
    - [Step 3 — Mode Graphs](#step-3--mode-graphs)
@@ -17,8 +17,17 @@ in execution order.
    - [Step 4 — Distance Matrix + TSP (Bike & Walk)](#step-4--distance-matrix--tsp-bike--walk)
    - [Step 4 (Drive) — Matrix + TSP](#step-4-drive--matrix--tsp)
    - [Step 5 — Route Reconstruction](#step-5--route-reconstruction)
-3. [Results Rendering](#3-results-rendering)
-4. [Data Class Reference](#4-data-class-reference)
+3. [Multi-Vehicle VRP Pipeline](#3-multi-vehicle-vrp-pipeline)
+   - [Step 1 — OSM Network Download](#step-1--osm-network-download-1)
+   - [Step 2 — Address Snapping](#step-2--address-snapping-1)
+   - [Step 3 — Modal Graphs](#step-3--modal-graphs)
+   - [Step 4 — Fleet Capacity Pre-flight](#step-4--fleet-capacity-pre-flight)
+   - [Step 5 — VRP: Phase 1 Mode Assignment](#step-5--vrp-phase-1-mode-assignment)
+   - [Step 6 — VRP: Phase 2 Intra-Mode Distribution](#step-6--vrp-phase-2-intra-mode-distribution)
+   - [Step 7 — Per-Vehicle TSP](#step-7--per-vehicle-tsp)
+   - [Step 8 — Leg Metadata](#step-8--leg-metadata)
+4. [Results Rendering](#4-results-rendering)
+5. [Data Class Reference](#5-data-class-reference)
 
 ---
 
@@ -79,18 +88,45 @@ def reverse_geocode(lat: float, lon: float) -> Optional[DeliveryStop]
 - If the reverse call fails or times out, the address string is set to
   `"<lat>, <lon>"` as a fallback. The stop is still added.
 
-### 1.5 Run Button
+### 1.5 Fleet Configuration (Fleet Settings Tab)
+
+The **Fleet Settings** tab (`fleet_tab`) lets the user manage the vehicle fleet stored
+in `st.session_state.fleet` (a `list[Vehicle]`). The fleet is initialised on first load
+with a single default drive vehicle:
+
+```python
+Vehicle("Vehicle 1", mode="drive", capacity=50, color=VEHICLE_COLORS[0])
+```
+
+Users can:
+- **Edit** name, mode (`drive` / `bike` / `walk`), and capacity per vehicle via inline
+  `st.text_input`, `st.selectbox`, `st.number_input` widgets.
+- **Add** a vehicle with the `＋ Add Vehicle` button — appends a new `Vehicle` and
+  reassigns palette colours by index.
+- **Remove** a vehicle with the `✕` button (disabled when only one vehicle remains) —
+  pops the entry and re-colours the remaining fleet.
+
+Any fleet edit resets `st.session_state.opt_vrp_results` and `opt_results` so stale
+results are not shown.
+
+### 1.6 Run Button
 
 ```python
 run_btn = st.button("🚀  Optimize Routes", disabled=not can_run)
 ```
 
 `can_run` is `True` when `st.session_state.depot is not None` and
-`len(st.session_state.stops) >= 1`. Clicking this button calls `run_optimization()`.
+`len(st.session_state.stops) >= 1`. Clicking this button dispatches to one of two
+pipelines based on fleet size:
+
+| Fleet size | Pipeline |
+|---|---|
+| 1 vehicle | Single-vehicle — `run_optimization()`, produces 3-mode comparison |
+| 2+ vehicles | Multi-vehicle VRP — `run_vrp_optimization()`, partitions stops across fleet |
 
 ---
 
-## 2. Optimization Pipeline
+## 2. Single-Vehicle Optimization Pipeline
 
 Entry point:
 
@@ -498,17 +534,215 @@ and stored in `st.session_state.opt_results`.
 
 ---
 
-## 3. Results Rendering
+## 3. Multi-Vehicle VRP Pipeline
 
-After `run_optimization` returns, `st.rerun()` is called. On the next render cycle
-`st.session_state.opt_results is not None`, so the results dashboard is shown.
+Activated when `len(st.session_state.fleet) >= 2`. Entry point:
 
-### 3.1 Mode Comparison Cards
+```python
+def run_vrp_optimization(
+    depot:      DeliveryStop,
+    stops:      list[DeliveryStop],
+    fleet:      list[Vehicle],
+    radius:     int,
+    tsp_method: str,
+) -> tuple[list[VehicleRoute], dict[str, nx.MultiDiGraph], list[str]]
+```
 
-The three `ModeResult` objects are compared by `total_time_s`. The fastest mode receives
-the "Most Efficient" badge.
+- **Output:**
+  - `vrp_routes` — one `VehicleRoute` per active vehicle (vehicles with 0 stops omitted).
+  - `mode_graphs` — same `{"drive": G, "bike": G, "walk": G}` dict as single-vehicle path.
+  - `warnings_out` — human-readable warnings (unreachable stops, idle vehicles, etc.).
 
-### 3.2 Result Map
+Results are stored in `st.session_state.opt_vrp_results` and
+`st.session_state.opt_graphs`. `opt_results` is cleared to `None` so the single-vehicle
+dashboard is not shown.
+
+---
+
+### Step 1 — OSM Network Download (VRP)
+
+Identical to single-vehicle Step 1:
+
+```python
+G_raw = cached_network_at(depot.lat, depot.lon, radius)
+```
+
+The same `@st.cache_resource` wrapper is used; no extra Overpass downloads occur if the
+single-vehicle path was already run from the same depot.
+
+---
+
+### Step 2 — Address Snapping (VRP)
+
+Identical snapping logic to single-vehicle Step 2. Every stop and the depot have their
+`node_id` field written in-place. Map-click stops go through `nearest_node_safe` with
+the same 500 m tolerance fallback.
+
+Stops that cannot be snapped (`node_id is None`) are collected and reported as warnings;
+only `valid_stops` are passed to `solve_vrp`.
+
+---
+
+### Step 3 — Modal Graphs (VRP)
+
+```python
+mode_graphs = cached_mode_graphs_at(depot.lat, depot.lon, radius)
+```
+
+Returns the same `{"drive": G_drive, "bike": G_bike, "walk": G_walk}` dict.  All three
+copies are shared across every vehicle regardless of mode, so the Overpass download and
+travel-time stamping happen only once.
+
+---
+
+### Step 4 — Fleet Capacity Pre-flight
+
+```python
+total_cap = sum(v.capacity for v in fleet)
+if total_cap < len(valid_stops):
+    raise ValueError(...)
+```
+
+Raises a `ValueError` (caught as `st.error` in `app.py`) if the fleet cannot
+theoretically hold all stops. Per-mode capacity exhaustion is caught separately by
+`_distribute_within_mode` and surfaces with a user-facing error message.
+
+---
+
+### Step 5 — VRP: Phase 1 Mode Assignment
+
+```python
+vrp_routes, vrp_warnings = solve_vrp(valid_stops, depot, fleet, mode_graphs, tsp_method)
+```
+
+`solve_vrp` (in `vrp_solver.py`) calls `_assign_stops_to_modes` first:
+
+```python
+def _assign_stops_to_modes(
+    stops:  list[DeliveryStop],
+    fleet:  list[Vehicle],
+    depot:  DeliveryStop,
+    graphs: dict[str, nx.MultiDiGraph],
+) -> tuple[dict[str, list], list]
+```
+
+**Algorithm:**
+
+1. Compute `mode_remaining[mode]` = sum of capacities of all fleet vehicles with that mode.
+2. For each stop, call `_check_reachable(stop, depot, graphs)`:
+   ```python
+   def _check_reachable(stop, depot, graphs) -> set[str]
+   ```
+   Runs `nx.shortest_path_length(G, depot.node_id, stop.node_id, weight="travel_time")`
+   for each mode graph. A mode is reachable if the cost is strictly below `PENALTY`.
+   Stops sharing the depot's node or with `node_id is None` return an empty set.
+3. From the compatible modes, keep only those with `mode_remaining > 0` (capacity left).
+4. If no mode qualifies, the stop goes to `unreachable` (surfaced as a fleet-level warning).
+5. Otherwise, assign the stop to the mode with the **most remaining capacity** (greedy
+   load-balancing), decrement that mode's counter by 1.
+
+- **Returns:** `(mode_stop_pool, unreachable)`
+  - `mode_stop_pool` — `dict[mode → list[stop]]`, one entry per fleet mode.
+  - `unreachable` — stops no fleet mode can serve.
+
+---
+
+### Step 6 — VRP: Phase 2 Intra-Mode Distribution
+
+For each mode with assigned stops, `solve_vrp` calls:
+
+```python
+def _distribute_within_mode(
+    stops:    list[DeliveryStop],
+    vehicles: list[Vehicle],
+    depot:    DeliveryStop,
+) -> dict[str, list[DeliveryStop]]
+```
+
+**Algorithm:**
+
+1. Run `sklearn.cluster.KMeans(n_clusters=k)` on stop `(lat, lon)` coordinates,
+   where `k = min(len(vehicles), len(stops))`.
+2. Compute the compass bearing from depot to each cluster centroid using:
+   ```python
+   def _bearing(lat1, lon1, lat2, lon2) -> float
+   ```
+3. Sort clusters by bearing and assign each to the next available vehicle (bearing-sorted
+   vehicles cover geographic sectors consistently).
+4. **Capacity rebalancing:** for each over-capacity vehicle, pop excess stops and insert
+   them into any other vehicle with remaining capacity. The scan checks vehicles with
+   higher indices first, then lower indices, so the last vehicle in bearing order can
+   spill back to earlier ones without raising a false `ValueError`.
+5. If no vehicle has remaining capacity, raises `ValueError` (caught in `app.py`).
+
+- **Returns:** `dict[vehicle.name → list[stop]]`.
+
+---
+
+### Step 7 — Per-Vehicle TSP
+
+For each vehicle with at least one assigned stop:
+
+```python
+def _solve_per_vehicle(
+    vehicle:       Vehicle,
+    cluster_stops: list[DeliveryStop],
+    depot:         DeliveryStop,
+    graphs:        dict[str, nx.MultiDiGraph],
+    tsp_method:    str,
+) -> VehicleRoute
+```
+
+1. Selects `G = graphs[vehicle.mode]` — uses the vehicle's own modal graph.
+2. Builds `nodes = [depot.node_id] + [s.node_id for s in cluster_stops]`, deduplicated
+   via `dict.fromkeys` (depot first).
+3. Calls `build_distance_matrix(G, nodes)` → Dijkstra n×n matrix.
+4. Calls `solve_tsp(nodes, matrix, method=tsp_method)` → closed tour
+   `[depot, s1, …, sN, depot]`.
+5. Calls `reconstruct_full_route(G, tsp_route)` → full geometry node sequence.
+6. Computes `total_dist_m` by summing edge `"length"` attributes along `full_route`
+   (missing `"length"` attributes default to `0.0` to avoid `inf`).
+7. Recovers `stop_visit_order` from `tsp_route[1:-1]` using a `node_to_stop` dict built
+   with explicit collision detection: if two stops share an OSM node, a `logger.warning`
+   is emitted and only the first is kept.
+
+- **Returns:** `VehicleRoute` with `vehicle`, `stops`, `tsp_route`, `full_route`,
+  `total_time_s`, `total_dist_m`.
+
+---
+
+### Step 8 — Leg Metadata (VRP)
+
+After `solve_vrp` returns, `run_vrp_optimization` populates `vr.legs` for each route:
+
+```python
+for vr in vrp_routes:
+    G = mode_graphs[vr.vehicle.mode]
+    for i in range(len(vr.tsp_route) - 1):
+        src, dst = vr.tsp_route[i], vr.tsp_route[i + 1]
+        t    = nx.shortest_path_length(G, src, dst, weight="travel_time")
+        path = get_full_path(G, src, dst)
+        dist = leg_dist(G, path)
+        legs.append(LegInfo(from_label, to_label, dist, t, cumulative_t))
+    vr.legs = legs
+```
+
+Uses the vehicle's own modal graph for both the travel-time query and coordinate lookups,
+so bike/walk routes are not contaminated by drive-graph data.
+
+---
+
+## 4. Results Rendering
+
+After either pipeline completes, `st.rerun()` is called. On the next render cycle the
+appropriate results dashboard is shown.
+
+### 4.1 Single-Vehicle Dashboard (`opt_results is not None`)
+
+**Mode Comparison Cards** — three `ModeResult` objects compared by `total_time_s`. The
+fastest mode receives the "Most Efficient" badge.
+
+**Result Map:**
 
 ```python
 def build_result_map(mode_graphs, results, depot, stops) -> folium.Map
@@ -522,15 +756,39 @@ def build_result_map(mode_graphs, results, depot, stops) -> folium.Map
 - Adds `folium.LayerControl` so the user can toggle between car / bike / walk routes.
 - The map object is rendered in the browser via `st_folium(rmap, …)`.
 
-### 3.3 Stop Breakdown Tabs
+**Stop Breakdown Tabs** — for each mode, `render_stop_table(result)` generates an HTML
+table from the `legs` list. Each row shows: From → To, distance, leg travel time,
+estimated arrival (current time + cumulative elapsed), and cumulative elapsed time.
 
-For each mode, `render_stop_table(result)` generates an HTML table from the `legs` list.
-Each row shows: From → To, distance, leg travel time, estimated arrival (current time +
-cumulative elapsed), and cumulative elapsed time.
+### 4.2 Multi-Vehicle VRP Dashboard (`opt_vrp_results is not None`)
+
+**Fleet Summary Cards** — one card per active `VehicleRoute`, colour-coded with the
+vehicle's palette colour, showing name, mode icon, total time, distance, and stop count.
+
+**Vehicle Routes Map:**
+
+```python
+def build_vrp_result_map(mode_graphs, vrp_routes, depot) -> folium.Map
+```
+
+- One `folium.FeatureGroup` per vehicle for the animated `AntPath` route.
+- One `folium.FeatureGroup` per vehicle for numbered stop markers (colour-coded).
+- Coordinate lookup uses `mode_graphs[vr.vehicle.mode]` so bike/walk node IDs resolve
+  correctly even if absent from the drive graph copy.
+- Green depot marker always visible.
+- `folium.LayerControl` (top-left) toggles each vehicle's route and stop layer
+  independently.
+
+**Per-Vehicle Expanders** — each vehicle's expander shows: Total Time, Total Distance,
+Mode metrics, and a `render_stop_table` reusing the existing single-vehicle table
+renderer via a `ModeResult` pseudo-object wrapping the vehicle's legs.
+
+Fleet-level warnings (unreachable stops, idle vehicles) appear above the expanders as
+`warn-box` blocks.
 
 ---
 
-## 4. Data Class Reference
+## 5. Data Class Reference
 
 ### `DeliveryStop`
 ```
@@ -538,7 +796,26 @@ address : str              full geocoded address string
 lat     : float            WGS-84 latitude
 lon     : float            WGS-84 longitude
 source  : str              "typed" | "map_click"
-node_id : int | None       OSM node ID after snapping (set by run_optimization)
+node_id : int | None       OSM node ID after snapping (set by run_optimization / run_vrp_optimization)
+```
+
+### `Vehicle`
+```
+name     : str    display name (e.g. "Van 1")
+mode     : str    "drive" | "bike" | "walk"
+capacity : int    maximum number of stops this vehicle can serve
+color    : str    hex colour from VEHICLE_COLORS palette, assigned at creation time
+```
+
+### `VehicleRoute`
+```
+vehicle      : Vehicle          the vehicle this route belongs to
+stops        : list[DeliveryStop]  ordered stop sequence (depot excluded), in TSP visit order
+tsp_route    : list[int]        closed OSM node tour [depot_node, n1, …, depot_node]
+full_route   : list[int]        expanded OSM node sequence for map polyline rendering
+total_time_s : float            round-trip travel time in seconds
+total_dist_m : float            round-trip road distance in metres
+legs         : list[LegInfo]    populated by run_vrp_optimization after solve_vrp returns
 ```
 
 ### `LegInfo`
@@ -572,7 +849,8 @@ unreachable_to   : list[str]     labels of stops this one cannot reach
 
 ## Penalty Sentinel (`PENALTY = 1e9`)
 
-`PENALTY` is defined identically in both `graph_builder.py` and `route_solver.py`.
+`PENALTY` is defined identically in both `graph_builder.py` and `route_solver.py`, and
+imported into `vrp_solver.py` from `route_solver`.
 It serves two purposes:
 
 1. **Edge weight** — `_compute_travel_time` returns `PENALTY` for any edge a mode
@@ -581,6 +859,8 @@ It serves two purposes:
 
 2. **Matrix entry** — `build_distance_matrix` inserts `PENALTY` for unreachable node
    pairs. `audit_reachability` flags any pair with cost `>= PENALTY`.
+   `_check_reachable` in `vrp_solver.py` uses `cost < PENALTY` (strict less-than),
+   consistent with the same sentinel convention.
 
 The threshold in `audit_reachability` (`>= PENALTY`) must equal the sentinel in
 `graph_builder`. Changing one without the other would silently suppress or falsely
