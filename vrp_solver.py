@@ -45,6 +45,7 @@ from route_solver import (
     reconstruct_full_route,
     PENALTY,
 )
+from graph_builder import nearest_car_accessible_node
 
 logger = logging.getLogger(__name__)
 
@@ -109,8 +110,16 @@ def _check_reachable(stop, depot, graphs: dict) -> set:
 
     reachable = set()
     for mode, G in graphs.items():
+        # For drive mode use the nearest car-accessible node (hybrid last-meter):
+        # the pedestrian snap node may only be reachable via footways (PENALTY edges).
+        if mode == "drive":
+            check_node = nearest_car_accessible_node(G, stop.lat, stop.lon)
+            if check_node is None:
+                check_node = stop.node_id
+        else:
+            check_node = stop.node_id
         try:
-            cost = nx.shortest_path_length(G, depot.node_id, stop.node_id, weight="travel_time")
+            cost = nx.shortest_path_length(G, depot.node_id, check_node, weight="travel_time")
             if cost < PENALTY:
                 reachable.add(mode)
         except (nx.NetworkXNoPath, nx.NodeNotFound):
@@ -241,8 +250,18 @@ def _solve_per_vehicle(
     """Build distance matrix and solve TSP for one vehicle's stop cluster."""
     G = graphs[vehicle.mode]
 
-    # Depot first, then stops; dedup preserves depot-first order
-    nodes = [depot.node_id] + [s.node_id for s in cluster_stops]
+    # Depot first, then stops; dedup preserves depot-first order.
+    # For drive mode use the nearest car-accessible node per stop so the
+    # distance matrix is built on the driveable graph (pedestrian snap nodes
+    # are surrounded by PENALTY edges and would produce an all-PENALTY matrix).
+    if vehicle.mode == "drive":
+        stop_nodes = [
+            nearest_car_accessible_node(G, s.lat, s.lon) or s.node_id
+            for s in cluster_stops
+        ]
+    else:
+        stop_nodes = [s.node_id for s in cluster_stops]
+    nodes = [depot.node_id] + stop_nodes
     nodes = list(dict.fromkeys(nodes))
 
     matrix = build_distance_matrix(G, nodes)

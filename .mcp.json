@@ -1,8 +1,15 @@
 {
   "mcpServers": {
     "memory": {
-      "command": "npx",
-      "args": ["@ai-devkit/memory"]
+      "command": "cmd",
+      "args": [
+        "/c",
+        "npx",
+        "-y",
+        "@ai-devkit/memory"
+      ],
+      "type": "stdio"
     }
   }
 }
+
