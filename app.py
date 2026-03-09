@@ -49,10 +49,14 @@ from route_solver import (
     PENALTY as ROUTE_PENALTY,
 )
 from vrp_solver import Vehicle, VehicleRoute, solve_vrp, VEHICLE_COLORS
+from package_db import Package, PackageDB, DeliveryStatus
 
 logging.basicConfig(level=logging.INFO)
 
 MAPBOX_API_KEY: str = os.getenv("MAPBOX_API_KEY", "")
+
+# Global package database (SQLite, single file in project root)
+_pkg_db = PackageDB()
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CITY LOCK  — change this one line to re-scope the whole app
@@ -1248,7 +1252,7 @@ st.markdown(f"""
   </div>
 </div>""", unsafe_allow_html=True)
 
-map_tab, fleet_tab = st.tabs(["🗺️ Map & Optimize", "🚛 Fleet Settings"])
+map_tab, fleet_tab, pkg_tab = st.tabs(["🗺️ Map & Optimize", "🚛 Fleet Settings", "📦 Packages"])
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  MAP & OPTIMIZE TAB
@@ -1590,3 +1594,189 @@ with fleet_tab:
             swatch = f'<span style="color:{v.color}">■</span>'
             rows.append(f"| {i} | {v.name} | {mode_badge.get(v.mode, v.mode)} | {v.capacity} | {swatch} |")
         st.markdown("\n".join(rows), unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PACKAGES TAB
+# ══════════════════════════════════════════════════════════════════════════════
+
+with pkg_tab:
+    st.markdown('<div class="sec-head">📦 Package Manager</div>', unsafe_allow_html=True)
+
+    # ── Summary counters ──────────────────────────────────────────────────────
+    counts = _pkg_db.count_by_status()
+    pc1, pc2, pc3 = st.columns(3)
+    pc1.metric("⏳ Pending",    counts[DeliveryStatus.PENDING])
+    pc2.metric("🚚 In Transit", counts[DeliveryStatus.IN_TRANSIT])
+    pc3.metric("✅ Delivered",  counts[DeliveryStatus.DELIVERED])
+
+    st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
+
+    # ── Add new package form ──────────────────────────────────────────────────
+    with st.expander("➕ Add New Package", expanded=True):
+        with st.form("add_package_form", clear_on_submit=True):
+            fa1, fa2 = st.columns([3, 1])
+            with fa1:
+                new_addr = st.text_input(
+                    "Delivery address",
+                    placeholder=f"Street in {st.session_state.city.split(',')[0]}…",
+                )
+            with fa2:
+                new_weight = st.number_input(
+                    "Weight (kg)",
+                    min_value=0.01,
+                    max_value=10_000.0,
+                    value=1.0,
+                    step=0.1,
+                    format="%.2f",
+                )
+            submitted = st.form_submit_button("Save Package", use_container_width=True)
+
+        if submitted:
+            if not new_addr.strip():
+                st.error("Address cannot be empty.")
+            else:
+                # Attempt geocoding so coordinates are stored immediately
+                with st.spinner("Geocoding address…"):
+                    geo = forward_geocode(new_addr.strip(), st.session_state.city)
+                if geo:
+                    pkg = _pkg_db.add_package(
+                        address=geo.address,
+                        weight_kg=float(new_weight),
+                        lat=geo.lat,
+                        lon=geo.lon,
+                    )
+                    st.success(f"Package saved — {geo.address[:60]} ({new_weight:.2f} kg)")
+                else:
+                    # Save with raw address even if geocoding failed
+                    pkg = _pkg_db.add_package(
+                        address=new_addr.strip(),
+                        weight_kg=float(new_weight),
+                    )
+                    st.warning(
+                        f"Address not found in {st.session_state.city} — "
+                        "package saved without coordinates."
+                    )
+                st.rerun()
+
+    st.markdown('<div style="height:4px"></div>', unsafe_allow_html=True)
+
+    # ── Filter controls ───────────────────────────────────────────────────────
+    st.markdown("**Filter by status:**")
+    _status_labels = {
+        "All":         None,
+        "⏳ Pending":    DeliveryStatus.PENDING,
+        "🚚 In Transit": DeliveryStatus.IN_TRANSIT,
+        "✅ Delivered":  DeliveryStatus.DELIVERED,
+    }
+    filter_choice = st.radio(
+        "pkg_filter",
+        list(_status_labels.keys()),
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+    selected_status = _status_labels[filter_choice]
+
+    # ── Package list ──────────────────────────────────────────────────────────
+    packages = (
+        _pkg_db.get_all()
+        if selected_status is None
+        else _pkg_db.get_by_status(selected_status)
+    )
+
+    if not packages:
+        st.markdown(
+            '<div style="font-size:.82rem;color:#64748b;padding:12px 0">No packages found.</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        for pkg in packages:
+            col_info, col_status, col_actions = st.columns([4, 2, 2])
+
+            with col_info:
+                short_addr = pkg.address[:55] + ("…" if len(pkg.address) > 55 else "")
+                coords_txt = (
+                    f"{pkg.lat:.5f}, {pkg.lon:.5f}"
+                    if pkg.lat is not None
+                    else "coordinates unknown"
+                )
+                st.markdown(
+                    f"""<div style="padding:6px 0">
+                      <div style="font-weight:600;font-size:.88rem">{short_addr}</div>
+                      <div style="font-size:.75rem;color:#64748b">
+                        ⚖️ {pkg.weight_kg:.2f} kg &nbsp;·&nbsp;
+                        📍 {coords_txt} &nbsp;·&nbsp;
+                        🕐 {pkg.created_at.strftime('%d %b %Y %H:%M')} UTC
+                      </div>
+                    </div>""",
+                    unsafe_allow_html=True,
+                )
+
+            with col_status:
+                st.markdown(
+                    f'<div style="margin-top:8px;font-size:.82rem;font-weight:600;'
+                    f'color:{pkg.status_color}">{pkg.status_label}</div>',
+                    unsafe_allow_html=True,
+                )
+                # Status change selector
+                _opts = [s.value for s in DeliveryStatus]
+                new_status_val = st.selectbox(
+                    "Change status",
+                    _opts,
+                    index=_opts.index(pkg.status.value),
+                    key=f"pkg_status_{pkg.id}",
+                    label_visibility="collapsed",
+                )
+                if new_status_val != pkg.status.value:
+                    _pkg_db.set_status(pkg.id, DeliveryStatus(new_status_val))
+                    st.rerun()
+
+            with col_actions:
+                st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
+                # Add to delivery stops (only if geocoded and not already delivered)
+                can_dispatch = (
+                    pkg.lat is not None
+                    and pkg.status != DeliveryStatus.DELIVERED
+                )
+                if st.button(
+                    "➜ Add to Route",
+                    key=f"pkg_dispatch_{pkg.id}",
+                    disabled=not can_dispatch,
+                    help=(
+                        "Add this address as a delivery stop"
+                        if can_dispatch
+                        else "No coordinates — geocoding failed, or already delivered"
+                    ),
+                    use_container_width=True,
+                ):
+                    new_stop = DeliveryStop(
+                        address=pkg.address,
+                        lat=pkg.lat,
+                        lon=pkg.lon,
+                        source="typed",
+                    )
+                    # Avoid duplicate addresses
+                    existing_addrs = [s.address for s in st.session_state.stops]
+                    if pkg.address not in existing_addrs:
+                        st.session_state.stops.append(new_stop)
+                        st.session_state.opt_results = None
+                        st.session_state.opt_vrp_results = None
+                        _pkg_db.set_status(pkg.id, DeliveryStatus.IN_TRANSIT)
+                        st.success(f"Added to route: {pkg.address[:50]}")
+                        st.rerun()
+                    else:
+                        st.warning("This address is already in the delivery list.")
+
+                if st.button(
+                    "🗑 Delete",
+                    key=f"pkg_delete_{pkg.id}",
+                    use_container_width=True,
+                    type="secondary",
+                ):
+                    _pkg_db.delete_package(pkg.id)
+                    st.rerun()
+
+            st.markdown(
+                '<hr style="border:none;border-top:1px solid #1e293b;margin:4px 0">',
+                unsafe_allow_html=True,
+            )
