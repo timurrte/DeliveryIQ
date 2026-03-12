@@ -74,7 +74,6 @@
     \item $E \subseteq V \times V$ --- множина орієнтованих ребер (доріг);
     \item $\Phi : V \to \vset{A}$ --- функція атрибутів вузлів;
     \item $\Psi : E \to \vset{B}$ --- функція атрибутів ребер.
-    \vset
 \end{itemize}
 
 \begin{definition}
@@ -88,9 +87,9 @@
 \begin{definition}
 \textbf{Ребро} $e_{ij} = (v_i, v_j) \in E$ характеризується кортежем:
 \[
-    \Psi(e_{ij}) = \bigl(\ell_{ij},\; \tau_{ij},\; c_{ij},\; M_{ij},\; \sigma_{ij}\bigr),
+    \Psi(e_{ij}) = \bigl(\ell_{ij},\; \tau_{ij},\; M_{ij}\bigr),
 \]
-де $\ell_{ij} \in \Real_{>0}$ --- довжина сегменту (метри); $\tau_{ij} \in \Real_{>0}$ --- базовий час проходження (секунди); $c_{ij} \in \Real_{>0}$ --- вартість транспортування одиниці вантажу; $M_{ij} \subseteq \mathcal{T}$ --- множина допустимих транспортних засобів; $\sigma_{ij} \in [0, 1]$ --- коефіцієнт надійності.
+де $\ell_{ij} \in \Real_{>0}$ --- довжина сегменту (метри); $\tau_{ij} \in \Real_{>0}$ --- базовий час проходження (секунди); $M_{ij} \subseteq \mathcal{T}$ --- множина допустимих транспортних засобів.
 \end{definition}
 
 \subsection{Типи транспортних засобів та мультимодальність}
@@ -99,25 +98,26 @@
 \[
     \mathcal{T} = \{\mathrm{Car},\; \mathrm{Bike},\; \mathrm{Walk}\},
 \]
-та розбиття множини ребер за типом транспорту:
+та розіб'ємо множини ребер за типом транспорту:
 \[
     E = E_{\mathrm{Car}} \cup E_{\mathrm{Bike}} \cup E_{\mathrm{Walk}}, \qquad
-    E_{\mathrm{Car}} \cap E_{\mathrm{Bike}} \cap E_{\mathrm{Walk}} = \varnothing.
+    E_{\theta_i} \cap E_{\theta_j} = \varnothing \quad \forall\, \theta_i \neq \theta_j \in \mathcal{T}.
 \]
 
-Для кожного типу транспорту $\theta \in \mathcal{T}$ введемо характеристичну швидкість $\bar{u}_\theta$ (м/с) та вантажну місткість $Q_\theta$ (кг):
+Для кожного типу транспорту $\theta \in \mathcal{T}$ введемо характеристику швидкості ${u}_\theta$ (м/с) та вантажну місткість $Q_\theta$ (кг):
 \[
-    \bar{u}_{\mathrm{Car}} > \bar{u}_{\mathrm{Bike}} > \bar{u}_{\mathrm{Walk}}, \qquad
+    {u}_{\mathrm{Car}} > {u}_{\mathrm{Bike}} > {u}_{\mathrm{Walk}}, \qquad
     Q_{\mathrm{Car}} \geq Q_{\mathrm{Bike}} \geq Q_{\mathrm{Walk}}.
 \]
 
-\subsection{Ієрархічна перевірка доступності транспорту}
+\subsection{Перевірка доступності транспорту для проходження ребра}
 
-Введемо метрику доступності ребра $e \in E_\theta$ від поточного вузла $v \in V$:
+Початок маршруту та кінцева точка доставки можуть бути поза межами графу $G$, тому
+введемо метрику доступності типу транспорту $\theta$ від вузла $v \in V$ як відстань до найближчого вузла, з якого виходить хоча б одне ребро типу $\theta$:
 \[
-    d\bigl(v,\, E_\theta\bigr) = \min_{e \in E_\theta,\; v_i(e) = v} \ell_e \;\in\; \Real_{\geq 0},
+    d\bigl(v,\, E_\theta\bigr) = \min_{\substack{u \in V \\ \exists\, e \in E_\theta:\; v_i(e) = u}} \mathrm{dist}_G(v,\, u) \;\in\; \Real_{\geq 0},
 \]
-де $v_i(e)$ --- початковий вузол ребра $e$.
+де $\mathrm{dist}_G(v, u)$ --- довжина найкоротшого шляху між $v$ та $u$ у графі $G$; $v_i(e)$ --- початковий вузол ребра $e$.
 
 Тоді \textbf{логічна функція доступності} транспорту типу $\theta$ у вузлі $v$ визначається як:
 \[
@@ -144,7 +144,7 @@
 \]
 
 \begin{remark}
-Умова $d(v, E_\theta) < 100$ м відповідає стандарту пішохідної доступності транспортних вузлів міської мережі (ДСТУ EN 13816:2012) і може бути параметризована відповідно до конкретної мережі.
+Умова $d(v, E_\theta) < 100$ м було обрано як відстань, яку кур'єр може пронести вантаж пішки і може бути параметризована відповідно до конкретної мережі.
 \end{remark}
 
 \subsection{Формалізація задачі маршрутизації}
@@ -173,7 +173,7 @@
 \[
     T\bigl(\{P_k\}_{k \in \mathcal{K}}\bigr)
     = \sum_{k \in \mathcal{K}} T_k(P_k)
-    = \sum_{k \in \mathcal{K}} \sum_{j=1}^{r_k} t_{e_j^{(k)}}^{(\theta)},
+    = \sum_{k \in \mathcal{K}} \sum_{j=1}^{r_k} t_{e_j^{(k)}}^{\bigl(\theta^*(v_{j-1}^{(k)})\bigr)},
 \]
 де $T_k(P_k)$ --- сумарний час доставки вантажу $k$ маршрутом $P_k$.
 
@@ -182,7 +182,7 @@
 \[
     \boxed{
     \min_{\{P_k\}_{k \in \mathcal{K}}} T\bigl(\{P_k\}\bigr)
-    = \min_{\{P_k\}} \sum_{k \in \mathcal{K}} \sum_{j=1}^{r_k} t_{e_j^{(k)}}^{(\theta)}
+    = \min_{\{P_k\}} \sum_{k \in \mathcal{K}} \sum_{j=1}^{r_k} t_{e_j^{(k)}}^{\bigl(\theta^*(v_{j-1}^{(k)})\bigr)}
     }
 \]
 
@@ -190,7 +190,7 @@
 
 \begin{enumerate}[label=\textbf{О\arabic*.}, leftmargin=3em]
     \item \textbf{(Зв'язність маршруту):} $\forall k \in \mathcal{K}$, $\forall j \in \{1,\ldots,r_k\!-\!1\}$: кінцевий вузол $e_j^{(k)}$ є початковим вузлом $e_{j+1}^{(k)}$.
-    \item \textbf{(Вантажна місткість):} $\forall e \in E,\; \theta \in \mathcal{T}$: $\displaystyle\sum_{k : e \in P_k} q_k \leq Q_\theta$.
+    \item \textbf{(Вантажна місткість):} $\forall e \in E$: $\displaystyle\sum_{k : e \in P_k} q_k \leq Q_{\theta^*(v_i(e))}$.
     \item \textbf{(Часові вікна):} $\forall k \in \mathcal{K}$: $a_k \leq T_k(P_k) \leq b_k$.
     \item \textbf{(Доступність транспорту):} $\forall k \in \mathcal{K}$, $\forall v \in P_k$: $\theta^*(v) \neq \varnothing$.
     \item \textbf{(Допустимість типу транспорту):} $\forall e_{ij} \in P_k$: $\theta^*(v_i) \in M_{ij}$.
