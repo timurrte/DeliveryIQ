@@ -176,19 +176,25 @@
 \]
 де $v_0^{(k)} = o_k$, $\; v_{r_k}^{(k)} = d_k$, \; $e_j^{(k)} \in E$; $r_k$ --- кількість ребер маршруту $P_k$.
 
-\textbf{Час проходження} $j$-го ребра $e_j^{(k)} = (v_{j-1}^{(k)}, v_j^{(k)})$ маршруту $P_k$ визначається ефективною швидкістю, що залежить від типу призначеного транспортного засобу та допустимості ребра:
+Маршрут $P_k$ поділяється на два послідовні відрізки за допомогою \textbf{індексу розбиття} $s_k \in \{0, 1, \ldots, r_k\}$:
+\begin{itemize}[leftmargin=2em]
+    \item \textbf{основний відрізок} (ребра $e_1^{(k)}, \ldots, e_{s_k}^{(k)}$) --- долається транспортним засобом $\xi(k)$ зі швидкістю $\bar{u}_{\theta_{\xi(k)}}$;
+    \item \textbf{відрізок «останньої милі»} (ребра $e_{s_k+1}^{(k)}, \ldots, e_{r_k}^{(k)}$) --- долається пішки зі швидкістю $\bar{u}_{\mathrm{Walk}}$.
+\end{itemize}
+Якщо весь маршрут доступний для $\theta_{\xi(k)}$, то $s_k = r_k$ і відрізок «останньої милі» порожній.
+
+\textbf{Ефективна швидкість} на $j$-му ребрі маршруту $P_k$:
 \[
     \bar{u}_j^{(k)} =
     \begin{cases}
-        \bar{u}_{\theta_{\xi(k)}}, & \text{якщо } \theta_{\xi(k)} \in M_{e_j^{(k)}}, \\[4pt]
-        \bar{u}_{\mathrm{Walk}}, & \text{інакше (Сегмент "остання миля").}
+        \bar{u}_{\theta_{\xi(k)}}, & \text{якщо } j \leq s_k, \\[4pt]
+        \bar{u}_{\mathrm{Walk}}, & \text{якщо } j > s_k.
     \end{cases}
 \]
-Тоді час проходження ребра:
+Тоді час проходження $j$-го ребра $e_j^{(k)} = (v_{j-1}^{(k)}, v_j^{(k)})$:
 \[
     t_j^{(k)} = \frac{\ell_{e_j^{(k)}}}{\bar{u}_j^{(k)}}.
 \]
-Основний маршрут виконується одним типом транспортного засобу $\theta_{\xi(k)}$. Якщо пункт призначення $d_k$ є недосяжним для $\theta_{\xi(k)}$ (перебуває поза межами доступної підмережі $E_{\theta_{\xi(k)}}$), кінцевий відрізок маршруту долається пішки зі швидкістю $\bar{u}_{\mathrm{Walk}}$.
 
 \subsection{Цільова функція}
 
@@ -220,8 +226,8 @@
         \delta_{d_k}^{\min} \;\leq\; t_{\mathrm{dep}}^{(k)} + T_k(P_k) \;\leq\; \delta_{d_k}^{\max},
     \]
     де $t_{\mathrm{dep}}^{(k)} \geq 0$ --- час відправлення вантажу $k$.
-    \item \textbf{(Доступність транспорту):} $\forall k \in \mathcal{K}$, $\forall v \in P_k$: $\mathcal{F}_{\theta_{\xi(k)}}(v) = 1 \;\lor\; \mathcal{F}_{\mathrm{Walk}}(v) = 1$.
-    \item \textbf{(Допустимість типу транспорту з урахуванням "останньої милі"):} $\forall k \in \mathcal{K}$, $\forall e_{ij} \in P_k$: $\theta_{\xi(k)} \in M_{ij} \;\lor\; \mathrm{Walk} \in M_{ij}$.
+    \item \textbf{(Допустимість на основному відрізку):} $\forall k \in \mathcal{K}$, $\forall j \in \{1,\ldots,s_k\}$: $\theta_{\xi(k)} \in M_{e_j^{(k)}}$.
+    \item \textbf{(Допустимість на відрізку «останньої милі»):} $\forall k \in \mathcal{K}$, $\forall j \in \{s_k\!+\!1,\ldots,r_k\}$: $\mathrm{Walk} \in M_{e_j^{(k)}}$.
     \item \textbf{(Цілісність маршруту):} $v_0^{(k)} = o_k$ та $v_{r_k}^{(k)} = d_k$, $\; \forall k \in \mathcal{K}$.
 \end{enumerate}
 
