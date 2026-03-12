@@ -219,3 +219,10 @@ cache/
 plantuml.jar
 .mcp.json
 .claude/settings.local.json
+
+# LaTeX
+docs/*.out
+docs/*.synctex.gz
+docs/*.log
+docs/*.toc
+docs/*.aux
