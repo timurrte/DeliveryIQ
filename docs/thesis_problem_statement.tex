@@ -87,9 +87,9 @@
 \begin{definition}
 \textbf{Ребро} $e_{ij} = (v_i, v_j) \in E$ характеризується кортежем:
 \[
-    \Psi(e_{ij}) = \bigl(\ell_{ij},\; \tau_{ij},\; M_{ij}\bigr),
+    \Psi(e_{ij}) = \bigl(\ell_{ij},\; M_{ij}\bigr),
 \]
-де $\ell_{ij} \in \Real_{>0}$ --- довжина сегменту (метри); $\tau_{ij} \in \Real_{>0}$ --- базовий час проходження (секунди); $M_{ij} \subseteq \mathcal{T}$ --- множина допустимих транспортних засобів.
+де $\ell_{ij} \in \Real_{>0}$ --- довжина сегменту (метри); $M_{ij} \subseteq \mathcal{T}$ --- множина допустимих для цього ребра типів транспортних засобів.
 \end{definition}
 
 \subsection{Типи транспортних засобів та мультимодальність}
@@ -98,17 +98,27 @@
 \[
     \mathcal{T} = \{\mathrm{Car},\; \mathrm{Bike},\; \mathrm{Walk}\},
 \]
-та розіб'ємо множини ребер за типом транспорту:
+та визначимо підмножину ребер, доступних для кожного типу транспорту:
 \[
-    E = E_{\mathrm{Car}} \cup E_{\mathrm{Bike}} \cup E_{\mathrm{Walk}}, \qquad
-    E_{\theta_i} \cap E_{\theta_j} = \varnothing \quad \forall\, \theta_i \neq \theta_j \in \mathcal{T}.
+    E_\theta = \bigl\{\, e \in E \mid \theta \in M_e \,\bigr\}, \qquad \theta \in \mathcal{T}.
 \]
+Підмножини $E_\theta$ можуть перетинатися: одне ребро може бути доступним для кількох типів транспорту.
 
-Для кожного типу транспорту $\theta \in \mathcal{T}$ введемо характеристику швидкості ${u}_\theta$ (м/с) та вантажну місткість $Q_\theta$ (кг):
+Для кожного типу транспорту $\theta \in \mathcal{T}$ введемо характеристичну швидкість $\bar{u}_\theta$ (м/с) та вантажну місткість одиниці $Q_\theta$ (кг):
 \[
-    {u}_{\mathrm{Car}} > {u}_{\mathrm{Bike}} > {u}_{\mathrm{Walk}}, \qquad
+    \bar{u}_{\mathrm{Car}} > \bar{u}_{\mathrm{Bike}} > \bar{u}_{\mathrm{Walk}}, \qquad
     Q_{\mathrm{Car}} \geq Q_{\mathrm{Bike}} \geq Q_{\mathrm{Walk}}.
 \]
+
+\textbf{Парк транспортних засобів.} Визначимо скінченну множину наявних транспортних засобів:
+\[
+    \mathcal{V} = \{v_1^{\mathcal{V}}, v_2^{\mathcal{V}}, \ldots, v_F^{\mathcal{V}}\}, \qquad F = |\mathcal{V}|,
+\]
+де кожному транспортному засобу $w \in \mathcal{V}$ відповідає тип $\theta_w \in \mathcal{T}$. Кількість одиниць кожного типу:
+\[
+    F_\theta = \bigl|\{\, w \in \mathcal{V} \mid \theta_w = \theta \,\}\bigr|, \qquad \theta \in \mathcal{T}.
+\]
+Вантажна місткість транспортного засобу $w$ дорівнює $Q_{\theta_w}$.
 
 \subsection{Перевірка доступності транспорту для проходження ребра}
 
@@ -151,21 +161,26 @@
 
 Нехай задано множину вантажів $\mathcal{K} = \{k_1, k_2, \ldots, k_m\}$. Кожен вантаж $k \in \mathcal{K}$ характеризується кортежем:
 \[
-    k = \bigl(o_k,\; d_k,\; q_k,\; [a_k, b_k]\bigr),
+    k = \bigl(o_k,\; d_k,\; q_k\bigr),
 \]
-де $o_k, d_k \in V$ --- вузли відправлення та призначення; $q_k \in \Real_{>0}$ --- маса вантажу; $[a_k, b_k]$ --- часове вікно доставки.
+де $o_k, d_k \in V$ --- вузли відправлення та призначення; $q_k \in \Real_{>0}$ --- маса вантажу.
+
+Введемо \textbf{функцію призначення} $\xi : \mathcal{K} \to \mathcal{V}$, яка кожному вантажу ставить у відповідність транспортний засіб, що його доставляє. Множина вантажів, призначених транспортному засобу $w \in \mathcal{V}$:
+\[
+    \mathcal{K}_w = \bigl\{\, k \in \mathcal{K} \mid \xi(k) = w \,\bigr\}.
+\]
 
 \textbf{Маршрутом} для вантажу $k$ назвемо послідовність:
 \[
     P_k = \bigl(v_0^{(k)}, e_1^{(k)}, v_1^{(k)}, e_2^{(k)}, \ldots, e_{r_k}^{(k)}, v_{r_k}^{(k)}\bigr),
 \]
-де $v_0^{(k)} = o_k$, $\; v_{r_k}^{(k)} = d_k$, \; $e_j^{(k)} \in E$, \; $r_k = |P_k|$.
+де $v_0^{(k)} = o_k$, $\; v_{r_k}^{(k)} = d_k$, \; $e_j^{(k)} \in E$; $r_k$ --- кількість ребер маршруту $P_k$.
 
 \textbf{Час проходження} сегменту $e_{ij}$ транспортним засобом $\theta^*(v_i)$:
 \[
-    t_{ij}^{(\theta)} = \frac{\ell_{ij}}{\bar{u}_{\theta^*(v_i)}} + \tau_{ij}^{\text{перес}},
+    t_{ij}^{\bigl(\theta^*(v_i)\bigr)} = \frac{\ell_{ij}}{\bar{u}_{\theta^*(v_i)}} + \tau_{ij}^{\text{перес}},
 \]
-де $\tau_{ij}^{\text{перес}}$ --- час пересадки при зміні виду транспорту.
+де $\tau_{ij}^{\text{перес}} \geq 0$ --- час пересадки при зміні виду транспорту на ребрі $e_{ij}$ (дорівнює нулю, якщо вид транспорту не змінюється).
 
 \subsection{Цільова функція}
 
@@ -177,12 +192,12 @@
 \]
 де $T_k(P_k)$ --- сумарний час доставки вантажу $k$ маршрутом $P_k$.
 
-\textbf{Задача оптимізації} полягає у знаходженні набору маршрутів $\{P_k^*\}_{k \in \mathcal{K}}$, який мінімізує цільову функцію:
+\textbf{Задача оптимізації} полягає у знаходженні набору маршрутів $\{P_k^*\}_{k \in \mathcal{K}}$ та функції призначення $\xi^*$, які мінімізують цільову функцію:
 
 \[
     \boxed{
-    \min_{\{P_k\}_{k \in \mathcal{K}}} T\bigl(\{P_k\}\bigr)
-    = \min_{\{P_k\}} \sum_{k \in \mathcal{K}} \sum_{j=1}^{r_k} t_{e_j^{(k)}}^{\bigl(\theta^*(v_{j-1}^{(k)})\bigr)}
+    \min_{\{P_k\},\, \xi} T\bigl(\{P_k\}\bigr)
+    = \min_{\{P_k\},\, \xi} \sum_{k \in \mathcal{K}} \sum_{j=1}^{r_k} t_{e_j^{(k)}}^{\bigl(\theta^*(v_{j-1}^{(k)})\bigr)}
     }
 \]
 
@@ -190,86 +205,12 @@
 
 \begin{enumerate}[label=\textbf{О\arabic*.}, leftmargin=3em]
     \item \textbf{(Зв'язність маршруту):} $\forall k \in \mathcal{K}$, $\forall j \in \{1,\ldots,r_k\!-\!1\}$: кінцевий вузол $e_j^{(k)}$ є початковим вузлом $e_{j+1}^{(k)}$.
-    \item \textbf{(Вантажна місткість):} $\forall e \in E$: $\displaystyle\sum_{k : e \in P_k} q_k \leq Q_{\theta^*(v_i(e))}$.
+    \item \textbf{(Вантажна місткість):} $\forall w \in \mathcal{V}$: $\displaystyle\sum_{k \in \mathcal{K}_w} q_k \leq Q_{\theta_w}$.
     \item \textbf{(Часові вікна):} $\forall k \in \mathcal{K}$: $a_k \leq T_k(P_k) \leq b_k$.
     \item \textbf{(Доступність транспорту):} $\forall k \in \mathcal{K}$, $\forall v \in P_k$: $\theta^*(v) \neq \varnothing$.
     \item \textbf{(Допустимість типу транспорту):} $\forall e_{ij} \in P_k$: $\theta^*(v_i) \in M_{ij}$.
+    \item \textbf{(Узгодженість засобу та маршруту):} $\forall k \in \mathcal{K}$, $\forall e_{ij} \in P_k$: $\theta_{\xi(k)} \in M_{ij}$.
     \item \textbf{(Цілісність маршруту):} $v_0^{(k)} = o_k$ та $v_{r_k}^{(k)} = d_k$, $\; \forall k \in \mathcal{K}$.
 \end{enumerate}
-
-% ================================================================
-\section{Методологія розв'язання задачі}
-
-\subsection{NP-складність задачі}
-
-\begin{theorem}[NP-складність MMVRPTW]
-Задача оптимізації розподілу вантажів у мультимодальній транспортній мережі з часовими вікнами (MMVRPTW --- \textit{Multimodal Vehicle Routing Problem with Time Windows}) є NP-важкою.
-\end{theorem}
-
-Доведення зводиться до поліноміального зведення задачі комівояжера (TSP), яка є NP-повною, до окремого випадку MMVRPTW (при $|\mathcal{K}| = 1$, $|\mathcal{T}| = 1$). Оскільки розмірність простору пошуку $|\Omega|$ зростає як $O\bigl(n! \cdot m^n\bigr)$ (де $n = |V|$, $m = |\mathcal{T}|$), точні методи є обчислювально неприйнятними для задач практичного масштабу.
-
-\subsection{Генетичні алгоритми}
-
-Для розв'язання задачі застосовуються \textbf{Генетичні алгоритми} (ГА) --- метаевристика, що моделює процеси природного добору. Особина (хромосома) кодує набір маршрутів $\{P_k\}_{k \in \mathcal{K}}$ у вигляді перестановки з роздільниками.
-
-Загальна схема ГА:
-\[
-    \text{Популяція}^{(t+1)} = \mathrm{Select}\Bigl(\mathrm{Mutate}\bigl(\mathrm{Crossover}\bigl(\text{Популяція}^{(t)}\bigr)\bigr)\Bigr).
-\]
-
-Фітнес-функція:
-\[
-    f(\text{особина}) = \frac{1}{T(\{P_k\}) + \alpha \cdot \mathrm{Pen}(\{P_k\})},
-\]
-де $\mathrm{Pen}(\{P_k\})$ --- штрафна функція за порушення обмежень О1--О6; $\alpha > 0$ --- коефіцієнт штрафу.
-
-Використовуються оператори:
-\begin{itemize}
-    \item \textbf{Селекція:} турнірна або пропорційна (рулетка);
-    \item \textbf{Схрещування:} Order Crossover (OX) для збереження зв'язності маршруту;
-    \item \textbf{Мутація:} інверсія підпослідовності, переміщення вузла.
-\end{itemize}
-
-\subsection{Ініціалізація початкової популяції: локальний пошук та евристики}
-
-Якість початкової популяції суттєво впливає на швидкість збіжності ГА. Застосовується гібридна ініціалізація:
-
-\begin{enumerate}[leftmargin=2em]
-    \item \textbf{Евристика «Найближчий сусід» (Nearest Neighbor Heuristic, NNH):}
-    \[
-        v_{\text{next}} = \arg\min_{v \in V \setminus \mathrm{visited}} d(v_{\mathrm{cur}}, v),
-    \]
-    де $d(\cdot, \cdot)$ --- зважена відстань у графі $G$. Алгоритм будує жадібний маршрут за $O(n^2)$.
-
-    \item \textbf{Алгоритм Кларка--Райта (Clarke--Wright Savings Algorithm):}
-    \[
-        s_{ij} = c_{i0} + c_{0j} - c_{ij} \geq 0,
-    \]
-    де $v_0$ --- депо, $c_{ij}$ --- вартість ребра. Маршрути об'єднуються в порядку спадання заощадження $s_{ij}$.
-
-    \item \textbf{Локальний пошук (2-opt / 3-opt):} після NNH виконується ітеративне покращення шляхом перестановки пар ребер до локального мінімуму:
-    \[
-        \text{якщо } (c_{ij} + c_{kl}) > (c_{ik} + c_{jl}) \Rightarrow \text{ реверс підпослідовності } [j, k].
-    \]
-\end{enumerate}
-
-Таким чином, початкова популяція для ГА формується як суміш жадібних, заощаджувальних та локально-оптимізованих рішень, що забезпечує широке покриття простору пошуку та прискорює збіжність до глобального оптимуму.
-
-\subsection{Параметри алгоритму}
-
-\begin{center}
-\begin{tabular}{>{\bfseries}lll}
-\toprule
-Параметр & Позначення & Типове значення \\
-\midrule
-Розмір популяції         & $N_{\mathrm{pop}}$ & $100 \div 500$ \\
-Кількість поколінь       & $N_{\mathrm{gen}}$ & $500 \div 2000$ \\
-Ймовірність схрещування  & $p_c$              & $0{,}7 \div 0{,}9$ \\
-Ймовірність мутації      & $p_m$              & $0{,}01 \div 0{,}1$ \\
-Коефіцієнт елітизму      & $\varepsilon$      & $0{,}05 \div 0{,}1$ \\
-Коефіцієнт штрафу        & $\alpha$           & $10^3 \div 10^5$ \\
-\bottomrule
-\end{tabular}
-\end{center}
 
 \end{document}
