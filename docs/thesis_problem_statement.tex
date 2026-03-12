@@ -79,9 +79,9 @@
 \begin{definition}
 \textbf{Вузол} $v_i \in V$ характеризується кортежем атрибутів:
 \[
-    \Phi(v_i) = \bigl(\mathrm{id}_i,\; \lambda_i,\; \mu_i,\; \delta_i^{\min},\; \delta_i^{\max},\; \kappa_i\bigr),
+    \Phi(v_i) = \bigl(\mathrm{id}_i,\; \lambda_i,\; \mu_i,\; \delta_i^{\min},\; \delta_i^{\max}\bigr),
 \]
-де $\mathrm{id}_i$ --- унікальний ідентифікатор; $(\lambda_i, \mu_i) \in \Real^2$ --- географічні координати (широта, довгота); $[\delta_i^{\min}, \delta_i^{\max}]$ --- часове вікно обслуговування; $\kappa_i \in \Real_{\geq 0}$ --- вантажопотужність терміналу.
+де $\mathrm{id}_i$ --- унікальний ідентифікатор; $(\lambda_i, \mu_i) \in \Real^2$ --- географічні координати (широта, довгота); $[\delta_i^{\min}, \delta_i^{\max}]$ --- часове вікно роботи хабу (наприклад, 08:00--21:00).
 \end{definition}
 
 \begin{definition}
@@ -100,7 +100,7 @@
 \]
 та визначимо підмножину ребер, доступних для кожного типу транспорту:
 \[
-    E_\theta = \bigl\{\, e \in E \mid \theta \in M_e \,\bigr\}, \qquad \theta \in \mathcal{T}.
+    E_\theta = \bigl\{\, e_{ij} \in E \mid \theta \in M_{ij} \,\bigr\}, \qquad \theta \in \mathcal{T}.
 \]
 Підмножини $E_\theta$ можуть перетинатися: одне ребро може бути доступним для кількох типів транспорту.
 
@@ -112,7 +112,7 @@
 
 \textbf{Парк транспортних засобів.} Визначимо скінченну множину наявних транспортних засобів:
 \[
-    \mathcal{V} = \{v_1^{\mathcal{V}}, v_2^{\mathcal{V}}, \ldots, v_F^{\mathcal{V}}\}, \qquad F = |\mathcal{V}|,
+    \mathcal{V} = \{w_1, w_2, \ldots, w_F\}, \qquad F = |\mathcal{V}|,
 \]
 де кожному транспортному засобу $w \in \mathcal{V}$ відповідає тип $\theta_w \in \mathcal{T}$. Кількість одиниць кожного типу:
 \[
@@ -176,19 +176,28 @@
 \]
 де $v_0^{(k)} = o_k$, $\; v_{r_k}^{(k)} = d_k$, \; $e_j^{(k)} \in E$; $r_k$ --- кількість ребер маршруту $P_k$.
 
-\textbf{Час проходження} сегменту $e_{ij}$ транспортним засобом $\theta^*(v_i)$:
+\textbf{Час проходження} $j$-го ребра $e_j^{(k)} = (v_{j-1}^{(k)}, v_j^{(k)})$ маршруту $P_k$ визначається ефективною швидкістю, що залежить від типу призначеного транспортного засобу та допустимості ребра:
 \[
-    t_{ij}^{\bigl(\theta^*(v_i)\bigr)} = \frac{\ell_{ij}}{\bar{u}_{\theta^*(v_i)}} + \tau_{ij}^{\text{перес}},
+    \bar{u}_j^{(k)} =
+    \begin{cases}
+        \bar{u}_{\theta_{\xi(k)}}, & \text{якщо } \theta_{\xi(k)} \in M_{e_j^{(k)}}, \\[4pt]
+        \bar{u}_{\mathrm{Walk}}, & \text{інакше (Сегмент "остання миля").}
+    \end{cases}
 \]
-де $\tau_{ij}^{\text{перес}} \geq 0$ --- час пересадки при зміні виду транспорту на ребрі $e_{ij}$ (дорівнює нулю, якщо вид транспорту не змінюється).
+Тоді час проходження ребра:
+\[
+    t_j^{(k)} = \frac{\ell_{e_j^{(k)}}}{\bar{u}_j^{(k)}}.
+\]
+Основний маршрут виконується одним типом транспортного засобу $\theta_{\xi(k)}$. Якщо пункт призначення $d_k$ є недосяжним для $\theta_{\xi(k)}$ (перебуває поза межами доступної підмережі $E_{\theta_{\xi(k)}}$), кінцевий відрізок маршруту долається пішки зі швидкістю $\bar{u}_{\mathrm{Walk}}$.
 
 \subsection{Цільова функція}
 
 \textbf{Сумарний час доставки} по всій множині вантажів визначається як:
 \[
-    T\bigl(\{P_k\}_{k \in \mathcal{K}}\bigr)
+    T\bigl(\{P_k\}_{k \in \mathcal{K}},\, \xi\bigr)
     = \sum_{k \in \mathcal{K}} T_k(P_k)
-    = \sum_{k \in \mathcal{K}} \sum_{j=1}^{r_k} t_{e_j^{(k)}}^{\bigl(\theta^*(v_{j-1}^{(k)})\bigr)},
+    = \sum_{k \in \mathcal{K}} \sum_{j=1}^{r_k} t_j^{(k)}
+    = \sum_{k \in \mathcal{K}} \sum_{j=1}^{r_k} \frac{\ell_{e_j^{(k)}}}{\bar{u}_j^{(k)}},
 \]
 де $T_k(P_k)$ --- сумарний час доставки вантажу $k$ маршрутом $P_k$.
 
@@ -196,8 +205,8 @@
 
 \[
     \boxed{
-    \min_{\{P_k\},\, \xi} T\bigl(\{P_k\}\bigr)
-    = \min_{\{P_k\},\, \xi} \sum_{k \in \mathcal{K}} \sum_{j=1}^{r_k} t_{e_j^{(k)}}^{\bigl(\theta^*(v_{j-1}^{(k)})\bigr)}
+    \min_{\{P_k\},\, \xi}\; T\bigl(\{P_k\},\, \xi\bigr)
+    = \min_{\{P_k\},\, \xi} \sum_{k \in \mathcal{K}} \sum_{j=1}^{r_k} \frac{\ell_{e_j^{(k)}}}{\bar{u}_j^{(k)}}
     }
 \]
 
@@ -206,10 +215,13 @@
 \begin{enumerate}[label=\textbf{О\arabic*.}, leftmargin=3em]
     \item \textbf{(Зв'язність маршруту):} $\forall k \in \mathcal{K}$, $\forall j \in \{1,\ldots,r_k\!-\!1\}$: кінцевий вузол $e_j^{(k)}$ є початковим вузлом $e_{j+1}^{(k)}$.
     \item \textbf{(Вантажна місткість):} $\forall w \in \mathcal{V}$: $\displaystyle\sum_{k \in \mathcal{K}_w} q_k \leq Q_{\theta_w}$.
-    \item \textbf{(Часові вікна):} $\forall k \in \mathcal{K}$: $a_k \leq T_k(P_k) \leq b_k$.
-    \item \textbf{(Доступність транспорту):} $\forall k \in \mathcal{K}$, $\forall v \in P_k$: $\theta^*(v) \neq \varnothing$.
-    \item \textbf{(Допустимість типу транспорту):} $\forall e_{ij} \in P_k$: $\theta^*(v_i) \in M_{ij}$.
-    \item \textbf{(Узгодженість засобу та маршруту):} $\forall k \in \mathcal{K}$, $\forall e_{ij} \in P_k$: $\theta_{\xi(k)} \in M_{ij}$.
+    \item \textbf{(Часові вікна):} $\forall k \in \mathcal{K}$: час прибуття вантажу до пункту призначення потрапляє у вікно роботи хабу:
+    \[
+        \delta_{d_k}^{\min} \;\leq\; t_{\mathrm{dep}}^{(k)} + T_k(P_k) \;\leq\; \delta_{d_k}^{\max},
+    \]
+    де $t_{\mathrm{dep}}^{(k)} \geq 0$ --- час відправлення вантажу $k$.
+    \item \textbf{(Доступність транспорту):} $\forall k \in \mathcal{K}$, $\forall v \in P_k$: $\mathcal{F}_{\theta_{\xi(k)}}(v) = 1 \;\lor\; \mathcal{F}_{\mathrm{Walk}}(v) = 1$.
+    \item \textbf{(Допустимість типу транспорту з урахуванням "останньої милі"):} $\forall k \in \mathcal{K}$, $\forall e_{ij} \in P_k$: $\theta_{\xi(k)} \in M_{ij} \;\lor\; \mathrm{Walk} \in M_{ij}$.
     \item \textbf{(Цілісність маршруту):} $v_0^{(k)} = o_k$ та $v_{r_k}^{(k)} = d_k$, $\; \forall k \in \mathcal{K}$.
 \end{enumerate}
 
