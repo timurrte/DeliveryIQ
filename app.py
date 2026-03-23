@@ -217,6 +217,7 @@ class DeliveryStop:
     lon: float
     source: str = "typed"        # "typed" | "map_click"
     node_id: Optional[int] = None
+    weight_kg: float = 1.0       # package weight q_k (kg)
 
 
 @dataclass
@@ -268,7 +269,7 @@ def _init():
         "opt_warnings": [],
         "opt_car_unreachable": [],
         # Multi-vehicle fleet (VRP)
-        "fleet": [Vehicle("Vehicle 1", "drive", 50, VEHICLE_COLORS[0])],
+        "fleet": [Vehicle("Vehicle 1", "drive", 500.0, VEHICLE_COLORS[0])],
         "opt_vrp_results": None,
         "opt_vrp_warnings": [],
     }
@@ -795,12 +796,14 @@ def run_vrp_optimization(depot, stops, fleet, radius, tsp_method):
     mode_graphs = cached_mode_graphs_at(depot.lat, depot.lon, radius)
     status("Modal graphs ready", done=True)
 
-    # ── Step 4: Total fleet capacity check ───────────────────────────────────
-    total_cap = sum(v.capacity for v in fleet)
-    if total_cap < len(valid_stops):
+    # ── Step 4: Total fleet weight capacity check ────────────────────────────
+    total_cap_kg = sum(v.capacity_kg for v in fleet)
+    total_weight_kg = sum(s.weight_kg for s in valid_stops)
+    if total_cap_kg < total_weight_kg:
         raise ValueError(
-            f"Total fleet capacity ({total_cap}) is less than the number of stops "
-            f"({len(valid_stops)}). Increase vehicle capacities or add more vehicles."
+            f"Total fleet capacity ({total_cap_kg:.1f} kg) is less than total "
+            f"package weight ({total_weight_kg:.1f} kg). "
+            f"Increase vehicle capacities or add more vehicles."
         )
 
     # ── Step 5: Solve VRP ─────────────────────────────────────────────────────
@@ -1541,8 +1544,8 @@ with fleet_tab:
                                     key=f"v_mode_{i}",
                                     label_visibility="collapsed")
         with c3:
-            new_cap = st.number_input("Cap", min_value=1, max_value=500,
-                                      value=v.capacity, step=1,
+            new_cap = st.number_input("Cap (kg)", min_value=1.0, max_value=10000.0,
+                                      value=v.capacity_kg, step=10.0,
                                       key=f"v_cap_{i}",
                                       label_visibility="collapsed")
         with c4:
@@ -1554,15 +1557,15 @@ with fleet_tab:
             updated_fleet.pop(i)
             # Reassign colours in order
             for j, u in enumerate(updated_fleet):
-                updated_fleet[j] = Vehicle(u.name, u.mode, u.capacity,
+                updated_fleet[j] = Vehicle(u.name, u.mode, u.capacity_kg,
                                            VEHICLE_COLORS[j % len(VEHICLE_COLORS)])
             st.session_state.fleet = updated_fleet
             st.session_state.opt_vrp_results = None
             st.session_state.opt_results = None
             st.rerun()
 
-        if new_name != v.name or new_mode != v.mode or int(new_cap) != v.capacity:
-            updated_fleet[i] = Vehicle(new_name, new_mode, int(new_cap),
+        if new_name != v.name or new_mode != v.mode or float(new_cap) != v.capacity_kg:
+            updated_fleet[i] = Vehicle(new_name, new_mode, float(new_cap),
                                        VEHICLE_COLORS[i % len(VEHICLE_COLORS)])
             changed = True
 
@@ -1577,7 +1580,7 @@ with fleet_tab:
         if st.button("＋ Add Vehicle", use_container_width=True):
             new_idx = len(st.session_state.fleet)
             st.session_state.fleet.append(
-                Vehicle(f"Vehicle {new_idx + 1}", "drive", 50,
+                Vehicle(f"Vehicle {new_idx + 1}", "drive", 500.0,
                         VEHICLE_COLORS[new_idx % len(VEHICLE_COLORS)])
             )
             st.session_state.opt_vrp_results = None
@@ -1587,12 +1590,12 @@ with fleet_tab:
     if fleet:
         st.markdown('<div style="height:16px"></div>', unsafe_allow_html=True)
         st.markdown("**Current fleet:**")
-        header = "| # | Vehicle | Mode | Max Stops | Colour |"
+        header = "| # | Vehicle | Mode | Capacity (kg) | Colour |"
         sep    = "|---|---|---|---|---|"
         rows = [header, sep]
         for i, v in enumerate(st.session_state.fleet, 1):
             swatch = f'<span style="color:{v.color}">■</span>'
-            rows.append(f"| {i} | {v.name} | {mode_badge.get(v.mode, v.mode)} | {v.capacity} | {swatch} |")
+            rows.append(f"| {i} | {v.name} | {mode_badge.get(v.mode, v.mode)} | {v.capacity_kg:.0f} | {swatch} |")
         st.markdown("\n".join(rows), unsafe_allow_html=True)
 
 
@@ -1754,6 +1757,7 @@ with pkg_tab:
                         lat=pkg.lat,
                         lon=pkg.lon,
                         source="typed",
+                        weight_kg=pkg.weight_kg,
                     )
                     # Avoid duplicate addresses
                     existing_addrs = [s.address for s in st.session_state.stops]

@@ -1,0 +1,55 @@
+@startuml Sequence_Geocoding
+!theme plain
+skinparam sequenceMessageAlign center
+
+title Діаграма послідовності -- Геокодування адреси доставки
+
+actor "Оператор" as User
+participant "app.py\n(Streamlit UI)" as App
+participant "Nominatim API\n(geopy)" as Nominatim
+
+User -> App : Вводить адресу в поле\n"Add delivery address"
+
+activate App
+
+App -> App : _lock(address, city)\nДодає ", Dnipro, Ukraine"
+
+App -> Nominatim : geocode(query, timeout=10)
+activate Nominatim
+
+alt Адресу знайдено
+    Nominatim --> App : result(address, lat, lon)
+    App -> App : Створити DeliveryStop(\n  address=result.address,\n  lat=result.latitude,\n  lon=result.longitude,\n  source="typed"\n)
+    App -> App : st.session_state["stops"].append(stop)
+    App --> User : Маркер на карті\n+ запис у списку доставок
+
+else Адресу не знайдено
+    Nominatim --> App : None
+    App --> User : Повідомлення про помилку:\n"Could not geocode address"
+
+else Таймаут
+    Nominatim --> App : GeocoderTimedOut
+    App --> User : Повідомлення:\n"Geocoder timed out"
+end
+
+deactivate Nominatim
+deactivate App
+
+== Альтернативний сценарій: додавання кліком на карту ==
+
+User -> App : Клікає на карту (lat, lon)
+
+activate App
+
+App -> Nominatim : reverse((lat, lon), language="en")
+activate Nominatim
+Nominatim --> App : result.address
+deactivate Nominatim
+
+App -> App : Створити DeliveryStop(\n  address=result.address,\n  lat=lat, lon=lon,\n  source="map_click"\n)
+App -> App : st.session_state["stops"].append(stop)
+App --> User : Маркер на карті +\nзворотно-геокодована адреса
+
+deactivate App
+
+@enduml

@@ -66,8 +66,8 @@ VEHICLE_COLORS: list[str] = [
 @dataclass
 class Vehicle:
     name: str
-    mode: str       # "drive" | "bike" | "walk"
-    capacity: int   # maximum number of stops this vehicle can serve
+    mode: str           # "drive" | "bike" | "walk"
+    capacity_kg: float  # maximum payload weight Q_θ (kg)
     color: str = ""
 
 
@@ -148,10 +148,10 @@ def _assign_stops_to_modes(
     unreachable : list[stop]
         Stops that no fleet mode can reach (or that are over capacity).
     """
-    # Total remaining capacity per mode across all vehicles of that mode
-    mode_remaining: dict[str, int] = {}
+    # Total remaining capacity (kg) per mode across all vehicles of that mode
+    mode_remaining_kg: dict[str, float] = {}
     for v in fleet:
-        mode_remaining[v.mode] = mode_remaining.get(v.mode, 0) + v.capacity
+        mode_remaining_kg[v.mode] = mode_remaining_kg.get(v.mode, 0.0) + v.capacity_kg
 
     # Initialise a pool for every mode present in the fleet
     fleet_modes = set(v.mode for v in fleet)
@@ -160,18 +160,19 @@ def _assign_stops_to_modes(
     unreachable: list = []
 
     for stop in stops:
+        stop_w = getattr(stop, "weight_kg", 1.0)
         compatible = _check_reachable(stop, depot, graphs)
-        # Keep only modes that have fleet vehicles with remaining capacity
-        available = [m for m in compatible if mode_remaining.get(m, 0) > 0]
+        # Keep only modes that have fleet vehicles with remaining weight capacity
+        available = [m for m in compatible if mode_remaining_kg.get(m, 0.0) >= stop_w]
 
         if not available:
             unreachable.append(stop)
             continue
 
         # Prefer the mode whose vehicles have the most remaining capacity
-        chosen = max(available, key=lambda m: mode_remaining[m])
+        chosen = max(available, key=lambda m: mode_remaining_kg[m])
         mode_stop_pool[chosen].append(stop)
-        mode_remaining[chosen] -= 1
+        mode_remaining_kg[chosen] -= stop_w
 
     return mode_stop_pool, unreachable
 
@@ -215,25 +216,32 @@ def _distribute_within_mode(stops: list, vehicles: list, depot) -> dict:
         veh_idx = cluster_to_veh_idx[int(cluster_id)]
         assignment[veh_idx].append(stops[stop_idx])
 
-    # Capacity rebalancing: move excess stops to any vehicle with remaining capacity.
-    # Scan all other vehicles (forward first, then backward) so the last vehicle in
-    # bearing order can spill back to earlier ones rather than raising a false error.
+    def _cluster_weight(cluster: list) -> float:
+        return sum(getattr(s, "weight_kg", 1.0) for s in cluster)
+
+    # Capacity rebalancing: move excess stops to any vehicle with remaining
+    # weight capacity.  Scan all other vehicles (forward first, then backward)
+    # so the last vehicle in bearing order can spill back to earlier ones.
     for veh_idx in range(len(vehicles)):
-        cap = vehicles[veh_idx].capacity
-        while len(assignment[veh_idx]) > cap:
+        cap_kg = vehicles[veh_idx].capacity_kg
+        while _cluster_weight(assignment[veh_idx]) > cap_kg and assignment[veh_idx]:
             excess = assignment[veh_idx].pop()
             placed = False
             candidates = list(range(veh_idx + 1, len(vehicles))) + list(range(0, veh_idx))
             for next_idx in candidates:
-                if len(assignment[next_idx]) < vehicles[next_idx].capacity:
+                excess_w = getattr(excess, "weight_kg", 1.0)
+                if _cluster_weight(assignment[next_idx]) + excess_w <= vehicles[next_idx].capacity_kg:
                     assignment[next_idx].insert(0, excess)
                     placed = True
                     break
             if not placed:
                 mode = vehicles[0].mode
+                total_w = sum(getattr(s, "weight_kg", 1.0) for s in stops)
+                total_cap = sum(v.capacity_kg for v in vehicles)
                 raise ValueError(
                     f"Capacity exhausted for {mode!r} vehicles: "
-                    f"{n_stops} stop(s) exceed total {mode} fleet capacity. "
+                    f"total package weight ({total_w:.1f} kg) exceeds "
+                    f"total {mode} fleet capacity ({total_cap:.1f} kg). "
                     f"Increase vehicle capacities or add more {mode} vehicles."
                 )
 

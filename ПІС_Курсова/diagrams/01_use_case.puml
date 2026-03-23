@@ -1,0 +1,62 @@
+@startuml UseCase_DeliveryIQ
+!theme plain
+skinparam actorStyle awesome
+skinparam packageStyle rectangle
+
+title Діаграма прецедентів -- DeliveryIQ
+
+left to right direction
+
+actor "Оператор\nлогістики" as Operator
+actor "Nominatim API" as Nominatim
+actor "OpenStreetMap\n(Overpass API)" as OSM
+actor "Mapbox API" as Mapbox
+
+rectangle "DeliveryIQ — Система оптимізації маршрутів доставки" {
+
+    usecase "Обрати місто\nдоставки" as UC1
+    usecase "Вказати адресу\nдепо" as UC2
+    usecase "Додати адресу\nдоставки" as UC3
+    usecase "Додати точку\nна карті (клік)" as UC4
+    usecase "Видалити точку\nдоставки" as UC5
+    usecase "Керувати\nпарком ТЗ" as UC6
+    usecase "Запустити\nоптимізацію" as UC7
+    usecase "Переглянути\nрезультати на карті" as UC8
+    usecase "Переглянути\nтаблицю маршруту" as UC9
+    usecase "Керувати\nпакунками (БД)" as UC10
+
+    usecase "Геокодувати\nадресу" as UC_GEO
+    usecase "Завантажити\nдорожню мережу" as UC_NET
+    usecase "Побудувати матрицю\nвідстаней (Dijkstra)" as UC_MAT
+    usecase "Розв'язати задачу\nмаршрутизації (TSP/VRP)" as UC_SOLVE
+    usecase "Візуалізувати\nмаршрут (Folium)" as UC_VIS
+    usecase "Отримати матрицю\nчасу з урахуванням\nтрафіку" as UC_MAPBOX
+
+    Operator --> UC1
+    Operator --> UC2
+    Operator --> UC3
+    Operator --> UC4
+    Operator --> UC5
+    Operator --> UC6
+    Operator --> UC7
+    Operator --> UC8
+    Operator --> UC9
+    Operator --> UC10
+
+    UC2 ..> UC_GEO : <<include>>
+    UC3 ..> UC_GEO : <<include>>
+    UC4 ..> UC_GEO : <<include>>
+
+    UC7 ..> UC_NET : <<include>>
+    UC7 ..> UC_MAT : <<include>>
+    UC7 ..> UC_SOLVE : <<include>>
+    UC7 ..> UC_VIS : <<include>>
+
+    UC7 ..> UC_MAPBOX : <<extend>>
+
+    UC_GEO --> Nominatim
+    UC_NET --> OSM
+    UC_MAPBOX --> Mapbox
+}
+
+@enduml

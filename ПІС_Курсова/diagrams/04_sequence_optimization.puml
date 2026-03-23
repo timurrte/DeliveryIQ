@@ -1,0 +1,90 @@
+@startuml Sequence_Optimization
+!theme plain
+skinparam sequenceMessageAlign center
+
+title Діаграма послідовності -- Процес оптимізації маршруту (TSP)
+
+actor "Оператор" as User
+participant "app.py\n(Streamlit UI)" as App
+participant "graph_builder.py\n(GraphBuilder)" as GB
+participant "route_solver.py\n(RouteSolver)" as RS
+participant "visualizer.py\n(Visualizer)" as Vis
+database "OSM\n(Overpass API)" as OSM
+
+User -> App : Натискає "Optimize Routes"
+
+activate App
+
+== Фаза 1: Завантаження мережі ==
+
+App -> GB : cached_network_at(depot.lat, depot.lon, radius)
+activate GB
+GB -> GB : _configure_osmnx_tags()
+GB -> OSM : ox.graph_from_point(lat, lon, dist, "all")
+OSM --> GB : G_raw (MultiDiGraph)
+GB -> GB : _largest_strongly_connected_component(G_raw)
+GB --> App : G (LSCC-pruned graph)
+deactivate GB
+
+== Фаза 2: Прив'язка адрес до вузлів ==
+
+loop для кожної адреси (депо + зупинки)
+    App -> GB : nearest_node(G, lat, lon)
+    GB --> App : node_id
+end
+
+App -> App : Дедуплікація вузлів\n(dict.fromkeys)
+
+== Фаза 3: Побудова модальних графів ==
+
+App -> GB : cached_mode_graphs_at(lat, lon, radius)
+activate GB
+GB -> GB : add_travel_times(G)\n[drive, bike, walk]
+GB --> App : {"drive": G_d, "bike": G_b, "walk": G_w}
+deactivate GB
+
+== Фаза 4: Побудова матриці відстаней ==
+
+loop для кожного режиму (drive, bike, walk)
+    App -> RS : build_distance_matrix(G_mode, nodes, "travel_time")
+    activate RS
+    RS -> RS : Dijkstra all-pairs\n(nx.shortest_path_length)
+    RS --> App : matrix: dict[(i,j) -> seconds]
+    deactivate RS
+
+    App -> RS : audit_reachability(matrix, nodes, labels)
+    RS --> App : list[UnreachableStop]
+end
+
+== Фаза 5: Розв'язання TSP ==
+
+loop для кожного режиму
+    App -> RS : solve_tsp(nodes, matrix, method="auto")
+    activate RS
+    alt n <= 2
+        RS -> RS : _nearest_neighbour()
+    else n <= 20
+        RS -> RS : _nearest_neighbour()\n+ _two_opt()
+    else n > 20
+        RS -> RS : _genetic_algorithm()
+    end
+    RS --> App : (tsp_route, total_time)
+    deactivate RS
+
+    App -> RS : reconstruct_full_route(G, tsp_route)
+    RS --> App : full_route (node-by-node path)
+end
+
+== Фаза 6: Візуалізація ==
+
+App -> Vis : build_map(mode_graphs, routes, times, depot, stops)
+activate Vis
+Vis -> Vis : Folium Map + AntPath\nдля кожного режиму
+Vis --> App : delivery_map.html
+deactivate Vis
+
+App --> User : Карта з маршрутами\n+ таблиця зупинок\n+ метрики часу
+
+deactivate App
+
+@enduml

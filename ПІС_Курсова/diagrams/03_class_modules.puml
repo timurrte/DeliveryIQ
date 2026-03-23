@@ -1,0 +1,112 @@
+@startuml Class_Modules_DeliveryIQ
+!theme plain
+skinparam classAttributeIconSize 0
+skinparam classFontSize 12
+
+title Діаграма класів (модульна структура) -- DeliveryIQ
+
+package "app.py — Streamlit UI" <<Frame>> #FFEEDD {
+    class AppController <<module>> {
+        -DEFAULT_CITY: str = "Dnipro, Ukraine"
+        -LAST_METER_THRESHOLD_M: float = 100.0
+        -_geolocator: Nominatim
+        -_pkg_db: PackageDB
+        __
+        +forward_geocode(raw, city): DeliveryStop
+        +reverse_geocode(lat, lon): DeliveryStop
+        +cached_network(city, radius): MultiDiGraph
+        +cached_network_at(lat, lon, radius): MultiDiGraph
+        +cached_mode_graphs(city, radius): dict
+        +cached_mode_graphs_at(lat, lon, radius): dict
+        +run_optimization(depot, stops, city, radius, method): tuple
+        +run_vrp_optimization(depot, stops, fleet, city, radius): tuple
+    }
+}
+
+package "geocoder.py" <<Frame>> #DDFFDD {
+    class Geocoder <<module>> {
+        -_geolocator: Nominatim
+        __
+        +geocode(address, retries): tuple[float, float]
+        +geocode_all(addresses): list[Location]
+    }
+}
+
+package "graph_builder.py" <<Frame>> #DDDDFF {
+    class GraphBuilder <<module>> {
+        -SPEED_KMH: dict[str, float]
+        -PENALTY: float = 1e9
+        -_REQUIRED_TAGS: list[str]
+        __
+        +get_network(location, dist): MultiDiGraph
+        +get_network_from_point(lat, lon, dist): MultiDiGraph
+        +get_network_from_place(place): MultiDiGraph
+        +add_travel_times(G): dict[str, MultiDiGraph]
+        +add_travel_times_to_single_graph(G): MultiDiGraph
+        +nearest_node(G, lat, lon): int
+        +nearest_node_safe(G, lat, lon): int
+        +nearest_car_accessible_node(G_drive, lat, lon): int
+        +distance_m_between_nodes(G, a, b): float
+        +graph_summary(G): dict
+        __
+        -_configure_osmnx_tags(): void
+        -_largest_strongly_connected_component(G): MultiDiGraph
+        -_compute_travel_time(data, mode, speed): float
+        -_node_car_accessible(G, node): bool
+        -_osm_tag(data, key): str
+        -_bike_contraflow_allowed(data): bool
+    }
+}
+
+package "route_solver.py" <<Frame>> #FFDDDD {
+    class RouteSolver <<module>> {
+        -PENALTY: float = 1e9
+        __
+        +build_distance_matrix(G, nodes, weight): dict
+        +build_drive_matrix_hybrid(G, depot, stops): tuple
+        +build_drive_matrix_mapbox(stops, api_key): dict
+        +solve_tsp(nodes, matrix, method, seed): tuple
+        +reconstruct_full_route(G, tsp_route): list[int]
+        +get_full_path(G, src, dst): list[int]
+        +audit_reachability(matrix, nodes, labels): list
+        __
+        -_route_cost(route, matrix): float
+        -_nearest_neighbour(nodes, matrix): list[int]
+        -_two_opt(route, matrix): list[int]
+        -_christofides_tsp(nodes, matrix): list[int]
+        -_genetic_algorithm(nodes, matrix, seed): list[int]
+    }
+}
+
+package "vrp_solver.py" <<Frame>> #FFDDF0 {
+    class VRPSolver <<module>> {
+        -VEHICLE_COLORS: list[str]
+        __
+        +solve_vrp(depot, stops, fleet, mode_graphs, ...): tuple
+        __
+        -_assign_stops_to_modes(stops, fleet, mode_graphs, ...): dict
+        -_cluster_stops(stops, n_vehicles): list[list]
+        -_rebalance_clusters(clusters, vehicles, stops): list[list]
+    }
+}
+
+package "visualizer.py" <<Frame>> #FFFFDD {
+    class Visualizer <<module>> {
+        -MODE_COLOURS: dict[str, str]
+        __
+        +build_map(mode_graphs, mode_routes, mode_times, ...): Path
+        __
+        -_nc(G, n): tuple
+        -_hms(s): str
+    }
+}
+
+AppController ..> Geocoder : геокодування адрес
+AppController ..> GraphBuilder : завантаження мережі
+AppController ..> RouteSolver : побудова матриці та TSP
+AppController ..> VRPSolver : VRP-оптимізація
+AppController ..> Visualizer : візуалізація карти
+VRPSolver ..> RouteSolver : TSP для кожного ТЗ
+RouteSolver ..> GraphBuilder : PENALTY, nearest_node
+
+@enduml

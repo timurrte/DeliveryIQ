@@ -564,7 +564,7 @@ class TestDataclasses:
         v = Vehicle("Van 1", "drive", 20, "#e41a1c")
         assert v.name == "Van 1"
         assert v.mode == "drive"
-        assert v.capacity == 20
+        assert v.capacity_kg == 20
         assert v.color == "#e41a1c"
 
     def test_vehicle_default_color_empty_string(self):

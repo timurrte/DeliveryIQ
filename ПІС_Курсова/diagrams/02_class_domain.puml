@@ -1,0 +1,142 @@
+@startuml Class_Domain_DeliveryIQ
+!theme plain
+skinparam classAttributeIconSize 0
+skinparam classFontSize 13
+
+title Діаграма класів (предметна область) -- DeliveryIQ
+
+package "Геокодування" <<Rectangle>> {
+    class Location {
+        +address: str
+        +lat: float
+        +lon: float
+        +node_id: int | None
+    }
+}
+
+package "Транспортна мережа" <<Rectangle>> {
+    class TransportGraph <<MultiDiGraph>> {
+        -nodes: dict[int, NodeData]
+        -edges: dict[tuple, EdgeData]
+        +number_of_nodes(): int
+        +number_of_edges(): int
+    }
+
+    class NodeData {
+        +id: int
+        +y: float  -- широта
+        +x: float  -- довгота
+    }
+
+    class EdgeData {
+        +length: float
+        +highway: str
+        +travel_time: float
+        +travel_time_drive: float
+        +travel_time_bike: float
+        +travel_time_walk: float
+        +motor_vehicle: str
+        +bicycle: str
+        +foot: str
+        +oneway: str
+    }
+
+    TransportGraph "1" *-- "*" NodeData : містить
+    TransportGraph "1" *-- "*" EdgeData : містить
+}
+
+package "Доставка" <<Rectangle>> {
+    class DeliveryStop {
+        +address: str
+        +lat: float
+        +lon: float
+        +source: str
+        +node_id: int | None
+        +weight_kg: float
+    }
+
+    class LegInfo {
+        +from_label: str
+        +to_label: str
+        +distance_m: float
+        +travel_time_s: float
+        +cumulative_time_s: float
+    }
+
+    class ModeResult {
+        +mode: str
+        +tsp_route: list[int]
+        +full_route: list[int]
+        +total_time_s: float
+        +legs: list[LegInfo]
+        +stop_visit_order: list | None
+    }
+
+    ModeResult "1" o-- "*" LegInfo : legs
+}
+
+package "Парк ТЗ (VRP)" <<Rectangle>> {
+    class Vehicle {
+        +name: str
+        +mode: str
+        +capacity_kg: float
+        +color: str
+    }
+
+    class VehicleRoute {
+        +vehicle: Vehicle
+        +stops: list[DeliveryStop]
+        +tsp_route: list[int]
+        +full_route: list[int]
+        +total_time_s: float
+    }
+
+    VehicleRoute "1" --> "1" Vehicle : vehicle
+    VehicleRoute "1" o-- "*" DeliveryStop : stops
+}
+
+package "База пакунків" <<Rectangle>> {
+    enum DeliveryStatus {
+        PENDING
+        IN_TRANSIT
+        DELIVERED
+    }
+
+    class Package {
+        +id: str
+        +address: str
+        +weight_kg: float
+        +status: DeliveryStatus
+        +created_at: datetime
+        +lat: float | None
+        +lon: float | None
+        +status_label: str
+        +status_color: str
+    }
+
+    class PackageDB {
+        -_conn: sqlite3.Connection
+        +add_package(address, weight): Package
+        +set_status(id, status): void
+        +get_by_status(status): list[Package]
+        +get_all(): list[Package]
+        +delete(id): void
+    }
+
+    Package --> DeliveryStatus
+    PackageDB "1" o-- "*" Package : зберігає
+}
+
+class UnreachableStop {
+    +node_id: int
+    +label: str
+    +unreachable_from: list[str]
+    +unreachable_to: list[str]
+    +is_isolated: bool
+    +summary(): str
+}
+
+DeliveryStop ..> Location : створюється з
+ModeResult ..> DeliveryStop : описує маршрут для
+
+@enduml

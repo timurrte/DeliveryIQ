@@ -1,0 +1,68 @@
+  Step 1: Build the street network graph
+
+  graph_builder.py downloads a real OpenStreetMap road network using OSMnx:
+
+  1. Download — ox.graph_from_point() fetches all roads/paths/footways within a radius (default 3 km) of the depot
+  coordinates. The network type is "all" (not just roads — includes bike paths, footways, etc.).
+  2. LSCC pruning — The raw graph is pruned to its Largest Strongly Connected Component
+  (_largest_strongly_connected_component). This guarantees that every node can reach every other node via directed edges
+   — eliminating dead-ends and disconnected islands.
+  3. Modal travel-time stamping — add_travel_times() creates three independent copies of the graph (drive / bike /
+  walk). For each edge in each copy, _compute_travel_time() assigns a travel_time attribute:
+    - Passable edges: time = length_meters / speed_m_s (drive=30 km/h, bike=15 km/h, walk=5 km/h)
+    - Impassable edges: time = PENALTY (1e9 seconds) — e.g., a footway gets PENALTY in the drive graph, a
+  motor_vehicle=no road gets PENALTY for cars, steps get PENALTY for bikes, etc.
+
+  This encoding means Dijkstra will never choose an impassable edge if any real detour exists.
+
+  Step 2: Snap addresses to graph nodes
+
+  Each geocoded (lat, lon) is snapped to the nearest OSM node in the pruned graph using ox.nearest_nodes(). For drive
+  mode, nearest_car_accessible_node() ensures the snapped node actually has at least one driveable edge.
+
+  Step 3: Build the distance matrix (Dijkstra)
+
+  build_distance_matrix() (route_solver.py:142) computes all-pairs shortest paths:
+
+  1. Deduplicate nodes (two addresses can snap to the same OSM node).
+  2. For every (src, dst) pair, run nx.shortest_path_length(G, src, dst, weight="travel_time") — this is Dijkstra's
+  algorithm on the weighted directed graph. It finds the path with minimum total travel_time.
+  3. If no path exists → insert PENALTY. If Dijkstra returns 0.0 for distinct nodes → insert PENALTY (defensive guard).
+  4. Result: an n×n dict mapping (node_i, node_j) → seconds.
+
+  For drive mode there's also a hybrid variant (build_drive_matrix_hybrid) that adds a last-meter walking penalty when
+  the car can't reach the exact address, and a Mapbox variant that uses real traffic data.
+
+  Step 4: Solve the TSP
+
+  solve_tsp() (route_solver.py:613) picks a method based on stop count:
+
+  ┌───────┬───────────────────────────────────────────────────────────────────────┐
+  │ Stops │                                Method                                 │
+  ├───────┼───────────────────────────────────────────────────────────────────────┤
+  │ 1–2   │ Nearest Neighbour — greedy, O(n²)                                     │
+  ├───────┼───────────────────────────────────────────────────────────────────────┤
+  │ 3–20  │ 2-opt — NN seed + edge-swap refinement, O(n³)                         │
+  ├───────┼───────────────────────────────────────────────────────────────────────┤
+  │ 21+   │ Genetic Algorithm — order crossover, 120 population × 400 generations │
+  └───────┴───────────────────────────────────────────────────────────────────────┘
+
+  The algorithms:
+
+  - Nearest Neighbour (_nearest_neighbour): Start at depot, always go to the closest unvisited stop, return to depot.
+  - 2-opt (_two_opt): Take the NN route, then repeatedly try reversing sub-segments. Accept a reversal if it reduces
+  total cost. Repeat until no improvement found (up to 2000 iterations).
+  - Genetic Algorithm (_genetic_algorithm): Random population of permutations → order crossover (OX) + swap mutation →
+  elitist selection over 400 generations. Fitness = 1 / (cost + 1).
+  - Christofides (explicit only): Builds an undirected helper graph, runs the ½-approximation algorithm. Falls back to
+  2-opt if the graph is disconnected.
+
+  Step 5: Reconstruct the full route
+
+  reconstruct_full_route() takes the TSP solution (e.g., [depot, stop3, stop1, stop2, depot]) and expands each leg back
+  into the full sequence of OSM nodes by calling nx.shortest_path() again. This gives the actual turn-by-turn
+  street-level path that gets drawn on the map.
+
+  ---
+  In short: Real OSM graph → modal edge weights → Dijkstra for all-pairs distances → TSP heuristic for visit order →
+  Dijkstra again for the actual street-level path.

@@ -1,0 +1,34 @@
+@startuml State_Package
+!theme plain
+
+title Діаграма станів -- Життєвий цикл пакунку (Package)
+
+[*] --> PENDING : add_package()
+
+state PENDING as "Очікує\n(PENDING)" #FFF3CD {
+    PENDING : Пакунок створено в БД
+    PENDING : Адреса задана, координати = None
+}
+
+state IN_TRANSIT as "В дорозі\n(IN_TRANSIT)" #CCE5FF {
+    IN_TRANSIT : Координати геокодовані
+    IN_TRANSIT : Пакунок включено в маршрут ТЗ
+    IN_TRANSIT : Оптимізація виконана
+}
+
+state DELIVERED as "Доставлено\n(DELIVERED)" #D4EDDA {
+    DELIVERED : Пакунок доставлено на адресу
+    DELIVERED : Маршрут завершено
+}
+
+PENDING --> IN_TRANSIT : set_status(IN_TRANSIT)\n[Оператор запускає\nоптимізацію маршруту]
+
+IN_TRANSIT --> DELIVERED : set_status(DELIVERED)\n[Кур'єр підтверджує\nдоставку]
+
+IN_TRANSIT --> PENDING : set_status(PENDING)\n[Повернення в чергу\n(збій доставки)]
+
+PENDING --> [*] : delete()\n[Оператор видаляє\nпакунок]
+
+DELIVERED --> [*] : delete()\n[Архівування]
+
+@enduml
