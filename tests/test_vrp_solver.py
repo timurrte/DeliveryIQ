@@ -1,6 +1,6 @@
 """
 tests/test_vrp_solver.py
-Unit + integration tests for vrp_solver.py (multi-vehicle routing).
+Unit + integration tests for vrp_solver.py (Solomon I1 CVRPTW solver).
 
 Run:
     pytest tests/test_vrp_solver.py -v
@@ -24,8 +24,9 @@ from vrp_solver import (
     _bearing,
     _check_reachable,
     _assign_stops_to_modes,
-    _distribute_within_mode,
-    _solve_per_vehicle,
+    _solomon_i1,
+    _build_solomon_routes,
+    compute_objective,
     solve_vrp,
 )
 
@@ -41,6 +42,10 @@ class Stop:
     lat: float
     lon: float
     node_id: Optional[int] = None
+    weight_kg: float = 1.0
+    tw_open: float = 0.0
+    tw_close: float = 86400.0
+    service_time: float = 0.0
 
 
 def _make_graph(nodes, edges):
@@ -49,7 +54,7 @@ def _make_graph(nodes, edges):
       nodes: list of (node_id, lat, lon)
       edges: list of (u, v, travel_time, length)
     """
-    G = nx.MultiDiGraph()
+    G = nx.MultiDiGraph(crs="EPSG:4326")
     for nid, lat, lon in nodes:
         G.add_node(nid, y=lat, x=lon)
     for u, v, tt, length in edges:
@@ -126,7 +131,6 @@ class TestBearing:
             assert 0.0 <= b < 360.0
 
     def test_same_point_defined(self):
-        # atan2(0, 0) is defined; result should be a finite float in [0, 360)
         b = _bearing(48.0, 35.0, 48.0, 35.0)
         assert math.isfinite(b)
         assert 0.0 <= b < 360.0
@@ -156,17 +160,17 @@ class TestCheckReachable:
         result = _check_reachable(stop, self.depot, self.graphs)
         assert result == {"drive", "bike", "walk"}
 
-    def test_penalty_edge_excluded(self):
-        """Node 4 is only reachable via PENALTY — should not appear in any mode."""
+    @patch("vrp_solver.nearest_car_accessible_node", return_value=None)
+    def test_penalty_edge_excluded(self, _mock_car):
         graphs_p = {"drive": self.Gp, "bike": self.Gp, "walk": self.Gp}
         stop = Stop("Penalty stop", 47.9, 34.9, node_id=4)
         result = _check_reachable(stop, self.depot, graphs_p)
         assert result == set()
 
-    def test_reachable_by_some_modes_only(self):
-        """Only 'walk' graph has path to node 4; drive/bike use penalty graph."""
-        G_walk = _ring_graph()  # node 4 fully connected in walk graph
-        G_penalized = _penalty_graph()  # node 4 only via PENALTY in drive/bike
+    @patch("vrp_solver.nearest_car_accessible_node", return_value=None)
+    def test_reachable_by_some_modes_only(self, _mock_car):
+        G_walk = _ring_graph()
+        G_penalized = _penalty_graph()
         graphs = {"drive": G_penalized, "bike": G_penalized, "walk": G_walk}
         stop = Stop("Walk-only stop", 47.9, 34.9, node_id=4)
         result = _check_reachable(stop, self.depot, graphs)
@@ -174,8 +178,8 @@ class TestCheckReachable:
         assert "drive" not in result
         assert "bike" not in result
 
-    def test_no_path_node_not_found(self):
-        """Stop snapped to a node that doesn't exist in the graph."""
+    @patch("vrp_solver.nearest_car_accessible_node", return_value=None)
+    def test_no_path_node_not_found(self, _mock_car):
         stop = Stop("Missing node", 48.0, 35.0, node_id=999)
         result = _check_reachable(stop, self.depot, self.graphs)
         assert result == set()
@@ -199,8 +203,8 @@ class TestAssignStopsToModes:
         assert len(pool["drive"]) == 3
         assert unreachable == []
 
-    def test_unreachable_stop_skipped(self):
-        """Node 4 only reachable via PENALTY in drive/bike/walk."""
+    @patch("vrp_solver.nearest_car_accessible_node", return_value=None)
+    def test_unreachable_stop_skipped(self, _mock_car):
         G_p = _penalty_graph()
         graphs = {"drive": G_p, "bike": G_p, "walk": G_p}
         fleet = [Vehicle("Van 1", "drive", 10, "#e41a1c")]
@@ -214,7 +218,6 @@ class TestAssignStopsToModes:
         assert len(pool["drive"]) == 1
 
     def test_stop_assigned_to_mode_with_most_capacity(self):
-        """Stop reachable by both drive and walk; drive has more capacity → chosen."""
         fleet = [
             Vehicle("Van", "drive", 10, "#e41a1c"),
             Vehicle("Walker", "walk", 2, "#377eb8"),
@@ -222,15 +225,12 @@ class TestAssignStopsToModes:
         stops = _stops([1, 2, 3])
         pool, unreachable = _assign_stops_to_modes(stops, fleet, self.depot, self.graphs)
         assert unreachable == []
-        # All 3 stops should prefer drive (capacity 10 > walk capacity 2)
         assert len(pool["drive"]) == 3
 
     def test_over_capacity_stops_go_unreachable(self):
-        """Fleet capacity < number of stops → excess stops are unreachable."""
         fleet = [Vehicle("Van", "drive", 1, "#e41a1c")]
         stops = _stops([1, 2])
         pool, unreachable = _assign_stops_to_modes(stops, fleet, self.depot, self.graphs)
-        # Only 1 stop can be assigned; 1 is unreachable (over capacity)
         assert len(pool["drive"]) == 1
         assert len(unreachable) == 1
 
@@ -248,13 +248,11 @@ class TestAssignStopsToModes:
         assert unreachable == []
 
     def test_multi_mode_fleet_distributes_across_modes(self):
-        """With walk-only and drive-only vehicles and stops reachable by both,
-        stops should be split across modes based on capacity."""
         fleet = [
             Vehicle("Van", "drive", 2, "#e41a1c"),
             Vehicle("Walker", "walk", 2, "#377eb8"),
         ]
-        stops = _stops([1, 2, 3])  # all 3 reachable by both modes
+        stops = _stops([1, 2, 3])
         pool, unreachable = _assign_stops_to_modes(stops, fleet, self.depot, self.graphs)
         assert unreachable == []
         total = len(pool.get("drive", [])) + len(pool.get("walk", []))
@@ -262,154 +260,138 @@ class TestAssignStopsToModes:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  _distribute_within_mode()
+#  _solomon_i1() — Solomon Insertion Heuristic
 # ══════════════════════════════════════════════════════════════════════════════
 
-class TestDistributeWithinMode:
-    def setup_method(self):
-        self.depot = _depot()
+class TestSolomonI1:
+    def _build_matrix(self, node_ids, cost=60.0):
+        """Build a symmetric complete matrix for the given node IDs."""
+        matrix = {}
+        for i in node_ids:
+            for j in node_ids:
+                matrix[(i, j)] = 0.0 if i == j else cost
+        return matrix
 
-    def test_single_vehicle_gets_all_stops(self):
-        vehicles = [Vehicle("Van", "drive", 10, "#e41a1c")]
-        stops = _stops([1, 2, 3])
-        result = _distribute_within_mode(stops, vehicles, self.depot)
-        assert len(result["Van"]) == 3
-
-    def test_two_vehicles_split_stops(self):
-        vehicles = [
-            Vehicle("V1", "drive", 5, "#e41a1c"),
-            Vehicle("V2", "drive", 5, "#377eb8"),
-        ]
-        stops = _stops([1, 2])
-        result = _distribute_within_mode(stops, vehicles, self.depot)
-        total = len(result["V1"]) + len(result["V2"])
-        assert total == 2
-
-    def test_capacity_rebalancing_moves_excess(self):
-        """V1 has capacity 1, V2 has capacity 5 — all 4 stops must be assigned."""
-        vehicles = [
-            Vehicle("V1", "drive", 1, "#e41a1c"),
-            Vehicle("V2", "drive", 5, "#377eb8"),
-        ]
-        stops = _stops([1, 2, 3])
-        stops.append(Stop("Stop extra", 48.05, 35.05, node_id=4))
-        # Patch _ring_graph node 4 into stops for this test — node 4 already in ring
-        result = _distribute_within_mode(stops, vehicles, self.depot)
-        assert len(result["V1"]) <= 1
-        assert len(result["V1"]) + len(result["V2"]) == 4
-
-    def test_over_capacity_raises_value_error(self):
-        """Total capacity (2) less than stops (3) → ValueError."""
-        vehicles = [
-            Vehicle("V1", "drive", 1, "#e41a1c"),
-            Vehicle("V2", "drive", 1, "#377eb8"),
-        ]
-        stops = _stops([1, 2, 3])
-        with pytest.raises(ValueError, match="Capacity exhausted"):
-            _distribute_within_mode(stops, vehicles, self.depot)
-
-    def test_k_capped_at_n_stops(self):
-        """More vehicles than stops: k = len(stops), extra vehicles get empty lists."""
-        vehicles = [Vehicle(f"V{i}", "drive", 5, "#e41a1c") for i in range(4)]
-        stops = _stops([1, 2])  # only 2 stops, 4 vehicles
-        result = _distribute_within_mode(stops, vehicles, self.depot)
-        total = sum(len(v) for v in result.values())
-        assert total == 2
+    def test_empty_stops_returns_empty(self):
+        result = _solomon_i1([], [Vehicle("V1", "drive", 10)], _depot(),
+                             {}, 0, {})
+        assert result == []
 
     def test_single_stop_single_vehicle(self):
-        vehicles = [Vehicle("Solo", "drive", 5, "#e41a1c")]
+        depot = _depot()
         stops = _stops([1])
-        result = _distribute_within_mode(stops, vehicles, self.depot)
-        assert len(result["Solo"]) == 1
+        matrix = self._build_matrix([0, 1])
+        stop_nodes = {0: 1}
+        vehicles = [Vehicle("V1", "drive", 10)]
+        result = _solomon_i1(stops, vehicles, depot, matrix, 0, stop_nodes)
+        assert len(result) == 1
+        vehicle, route_indices = result[0]
+        assert vehicle.name == "V1"
+        assert route_indices == [0]
 
-    def test_returns_dict_keyed_by_vehicle_name(self):
-        vehicles = [Vehicle("Alpha", "drive", 10, "#e41a1c")]
-        stops = _stops([1])
-        result = _distribute_within_mode(stops, vehicles, self.depot)
-        assert "Alpha" in result
+    def test_multiple_stops_all_inserted(self):
+        depot = _depot()
+        stops = _stops([1, 2, 3])
+        matrix = self._build_matrix([0, 1, 2, 3])
+        stop_nodes = {0: 1, 1: 2, 2: 3}
+        vehicles = [Vehicle("V1", "drive", 10)]
+        result = _solomon_i1(stops, vehicles, depot, matrix, 0, stop_nodes)
+        total_inserted = sum(len(indices) for _, indices in result)
+        assert total_inserted == 3
 
-    def test_rebalancing_success_branch_covered(self):
-        """
-        Force the rebalancing success path (lines 220-222): create 4 stops
-        that cluster tightly into one group so that V1 (cap 1) receives multiple
-        stops and must spill the excess into V2 (cap 5).
-        """
-        depot = Stop("Depot", 48.0, 35.0, node_id=0)
-        # All 4 stops clustered tightly near (48.1, 35.0); the second cluster
-        # centroid (far from depot) will have 0 items, so k-means with k=2 will
-        # still split them 3+1 or 2+2, but V1 capacity=1 guarantees spillover.
-        clustered_stops = [
-            Stop(f"CS{i}", 48.1 + i * 0.0001, 35.0 + i * 0.0001, node_id=i + 10)
-            for i in range(4)
-        ]
+    def test_capacity_constraint_splits_routes(self):
+        depot = _depot()
+        stops = _stops([1, 2, 3])
+        for s in stops:
+            s.weight_kg = 5.0
+        matrix = self._build_matrix([0, 1, 2, 3])
+        stop_nodes = {0: 1, 1: 2, 2: 3}
         vehicles = [
-            Vehicle("V1", "drive", 1, "#e41a1c"),
-            Vehicle("V2", "drive", 5, "#377eb8"),
+            Vehicle("V1", "drive", 10),
+            Vehicle("V2", "drive", 10),
         ]
-        result = _distribute_within_mode(clustered_stops, vehicles, depot)
-        assert len(result["V1"]) <= 1
-        assert len(result["V1"]) + len(result["V2"]) == 4
+        result = _solomon_i1(stops, vehicles, depot, matrix, 0, stop_nodes)
+        assert len(result) == 2
+        total = sum(len(indices) for _, indices in result)
+        assert total == 3
+
+    def test_seed_is_farthest_from_depot(self):
+        depot = _depot()
+        stops = _stops([1, 2])
+        # Make stop 1 (node 1) far from depot, stop 2 (node 2) close
+        matrix = {
+            (0, 0): 0.0, (0, 1): 200.0, (0, 2): 50.0,
+            (1, 0): 200.0, (1, 1): 0.0, (1, 2): 60.0,
+            (2, 0): 50.0, (2, 1): 60.0, (2, 2): 0.0,
+        }
+        stop_nodes = {0: 1, 1: 2}
+        vehicles = [Vehicle("V1", "drive", 10)]
+        result = _solomon_i1(stops, vehicles, depot, matrix, 0, stop_nodes)
+        # Both stops should be in one route (farthest is seed, then closer one inserted)
+        _, route_indices = result[0]
+        assert len(route_indices) == 2
+        assert 0 in route_indices  # farthest stop (index 0, node 1) is in the route
+
+    def test_time_window_prevents_insertion(self):
+        depot = _depot()
+        depot.tw_open = 0.0
+        depot.tw_close = 100.0  # depot closes at 100s
+        stops = _stops([1])
+        stops[0].tw_open = 0.0
+        stops[0].tw_close = 50.0  # stop closes at 50s
+        # Travel time 200s > tw_close → infeasible
+        matrix = {
+            (0, 0): 0.0, (0, 1): 200.0,
+            (1, 0): 200.0, (1, 1): 0.0,
+        }
+        stop_nodes = {0: 1}
+        vehicles = [Vehicle("V1", "drive", 10)]
+        result = _solomon_i1(stops, vehicles, depot, matrix, 0, stop_nodes)
+        # Stop cannot be inserted due to time window violation
+        total = sum(len(indices) for _, indices in result)
+        assert total == 0
+
+    def test_fleet_exhausted_leaves_unrouted(self):
+        depot = _depot()
+        stops = _stops([1, 2, 3])
+        for s in stops:
+            s.weight_kg = 5.0
+        matrix = self._build_matrix([0, 1, 2, 3])
+        stop_nodes = {0: 1, 1: 2, 2: 3}
+        # Only 1 vehicle with capacity 5 → can fit 1 stop, 2 unrouted
+        vehicles = [Vehicle("V1", "drive", 5)]
+        result = _solomon_i1(stops, vehicles, depot, matrix, 0, stop_nodes)
+        total = sum(len(indices) for _, indices in result)
+        assert total == 1
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  _solve_per_vehicle()
+#  compute_objective()
 # ══════════════════════════════════════════════════════════════════════════════
 
-class TestSolvePerVehicle:
-    def setup_method(self):
-        self.G = _ring_graph()
-        self.depot = _depot()
-        self.vehicle = Vehicle("Van 1", "drive", 10, "#e41a1c")
-        self.graphs = {"drive": self.G}
+class TestComputeObjective:
+    def test_zero_routes(self):
+        assert compute_objective([]) == 0.0
 
-    @patch("vrp_solver.reconstruct_full_route", return_value=[0, 1, 2, 0])
-    @patch("vrp_solver.solve_tsp", return_value=([0, 1, 2, 0], 300.0))
-    @patch("vrp_solver.build_distance_matrix", return_value=[[0, 60, 120], [60, 0, 60], [120, 60, 0]])
-    def test_happy_path_returns_vehicle_route(self, mock_matrix, mock_tsp, mock_reconstruct):
-        stops = _stops([1, 2])
-        result = _solve_per_vehicle(self.vehicle, stops, self.depot, self.graphs, "auto")
-        assert isinstance(result, VehicleRoute)
-        assert result.vehicle is self.vehicle
-        assert result.total_time_s == 300.0
-        assert isinstance(result.total_dist_m, float)
+    def test_single_route(self):
+        v = Vehicle("V", "drive", 10)
+        vr = VehicleRoute(v, [], [0, 1, 0], [0, 1, 0], total_time_s=120.0, total_dist_m=500.0)
+        # F = A*120 + B*1 = 1*120 + 0*1 = 120
+        assert compute_objective([vr]) == 120.0
 
-    @patch("vrp_solver.reconstruct_full_route", return_value=[0, 1, 0])
-    @patch("vrp_solver.solve_tsp", return_value=([0, 1, 0], 120.0))
-    @patch("vrp_solver.build_distance_matrix", return_value=[[0, 60], [60, 0]])
-    def test_stop_visit_order_excludes_depot(self, mock_matrix, mock_tsp, mock_reconstruct):
-        stops = _stops([1])
-        result = _solve_per_vehicle(self.vehicle, stops, self.depot, self.graphs, "auto")
-        # stop_visit_order should contain stop 1, not depot 0
-        assert all(s.node_id != 0 for s in result.stops)
-        assert len(result.stops) == 1
+    def test_with_vehicle_penalty(self):
+        v = Vehicle("V", "drive", 10)
+        vr = VehicleRoute(v, [], [0, 1, 0], [0, 1, 0], total_time_s=100.0, total_dist_m=500.0)
+        # F = 1*100 + 10*1 = 110
+        assert compute_objective([vr], A=1.0, B=10.0) == 110.0
 
-    @patch("vrp_solver.reconstruct_full_route", return_value=[0, 1, 0])
-    @patch("vrp_solver.solve_tsp", return_value=([0, 1, 0], 120.0))
-    @patch("vrp_solver.build_distance_matrix", return_value=[[0, 60], [60, 0]])
-    def test_duplicate_node_ids_only_first_in_visit_order(self, mock_matrix, mock_tsp, mock_reconstruct):
-        """Two stops with same node_id: only the first is added to stop_visit_order."""
-        stop_a = Stop("A", 48.1, 35.0, node_id=1)
-        stop_b = Stop("B at same node", 48.1, 35.0, node_id=1)
-        result = _solve_per_vehicle(self.vehicle, [stop_a, stop_b], self.depot, self.graphs, "auto")
-        node_ids_in_result = [s.node_id for s in result.stops]
-        assert node_ids_in_result.count(1) == 1
-
-    @patch("vrp_solver.reconstruct_full_route", return_value=[0, 1, 2, 0])
-    @patch("vrp_solver.solve_tsp", return_value=([0, 1, 2, 0], 180.0))
-    @patch("vrp_solver.build_distance_matrix", return_value=[[0, 60, 120], [60, 0, 60], [120, 60, 0]])
-    def test_total_dist_m_is_non_negative(self, mock_matrix, mock_tsp, mock_reconstruct):
-        stops = _stops([1, 2])
-        result = _solve_per_vehicle(self.vehicle, stops, self.depot, self.graphs, "auto")
-        assert result.total_dist_m >= 0.0
-
-    @patch("vrp_solver.reconstruct_full_route", return_value=[0, 1, 0])
-    @patch("vrp_solver.solve_tsp", return_value=([0, 1, 0], 60.0))
-    @patch("vrp_solver.build_distance_matrix", return_value=[[0, 60], [60, 0]])
-    def test_tsp_method_forwarded(self, mock_matrix, mock_tsp, mock_reconstruct):
-        stops = _stops([1])
-        _solve_per_vehicle(self.vehicle, stops, self.depot, self.graphs, "2opt")
-        _, kwargs = mock_tsp.call_args
-        assert kwargs.get("method") == "2opt" or mock_tsp.call_args[0][2] == "2opt"
+    def test_multiple_routes(self):
+        v1 = Vehicle("V1", "drive", 10)
+        v2 = Vehicle("V2", "drive", 10)
+        vr1 = VehicleRoute(v1, [], [], [], total_time_s=100.0, total_dist_m=0)
+        vr2 = VehicleRoute(v2, [], [], [], total_time_s=200.0, total_dist_m=0)
+        # F = 1*(100+200) + 5*2 = 310
+        assert compute_objective([vr1, vr2], A=1.0, B=5.0) == 310.0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -437,19 +419,13 @@ class TestSolveVrp:
         with pytest.raises(ValueError, match="node_id is None"):
             solve_vrp(_stops([1]), depot, fleet, self.graphs)
 
-    @patch("vrp_solver.reconstruct_full_route", return_value=[0, 1, 0])
-    @patch("vrp_solver.solve_tsp", return_value=([0, 1, 0], 120.0))
-    @patch("vrp_solver.build_distance_matrix", return_value=[[0, 60], [60, 0]])
-    def test_happy_path_single_vehicle(self, mock_matrix, mock_tsp, mock_reconstruct):
+    def test_happy_path_single_vehicle(self):
         fleet = [Vehicle("V1", "drive", 10, "#e41a1c")]
         routes, warnings = solve_vrp(_stops([1]), self.depot, fleet, self.graphs)
         assert len(routes) == 1
         assert routes[0].vehicle.name == "V1"
 
-    @patch("vrp_solver.reconstruct_full_route", return_value=[0, 1, 0])
-    @patch("vrp_solver.solve_tsp", return_value=([0, 1, 0], 120.0))
-    @patch("vrp_solver.build_distance_matrix", return_value=[[0, 60], [60, 0]])
-    def test_returns_tuple_of_routes_and_warnings(self, *_mocks):
+    def test_returns_tuple_of_routes_and_warnings(self):
         fleet = [Vehicle("V1", "drive", 10, "#e41a1c")]
         result = solve_vrp(_stops([1]), self.depot, fleet, self.graphs)
         assert isinstance(result, tuple)
@@ -458,47 +434,30 @@ class TestSolveVrp:
         assert isinstance(routes, list)
         assert isinstance(warnings, list)
 
-    @patch("vrp_solver.reconstruct_full_route", return_value=[0, 1, 0])
-    @patch("vrp_solver.solve_tsp", return_value=([0, 1, 0], 120.0))
-    @patch("vrp_solver.build_distance_matrix", return_value=[[0, 60], [60, 0]])
-    def test_idle_vehicle_produces_warning(self, *_mocks):
-        """V2 has no compatible mode for the given stops → idle warning."""
-        # Use penalty graph so node 1 unreachable by bike, but reachable by drive
-        Gp = _penalty_graph()
-        graphs = {
-            "drive": self.G,   # drive: node 1 reachable
-            "bike": Gp,        # bike: node 1 reachable (penalty only for node 4)
-            "walk": self.G,
-        }
+    def test_idle_vehicle_produces_warning(self):
         fleet = [
             Vehicle("V1", "drive", 10, "#e41a1c"),
-            Vehicle("V2", "drive", 10, "#377eb8"),  # same mode, will be idle after distribution
+            Vehicle("V2", "drive", 10, "#377eb8"),
         ]
-        stops = _stops([1])  # only 1 stop; one vehicle will be idle
-        routes, warnings = solve_vrp(stops, self.depot, fleet, graphs)
+        stops = _stops([1])
+        routes, warnings = solve_vrp(stops, self.depot, fleet, self.graphs)
         idle_warnings = [w for w in warnings if "idle" in w.lower() or "no stops" in w.lower()]
         assert len(idle_warnings) >= 1
 
-    def test_unreachable_stop_produces_warning(self):
-        """Stop at node 4 is unreachable (PENALTY) — should appear in warnings."""
+    @patch("vrp_solver.nearest_car_accessible_node", return_value=None)
+    def test_unreachable_stop_produces_warning(self, _mock_car):
         Gp = _penalty_graph()
         graphs = {"drive": Gp, "bike": Gp, "walk": Gp}
         fleet = [Vehicle("V1", "drive", 10, "#e41a1c")]
         reachable_stop = Stop("Good", 48.1, 35.0, node_id=1)
         bad_stop = Stop("Bad", 47.9, 34.9, node_id=4)
-
-        with patch("vrp_solver.build_distance_matrix", return_value=[[0, 60], [60, 0]]), \
-             patch("vrp_solver.solve_tsp", return_value=([0, 1, 0], 60.0)), \
-             patch("vrp_solver.reconstruct_full_route", return_value=[0, 1, 0]):
-            routes, warnings = solve_vrp(
-                [reachable_stop, bad_stop], self.depot, fleet, graphs
-            )
-
+        routes, warnings = solve_vrp(
+            [reachable_stop, bad_stop], self.depot, fleet, graphs
+        )
         unreachable_warns = [w for w in warnings if "unreachable" in w.lower() or "skipped" in w.lower()]
         assert len(unreachable_warns) >= 1
 
     def test_no_vehicle_routed_raises_runtime_error(self):
-        """All stops unreachable → no routes produced → RuntimeError."""
         Gp = _penalty_graph()
         graphs = {"drive": Gp, "bike": Gp, "walk": Gp}
         fleet = [Vehicle("V1", "drive", 10, "#e41a1c")]
@@ -506,34 +465,21 @@ class TestSolveVrp:
         with pytest.raises(RuntimeError, match="No vehicle could be routed"):
             solve_vrp([bad_stop], self.depot, fleet, graphs)
 
-    @patch("vrp_solver.reconstruct_full_route", side_effect=lambda G, r: r)
-    @patch("vrp_solver.solve_tsp", return_value=([0, 1, 0], 60.0))
-    @patch("vrp_solver.build_distance_matrix", return_value=[[0, 60], [60, 0]])
-    def test_multi_mode_fleet_routes_each_mode(self, *_mocks):
-        """Two vehicles with different modes each get their own route."""
+    def test_multi_mode_fleet_routes_each_mode(self):
         fleet = [
             Vehicle("Driver", "drive", 5, "#e41a1c"),
             Vehicle("Biker",  "bike",  5, "#377eb8"),
         ]
-        # Node 1 reachable by drive; node 2 reachable by bike (same ring graph for both here)
         routes, warnings = solve_vrp(_stops([1, 2]), self.depot, fleet, self.graphs)
         assert len(routes) >= 1
         served_vehicles = {r.vehicle.name for r in routes}
-        # At least one vehicle has a route
         assert len(served_vehicles) >= 1
 
-    @patch("vrp_solver.reconstruct_full_route", return_value=[0, 1, 0])
-    @patch("vrp_solver.solve_tsp", return_value=([0, 1, 0], 60.0))
-    @patch("vrp_solver.build_distance_matrix", return_value=[[0, 60], [60, 0]])
-    def test_over_capacity_excess_stops_become_unreachable(self, *_mocks):
-        """When fleet capacity (1) < stops (3), the 2 excess stops become
-        unreachable (warning emitted) and the 1 fitting stop is routed normally."""
+    def test_over_capacity_excess_stops_become_unreachable(self):
         fleet = [Vehicle("V1", "drive", 1, "#e41a1c")]
         stops = _stops([1, 2, 3])
         routes, warnings = solve_vrp(stops, self.depot, fleet, self.graphs)
-        # 1 route produced for the 1 stop that fits
         assert len(routes) == 1
-        # Warning about unreachable / skipped stops
         skipped_warns = [w for w in warnings if "unreachable" in w.lower() or "skipped" in w.lower()]
         assert len(skipped_warns) >= 1
 

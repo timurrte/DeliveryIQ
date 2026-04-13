@@ -218,6 +218,9 @@ class DeliveryStop:
     source: str = "typed"        # "typed" | "map_click"
     node_id: Optional[int] = None
     weight_kg: float = 1.0       # package weight q_k (kg)
+    tw_open: float = 0.0         # time window open  δ_min (seconds from midnight)
+    tw_close: float = 86400.0    # time window close δ_max (seconds from midnight)
+    service_time: float = 0.0    # service time s_i (seconds)
 
 
 @dataclass
