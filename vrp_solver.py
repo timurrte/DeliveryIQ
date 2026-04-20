@@ -351,10 +351,14 @@ def _check_reachable(stop, depot, graphs: dict) -> set:
             check_node = nearest_car_accessible_node(G, stop.lat, stop.lon)
             if check_node is None:
                 check_node = stop.node_id
+            depot_node = nearest_car_accessible_node(G, depot.lat, depot.lon)
+            if depot_node is None:
+                depot_node = depot.node_id
         else:
             check_node = stop.node_id
+            depot_node = depot.node_id
         try:
-            cost = nx.shortest_path_length(G, depot.node_id, check_node, weight="travel_time")
+            cost = nx.shortest_path_length(G, depot_node, check_node, weight="travel_time")
             if cost < PENALTY:
                 reachable.add(mode)
         except (nx.NetworkXNoPath, nx.NodeNotFound):
@@ -430,7 +434,10 @@ def _build_solomon_routes(
     else:
         node_ids = [s.node_id for s in pool_stops]
 
-    depot_node = depot.node_id
+    if mode == "drive":
+        depot_node = nearest_car_accessible_node(G, depot.lat, depot.lon) or depot.node_id
+    else:
+        depot_node = depot.node_id
 
     # Build distance matrix for depot + all stops
     all_nodes = [depot_node] + node_ids
