@@ -1,14 +1,14 @@
 [0] Config.pm:328> INFO - This is Biber 2.21
 [0] Config.pm:331> INFO - Logfile is 'thesis_problem_statement.blg'
-[143] biber-MSWIN64:342> INFO - === 
-[185] Biber.pm:421> INFO - Reading 'thesis_problem_statement.bcf'
-[282] Biber.pm:1002> INFO - Found 5 citekeys in bib section 0
-[300] Biber.pm:4487> INFO - Processing section 0
-[309] Biber.pm:4678> INFO - Looking for bibtex file 'references.bib' for section 0
-[373] bibtex.pm:1713> INFO - LaTeX decoding ...
-[385] bibtex.pm:1519> INFO - Found BibTeX data source 'references.bib'
-[432] UCollate.pm:68> INFO - Overriding locale 'uk-UA' defaults 'normalization = NFD' with 'normalization = prenormalized'
-[432] UCollate.pm:68> INFO - Overriding locale 'uk-UA' defaults 'variable = shifted' with 'variable = non-ignorable'
-[432] Biber.pm:4307> INFO - Sorting list 'none/global//global/global/global' of type 'entry' with template 'none' and locale 'uk-UA'
-[435] bbl.pm:676> INFO - Writing 'thesis_problem_statement.bbl' with encoding 'UTF-8'
-[437] bbl.pm:779> INFO - Output to thesis_problem_statement.bbl
+[127] biber-MSWIN64:342> INFO - === 
+[157] Biber.pm:421> INFO - Reading 'thesis_problem_statement.bcf'
+[249] Biber.pm:1002> INFO - Found 9 citekeys in bib section 0
+[268] Biber.pm:4487> INFO - Processing section 0
+[277] Biber.pm:4678> INFO - Looking for bibtex file 'references.bib' for section 0
+[321] bibtex.pm:1713> INFO - LaTeX decoding ...
+[336] bibtex.pm:1519> INFO - Found BibTeX data source 'references.bib'
+[395] UCollate.pm:68> INFO - Overriding locale 'uk-UA' defaults 'normalization = NFD' with 'normalization = prenormalized'
+[395] UCollate.pm:68> INFO - Overriding locale 'uk-UA' defaults 'variable = shifted' with 'variable = non-ignorable'
+[395] Biber.pm:4307> INFO - Sorting list 'none/global//global/global/global' of type 'entry' with template 'none' and locale 'uk-UA'
+[400] bbl.pm:676> INFO - Writing 'thesis_problem_statement.bbl' with encoding 'UTF-8'
+[404] bbl.pm:779> INFO - Output to thesis_problem_statement.bbl

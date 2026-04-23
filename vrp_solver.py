@@ -1,7 +1,8 @@
 """
-vrp_solver.py — CVRPTW solver for DeliveryIQ (Solomon I1 Insertion Heuristic)
+vrp_solver.py — CVRPTW solver for DeliveryIQ (Genetic Algorithm)
 ==============================================================================
-Implements the Solomon Insertion Heuristic I1 as described in the thesis
+Solves the Capacitated Vehicle Routing Problem with Time Windows (CVRPTW)
+via a genetic algorithm, as described in the thesis
 "Розробка та програмна реалізація алгоритму оптимізації розподілу вантажів
 у транспортній мережі".
 
@@ -13,37 +14,49 @@ Phase 1 — Mode assignment (per stop):
   impassable edges).  Assign each stop to the vehicle-type pool that has
   the most remaining capacity among compatible modes.
 
-Phase 2 — Solomon I1 sequential insertion (per mode):
-  Within each mode's stop pool, build routes one at a time using Solomon's
-  I1 insertion heuristic:
-    1. Seed: pick the unrouted customer farthest from depot.
-    2. Iteratively insert the customer with the best c2 score into its
-       best feasible position (c1 criterion), checking capacity (Д2) and
-       time window (Д3) constraints at every insertion.
-    3. When no more customers fit the current route, close it and start
-       a new route with a new vehicle (if available).
+Phase 2 — Genetic algorithm (per mode):
+  Within each mode's stop pool, a steady-state GA searches for a good
+  assignment + ordering:
+    * Chromosome: a permutation of customer indices (giant tour, no
+      route-boundary markers).
+    * Decoder (Split): walks the permutation and greedily partitions
+      it into capacity- and time-window-feasible sub-sequences,
+      dispatching each to the next available vehicle from the fleet.
+    * Fitness (minimised):   F = A·T_total + B·K + P·|U|
+      where K is the number of active vehicles and U is the set of
+      unrouted customers (P >> A, B discourages infeasibility).
+    * Operators: tournament selection, Order Crossover (OX), swap
+      mutation, elitism.
+    * Initialisation: one greedy nearest-neighbour chromosome plus
+      random permutations — this seeds the population with a
+      reasonable warm start while preserving diversity.
 
 Key design decisions
 --------------------
 * Round-trip routing: every vehicle starts AND ends at the depot.
 * PENALTY sentinel (1e9): same value as route_solver.py.
-* The c1 criterion is a weighted combination of extra travel time (c11)
-  and push-forward delay (c12): c1 = α1·c11 + α2·c12.
-* The c2 criterion balances depot-distance incentive against insertion
-  cost: c2 = λ·t(0,u) − c1*(u, R).
-* Time windows and service times are propagated via push-forward (PF)
-  checks along the entire route suffix after each candidate insertion.
+* Permutation encoding is universally feasible (decode enforces
+  all constraints), so operators never produce malformed offspring.
+* Elitism preserves the top E chromosomes each generation,
+  guaranteeing the best-so-far fitness is non-increasing.
+* Deterministic by default (GA_SEED = 42) so repeated runs reproduce
+  the same routes — important for debugging and for consistent UI.
 
 References
 ----------
-Solomon, M. M. (1987). Algorithms for the vehicle routing and scheduling
-problems with time window constraints. Operations Research, 35(2), 254–265.
+Holland, J. H. (1975). Adaptation in Natural and Artificial Systems.
+Prins, C. (2004). A simple and effective evolutionary algorithm for the
+  vehicle routing problem. Computers & Operations Research, 31(12),
+  1985–2002.
+Oliver, I. M., Smith, D. J., Holland, J. R. C. (1987). A study of
+  permutation crossover operators on the TSP. Proc. ICGA '87.
 """
 
 from __future__ import annotations
 
 import logging
 import math
+import random
 from dataclasses import dataclass, field
 
 import networkx as nx
@@ -64,15 +77,19 @@ VEHICLE_COLORS: list[str] = [
     "#66c2a5", "#fc8d62",
 ]
 
-# ── Solomon I1 default parameters (§2.7 of thesis) ──────────────────────────
-ALPHA_1: float = 1.0   # weight of extra travel time in c1
-ALPHA_2: float = 0.0   # weight of push-forward in c1
-MU_1: float = 1.0      # coefficient for direct-path subtraction in c11
-LAMBDA_C2: float = 1.0  # weight of depot-distance in c2
+# ── Genetic-algorithm default parameters (§2.7 of thesis) ───────────────────
+POP_SIZE: int = 50
+N_GENERATIONS: int = 150
+CROSSOVER_RATE: float = 0.85
+MUTATION_RATE: float = 0.15
+ELITE_SIZE: int = 2
+TOURNAMENT_SIZE: int = 3
+UNROUTED_PENALTY: float = 1.0e6   # fitness penalty per unrouted customer
+GA_SEED: int | None = 42          # None => non-deterministic runs
 
-# Objective function weights: F = A·T_total + B·|V_act|
-OBJ_A: float = 1.0     # weight of total travel time
-OBJ_B: float = 0.0     # weight of number of active vehicles
+# Objective-function weights: F = A·T_total + B·|V_act|
+OBJ_A: float = 1.0
+OBJ_B: float = 0.0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -100,53 +117,38 @@ class VehicleRoute:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SOLOMON I1 INSERTION HEURISTIC
+#  GENETIC ALGORITHM — DECODER (Split)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _solomon_i1(
+def _decode_chromosome(
+    chromosome: list[int],
     stops: list,
     vehicles: list,
     depot,
     matrix: dict,
     depot_node: int,
     stop_nodes: dict,
-    *,
-    alpha_1: float = ALPHA_1,
-    alpha_2: float = ALPHA_2,
-    mu_1: float = MU_1,
-    lambda_c2: float = LAMBDA_C2,
-) -> list[tuple[Vehicle, list]]:
+) -> tuple[list[tuple[Vehicle, list[int]]], list[int]]:
     """
-    Solomon I1 sequential insertion heuristic for CVRPTW.
+    Split decoder — converts a permutation into a list of feasible vehicle
+    routes.
 
-    Parameters
-    ----------
-    stops       : list of DeliveryStop objects (unrouted customers)
-    vehicles    : list of Vehicle objects available for this mode
-    depot       : DeliveryStop for the depot (with tw_open, tw_close, service_time)
-    matrix      : dict[(node_i, node_j) -> float] travel time matrix
-    depot_node  : int, OSM node id of the depot
-    stop_nodes  : dict[stop_index -> node_id] mapping stop list index to OSM node
-    alpha_1, alpha_2, mu_1, lambda_c2 : Solomon I1 parameters
+    Walks through the chromosome in order, adding each customer to the
+    current vehicle's route as long as capacity and time-window
+    constraints remain satisfied.  When an insertion would violate a
+    constraint, the current route is closed and the customer is tried on
+    the next vehicle in the fleet.
 
     Returns
     -------
-    list of (Vehicle, [stop_indices_in_visit_order])
+    routes     : list of (Vehicle, [customer_indices]) for routes with ≥1 stop
+    unassigned : list of customer indices that fit no vehicle
     """
-    n_stops = len(stops)
-    if n_stops == 0:
-        return []
-
-    # Unrouted customer indices
-    unrouted: set[int] = set(range(n_stops))
-
-    # Helper: travel time between two customer indices (or depot=-1)
     def t(i: int, j: int) -> float:
         ni = depot_node if i == -1 else stop_nodes[i]
         nj = depot_node if j == -1 else stop_nodes[j]
         return matrix.get((ni, nj), PENALTY)
 
-    # Helper: get time window and service time for a customer index (or depot=-1)
     def tw_open(i: int) -> float:
         return depot.tw_open if i == -1 else stops[i].tw_open
 
@@ -159,166 +161,288 @@ def _solomon_i1(
     def weight(i: int) -> float:
         return stops[i].weight_kg
 
+    def route_feasible(route: list[int], vehicle: Vehicle) -> bool:
+        """Capacity + time-window feasibility for a closed route (depot→…→depot)."""
+        if not route:
+            return True
+        if sum(weight(i) for i in route) > vehicle.capacity_kg:
+            return False
+        prev = -1
+        prev_begin = tw_open(-1)
+        for cust in route:
+            tt = t(prev, cust)
+            if tt >= PENALTY:
+                return False
+            arr = prev_begin + service(prev) + tt
+            if arr > tw_close(cust):
+                return False
+            prev_begin = max(arr, tw_open(cust))
+            prev = cust
+        tt_back = t(prev, -1)
+        if tt_back >= PENALTY:
+            return False
+        if prev_begin + service(prev) + tt_back > tw_close(-1):
+            return False
+        return True
+
     routes: list[tuple[Vehicle, list[int]]] = []
+    unassigned: list[int] = []
     veh_idx = 0
+    current_route: list[int] = []
 
-    while unrouted and veh_idx < len(vehicles):
-        vehicle = vehicles[veh_idx]
-        veh_idx += 1
+    for cust in chromosome:
+        placed = False
+        while veh_idx < len(vehicles) and not placed:
+            vehicle = vehicles[veh_idx]
+            candidate = current_route + [cust]
+            if route_feasible(candidate, vehicle):
+                current_route = candidate
+                placed = True
+            else:
+                if current_route:
+                    routes.append((vehicle, current_route))
+                    current_route = []
+                veh_idx += 1
+        if not placed:
+            unassigned.append(cust)
 
-        # ── Seed selection: farthest feasible unrouted customer from depot ──
-        # Sort by descending travel time from depot, pick first feasible
-        seed = None
-        for candidate in sorted(unrouted, key=lambda u: t(-1, u), reverse=True):
-            t_dep_c = t(-1, candidate)
-            t_c_dep = t(candidate, -1)
-            if t_dep_c >= PENALTY or t_c_dep >= PENALTY:
-                continue
-            if weight(candidate) > vehicle.capacity_kg:
-                continue
-            # Time window check for seed: arrival = depot_open + service(depot) + t(depot, c)
-            arr_c = tw_open(-1) + service(-1) + t_dep_c
-            b_c = max(arr_c, tw_open(candidate))
-            if arr_c > tw_close(candidate):
-                continue
-            # Check return to depot
-            arr_depot_back = b_c + service(candidate) + t_c_dep
-            if arr_depot_back > tw_close(-1):
-                continue
-            seed = candidate
-            break
+    if current_route and veh_idx < len(vehicles):
+        routes.append((vehicles[veh_idx], current_route))
 
-        if seed is None:
-            # No feasible seed for this vehicle
-            continue
+    return routes, unassigned
 
-        # Route representation: list of customer indices (depot implicit at start/end)
-        route: list[int] = [seed]
-        unrouted.discard(seed)
-        load = weight(seed)
 
-        # Arrival times for the route: τ[pos] = arrival time at route[pos]
-        # Route is: depot -> route[0] -> route[1] -> ... -> route[n-1] -> depot
-        # We track arrival and begin-service times for each position
-        def compute_schedule(r: list[int]) -> tuple[list[float], list[float], float]:
-            """Compute (arrivals, begin_service, return_to_depot_arrival) for route r."""
-            arrivals = []
-            begins = []
-            # Depart depot at tw_open
-            prev = -1
-            prev_begin = tw_open(-1)
-            for idx, cust in enumerate(r):
-                arr = prev_begin + service(prev if idx > 0 else -1) + t(prev, cust)
-                b = max(arr, tw_open(cust))
-                arrivals.append(arr)
-                begins.append(b)
-                prev = cust
-                prev_begin = b
-            # Return to depot
-            arr_depot = prev_begin + service(prev) + t(prev, -1)
-            return arrivals, begins, arr_depot
-
-        # ── Sequential insertion loop ────────────────────────────────────
-        improved = True
-        while improved:
-            improved = False
-            best_u_star = None
-            best_c2_val = -math.inf
-            best_u_pos = -1
-
-            for u in list(unrouted):
-                # Д2: capacity check
-                if load + weight(u) > vehicle.capacity_kg:
-                    continue
-
-                # Find best position for u in current route
-                best_c1_for_u = math.inf
-                best_pos_for_u = -1
-
-                n_r = len(route)
-                for p in range(n_r + 1):
-                    # Insert u between position p-1 and p in route
-                    # i_p = route[p-1] if p > 0 else depot (-1)
-                    # i_p1 = route[p] if p < n_r else depot (-1)
-                    i_p = route[p - 1] if p > 0 else -1
-                    i_p1 = route[p] if p < n_r else -1
-
-                    # Д1: route feasibility in graph
-                    t_ip_u = t(i_p, u)
-                    t_u_ip1 = t(u, i_p1)
-                    if t_ip_u >= PENALTY or t_u_ip1 >= PENALTY:
-                        continue
-
-                    # Build candidate route
-                    candidate = route[:p] + [u] + route[p:]
-
-                    # Check Д3: time windows for u and all subsequent customers
-                    arrivals, begins, arr_depot = compute_schedule(candidate)
-
-                    feasible = True
-                    for idx, cust in enumerate(candidate):
-                        if arrivals[idx] > tw_close(cust):
-                            feasible = False
-                            break
-                    if feasible and arr_depot > tw_close(-1):
-                        feasible = False
-
-                    if not feasible:
-                        continue
-
-                    # Compute c11: extra travel time
-                    t_ip_ip1 = t(i_p, i_p1)
-                    c11 = t_ip_u + t_u_ip1 - mu_1 * t_ip_ip1
-
-                    # Compute c12: push-forward
-                    # PF_u = new arrival at i_{p+1} - old arrival at i_{p+1}
-                    if p < n_r:
-                        # Old arrival at position p (which is i_{p+1} before insertion)
-                        old_arrivals, _, _ = compute_schedule(route)
-                        old_arr_ip1 = old_arrivals[p] if p < len(old_arrivals) else tw_open(-1)
-                        new_arr_ip1 = arrivals[p + 1] if (p + 1) < len(arrivals) else arr_depot
-                        c12 = max(0.0, new_arr_ip1 - old_arr_ip1)
-                    else:
-                        # Inserting at the end, PF affects only depot return
-                        old_arrivals, old_begins, old_arr_depot = compute_schedule(route)
-                        c12 = max(0.0, arr_depot - old_arr_depot)
-
-                    c1_val = alpha_1 * c11 + alpha_2 * c12
-
-                    if c1_val < best_c1_for_u:
-                        best_c1_for_u = c1_val
-                        best_pos_for_u = p
-
-                # If no feasible position found for u, skip
-                if best_pos_for_u == -1:
-                    continue
-
-                # c2 criterion: λ·t(0,u) - c1*(u, R)
-                c2_val = lambda_c2 * t(-1, u) - best_c1_for_u
-
-                if c2_val > best_c2_val:
-                    best_c2_val = c2_val
-                    best_u_star = u
-                    best_u_pos = best_pos_for_u
-
-            # Insert the best customer
-            if best_u_star is not None:
-                route.insert(best_u_pos, best_u_star)
-                unrouted.discard(best_u_star)
-                load += weight(best_u_star)
-                improved = True
-
-        routes.append((vehicle, route))
-
-    # Any remaining unrouted customers — log warning
-    if unrouted:
-        logger.warning(
-            "Solomon I1: %d customer(s) could not be inserted into any route "
-            "(fleet exhausted or infeasible): indices %s",
-            len(unrouted), sorted(unrouted),
+def _compute_route_time(
+    route: list[int],
+    matrix: dict,
+    depot_node: int,
+    stop_nodes: dict,
+) -> float:
+    """Total travel time along a closed route: depot → customers → depot."""
+    if not route:
+        return 0.0
+    total = matrix.get((depot_node, stop_nodes[route[0]]), PENALTY)
+    for k in range(len(route) - 1):
+        total += matrix.get(
+            (stop_nodes[route[k]], stop_nodes[route[k + 1]]),
+            PENALTY,
         )
+    total += matrix.get((stop_nodes[route[-1]], depot_node), PENALTY)
+    return total
 
-    return routes
+
+def _evaluate(
+    chromosome: list[int],
+    stops: list,
+    vehicles: list,
+    depot,
+    matrix: dict,
+    depot_node: int,
+    stop_nodes: dict,
+) -> tuple[float, list[tuple[Vehicle, list[int]]], list[int]]:
+    """
+    Compute fitness F = A·T_total + B·K + P·|U|  (lower is better).
+
+    Returns (fitness, routes, unassigned).
+    """
+    routes, unassigned = _decode_chromosome(
+        chromosome, stops, vehicles, depot, matrix, depot_node, stop_nodes,
+    )
+    T_total = sum(
+        _compute_route_time(r, matrix, depot_node, stop_nodes)
+        for _, r in routes
+    )
+    K = len(routes)
+    fitness = OBJ_A * T_total + OBJ_B * K + UNROUTED_PENALTY * len(unassigned)
+    return fitness, routes, unassigned
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  GENETIC OPERATORS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _order_crossover(
+    p1: list[int],
+    p2: list[int],
+    rng: random.Random,
+) -> list[int]:
+    """
+    Order Crossover (OX).  Copies a contiguous slice of p1 into the child,
+    then fills the remaining positions in the order they appear in p2
+    (starting after the slice, wrapping around).
+    """
+    n = len(p1)
+    if n < 2:
+        return p1[:]
+    i, j = sorted(rng.sample(range(n), 2))
+    child: list[int] = [-1] * n
+    used = [False] * n
+    for k in range(i, j + 1):
+        child[k] = p1[k]
+        used[p1[k]] = True
+    fill_pos = (j + 1) % n
+    scan_pos = (j + 1) % n
+    for _ in range(n):
+        gene = p2[scan_pos]
+        scan_pos = (scan_pos + 1) % n
+        if not used[gene]:
+            child[fill_pos] = gene
+            fill_pos = (fill_pos + 1) % n
+    return child
+
+
+def _swap_mutation(chromo: list[int], rng: random.Random) -> list[int]:
+    """Swap mutation: exchange the values at two random positions."""
+    n = len(chromo)
+    if n < 2:
+        return chromo
+    i, j = rng.sample(range(n), 2)
+    chromo[i], chromo[j] = chromo[j], chromo[i]
+    return chromo
+
+
+def _tournament_select(
+    population: list[list[int]],
+    fitnesses: list[float],
+    k: int,
+    rng: random.Random,
+) -> list[int]:
+    """Tournament selection: draw k at random, return the fittest."""
+    size = min(k, len(population))
+    candidates = rng.sample(range(len(population)), size)
+    best = min(candidates, key=lambda idx: fitnesses[idx])
+    return population[best]
+
+
+def _nearest_neighbour_seed(
+    n_stops: int,
+    matrix: dict,
+    depot_node: int,
+    stop_nodes: dict,
+) -> list[int]:
+    """Greedy nearest-neighbour permutation — used as one high-quality seed."""
+    if n_stops == 0:
+        return []
+    unvisited = set(range(n_stops))
+    current = depot_node
+    chromo: list[int] = []
+    while unvisited:
+        nxt = min(
+            unvisited,
+            key=lambda c: matrix.get((current, stop_nodes[c]), PENALTY),
+        )
+        chromo.append(nxt)
+        current = stop_nodes[nxt]
+        unvisited.discard(nxt)
+    return chromo
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN GA LOOP
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _genetic_algorithm(
+    stops: list,
+    vehicles: list,
+    depot,
+    matrix: dict,
+    depot_node: int,
+    stop_nodes: dict,
+    *,
+    pop_size: int = POP_SIZE,
+    n_generations: int = N_GENERATIONS,
+    crossover_rate: float = CROSSOVER_RATE,
+    mutation_rate: float = MUTATION_RATE,
+    elite_size: int = ELITE_SIZE,
+    tournament_size: int = TOURNAMENT_SIZE,
+    seed: int | None = GA_SEED,
+) -> list[tuple[Vehicle, list[int]]]:
+    """
+    Genetic algorithm for CVRPTW.
+
+    Parameters
+    ----------
+    stops       : list[DeliveryStop] — unrouted customers
+    vehicles    : list[Vehicle]      — available fleet for this mode
+    depot       : DeliveryStop       — depot (tw_open/close, service_time)
+    matrix      : dict[(node_i, node_j) -> float] travel-time matrix
+    depot_node  : OSM node id of the depot
+    stop_nodes  : dict[customer_index -> OSM node id]
+    pop_size, n_generations, crossover_rate, mutation_rate,
+    elite_size, tournament_size : GA control parameters.
+    seed        : RNG seed for reproducibility (None = non-deterministic).
+
+    Returns
+    -------
+    list of (Vehicle, [customer_indices_in_visit_order])
+    """
+    n = len(stops)
+    if n == 0:
+        return []
+
+    rng = random.Random(seed)
+
+    # ── Initial population: 1 NN seed + random permutations ──────────────
+    population: list[list[int]] = []
+    nn_chromo = _nearest_neighbour_seed(n, matrix, depot_node, stop_nodes)
+    if nn_chromo:
+        population.append(nn_chromo)
+    while len(population) < pop_size:
+        perm = list(range(n))
+        rng.shuffle(perm)
+        population.append(perm)
+
+    evaluations = [
+        _evaluate(c, stops, vehicles, depot, matrix, depot_node, stop_nodes)
+        for c in population
+    ]
+    fitnesses = [e[0] for e in evaluations]
+
+    best_idx = min(range(pop_size), key=lambda i: fitnesses[i])
+    best_fitness = fitnesses[best_idx]
+    best_eval = evaluations[best_idx]
+
+    # ── Evolutionary loop ───────────────────────────────────────────────
+    for _ in range(n_generations):
+        order = sorted(range(pop_size), key=lambda i: fitnesses[i])
+        new_population: list[list[int]] = [
+            population[i][:] for i in order[:elite_size]
+        ]
+
+        while len(new_population) < pop_size:
+            p1 = _tournament_select(population, fitnesses, tournament_size, rng)
+            p2 = _tournament_select(population, fitnesses, tournament_size, rng)
+
+            child = _order_crossover(p1, p2, rng) if rng.random() < crossover_rate else p1[:]
+            if rng.random() < mutation_rate:
+                child = _swap_mutation(child, rng)
+
+            new_population.append(child)
+
+        population = new_population
+        evaluations = [
+            _evaluate(c, stops, vehicles, depot, matrix, depot_node, stop_nodes)
+            for c in population
+        ]
+        fitnesses = [e[0] for e in evaluations]
+
+        gen_best = min(range(pop_size), key=lambda i: fitnesses[i])
+        if fitnesses[gen_best] < best_fitness:
+            best_fitness = fitnesses[gen_best]
+            best_eval = evaluations[gen_best]
+
+    _, best_routes, unassigned = best_eval
+    if unassigned:
+        logger.warning(
+            "GA: %d customer(s) could not be routed (fleet exhausted or "
+            "infeasible): indices %s",
+            len(unassigned), sorted(unassigned),
+        )
+    logger.info(
+        "GA: best fitness %.1f after %d generation(s), %d active route(s)",
+        best_fitness, n_generations, len(best_routes),
+    )
+    return best_routes
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -407,69 +531,57 @@ def _assign_stops_to_modes(
     return mode_stop_pool, unreachable
 
 
-def _build_solomon_routes(
+def _build_ga_routes(
     pool_stops: list,
     vehicles: list,
     depot,
     graphs: dict,
 ) -> list[VehicleRoute]:
     """
-    Phase 2 — build routes for one mode's stop pool using Solomon I1.
+    Phase 2 — build routes for one mode's stop pool using the GA.
 
     Steps:
-    1. Build the distance matrix for depot + all stops in the pool.
-    2. Run Solomon I1 to partition stops across vehicles.
-    3. For each vehicle route, reconstruct the full OSM path and compute
-       total distance.
+    1. Snap depot + stops to OSM nodes (car-accessible for drive mode).
+    2. Build the travel-time matrix over depot + stop nodes.
+    3. Run the genetic algorithm to partition stops across vehicles.
+    4. For each vehicle route, reconstruct the full OSM path and compute
+       the total road distance.
     """
     mode = vehicles[0].mode
     G = graphs[mode]
 
-    # Map stops to OSM nodes
     if mode == "drive":
         node_ids = [
             nearest_car_accessible_node(G, s.lat, s.lon) or s.node_id
             for s in pool_stops
         ]
-    else:
-        node_ids = [s.node_id for s in pool_stops]
-
-    if mode == "drive":
         depot_node = nearest_car_accessible_node(G, depot.lat, depot.lon) or depot.node_id
     else:
+        node_ids = [s.node_id for s in pool_stops]
         depot_node = depot.node_id
 
-    # Build distance matrix for depot + all stops
     all_nodes = [depot_node] + node_ids
     unique_nodes = list(dict.fromkeys(all_nodes))
     matrix = build_distance_matrix(G, unique_nodes)
 
-    # stop_index -> node_id mapping
     stop_node_map: dict[int, int] = {i: node_ids[i] for i in range(len(pool_stops))}
 
-    # Run Solomon I1
-    solomon_routes = _solomon_i1(
+    ga_routes = _genetic_algorithm(
         pool_stops, vehicles, depot, matrix, depot_node, stop_node_map,
     )
 
     results: list[VehicleRoute] = []
-    for vehicle, stop_indices in solomon_routes:
+    for vehicle, stop_indices in ga_routes:
         if not stop_indices:
             continue
 
-        # Build TSP-style node route: [depot, n1, n2, ..., depot]
         tsp_route = [depot_node] + [stop_node_map[i] for i in stop_indices] + [depot_node]
-
-        # Reconstruct full OSM path
         full_route = reconstruct_full_route(G, tsp_route)
 
-        # Total travel time from matrix
         total_time_s = 0.0
         for k in range(len(tsp_route) - 1):
-            cost = matrix.get((tsp_route[k], tsp_route[k + 1]), PENALTY)
-            total_time_s += cost
+            total_time_s += matrix.get((tsp_route[k], tsp_route[k + 1]), PENALTY)
 
-        # Total road distance
         total_dist_m = 0.0
         for k in range(len(full_route) - 1):
             ed = G.get_edge_data(full_route[k], full_route[k + 1])
@@ -479,7 +591,6 @@ def _build_solomon_routes(
                     default=0.0,
                 )
 
-        # Recover ordered stops
         ordered_stops = [pool_stops[i] for i in stop_indices]
 
         results.append(VehicleRoute(
@@ -500,10 +611,10 @@ def _build_solomon_routes(
 
 def compute_objective(routes: list[VehicleRoute], A: float = OBJ_A, B: float = OBJ_B) -> float:
     """
-    Compute the objective function value:
+    Objective function value:
         F = A · Σ T_total + B · K
-    where T_total is the sum of travel times across all routes, and K is
-    the number of active vehicles.
+    where T_total is the total travel time across all routes and K is the
+    number of active vehicles.
     """
     T_total = sum(vr.total_time_s for vr in routes)
     K = len(routes)
@@ -522,7 +633,7 @@ def solve_vrp(
     tsp_method: str = "auto",
 ) -> tuple[list, list]:
     """
-    Solve a Capacitated VRP with Time Windows using Solomon I1 heuristic.
+    Solve a Capacitated VRP with Time Windows using a genetic algorithm.
 
     Parameters
     ----------
@@ -530,7 +641,7 @@ def solve_vrp(
     depot      : DeliveryStop              — start/end point (node_id set)
     fleet      : list[Vehicle]             — vehicles with mode and capacity
     graphs     : dict[str, MultiDiGraph]   — {"drive": G, "bike": G, "walk": G}
-    tsp_method : str                       — kept for API compatibility (unused by Solomon)
+    tsp_method : str                       — kept for API compatibility (unused by GA)
 
     Returns
     -------
@@ -547,7 +658,7 @@ def solve_vrp(
 
     warnings: list[str] = []
 
-    # ── Phase 1: assign each stop to a vehicle-type pool ─────────────────────
+    # ── Phase 1: assign each stop to a vehicle-type pool ────────────────
     mode_stop_pool, unreachable = _assign_stops_to_modes(stops, fleet, depot, graphs)
 
     if unreachable:
@@ -561,7 +672,7 @@ def solve_vrp(
             len(unreachable), [s.address[:40] for s in unreachable],
         )
 
-    # ── Phase 2: Solomon I1 insertion per mode ───────────────────────────────
+    # ── Phase 2: GA per mode ────────────────────────────────────────────
     mode_to_vehicles: dict[str, list] = {}
     for v in fleet:
         mode_to_vehicles.setdefault(v.mode, []).append(v)
@@ -577,10 +688,9 @@ def solve_vrp(
                 logger.info("Vehicle %r (%s) is idle — no compatible stops.", v.name, mode)
             continue
 
-        mode_routes = _build_solomon_routes(pool, vehicles, depot, graphs)
+        mode_routes = _build_ga_routes(pool, vehicles, depot, graphs)
         routes.extend(mode_routes)
 
-        # Check for vehicles that ended up idle
         active_names = {vr.vehicle.name for vr in mode_routes}
         for v in vehicles:
             if v.name not in active_names:
@@ -594,7 +704,7 @@ def solve_vrp(
 
     obj_val = compute_objective(routes)
     logger.info(
-        "Solomon I1 solution: %d active vehicle(s), objective F = %.1f",
+        "GA solution: %d active vehicle(s), objective F = %.1f",
         len(routes), obj_val,
     )
 

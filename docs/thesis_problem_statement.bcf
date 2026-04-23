@@ -2376,9 +2376,17 @@
     <bcf:citekey order="1" intorder="1">toth2014</bcf:citekey>
     <bcf:citekey order="2" intorder="1">wang2014</bcf:citekey>
     <bcf:citekey order="3" intorder="1">mtz1960</bcf:citekey>
-    <bcf:citekey order="4" intorder="1">solomon1987</bcf:citekey>
-    <bcf:citekey order="5" intorder="1">braysy2005</bcf:citekey>
+    <bcf:citekey order="4" intorder="1">toth2014</bcf:citekey>
+    <bcf:citekey order="5" intorder="1">holland1975</bcf:citekey>
+    <bcf:citekey order="5" intorder="2">goldberg1989</bcf:citekey>
     <bcf:citekey order="6" intorder="1">solomon1987</bcf:citekey>
+    <bcf:citekey order="7" intorder="1">prins2004</bcf:citekey>
+    <bcf:citekey order="7" intorder="2">braysy2005</bcf:citekey>
+    <bcf:citekey order="8" intorder="1">oliver1987</bcf:citekey>
+    <bcf:citekey order="9" intorder="1">prins2004</bcf:citekey>
+    <bcf:citekey order="10" intorder="1">prins2004</bcf:citekey>
+    <bcf:citekey order="10" intorder="2">goldberg1989</bcf:citekey>
+    <bcf:citekey order="11" intorder="1">prins2004</bcf:citekey>
   </bcf:section>
   <!-- SORTING TEMPLATES -->
   <bcf:sortingtemplate name="none">

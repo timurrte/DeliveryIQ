@@ -1,6 +1,6 @@
 """
 tests/test_vrp_solver.py
-Unit + integration tests for vrp_solver.py (Solomon I1 CVRPTW solver).
+Unit + integration tests for vrp_solver.py (Genetic-Algorithm CVRPTW solver).
 
 Run:
     pytest tests/test_vrp_solver.py -v
@@ -10,11 +10,12 @@ Coverage:
 from __future__ import annotations
 
 import math
+import random
 import pytest
 import networkx as nx
 from dataclasses import dataclass
 from typing import Optional
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 from vrp_solver import (
     Vehicle,
@@ -24,8 +25,15 @@ from vrp_solver import (
     _bearing,
     _check_reachable,
     _assign_stops_to_modes,
-    _solomon_i1,
-    _build_solomon_routes,
+    _decode_chromosome,
+    _compute_route_time,
+    _evaluate,
+    _order_crossover,
+    _swap_mutation,
+    _tournament_select,
+    _nearest_neighbour_seed,
+    _genetic_algorithm,
+    _build_ga_routes,
     compute_objective,
     solve_vrp,
 )
@@ -104,26 +112,31 @@ def _stops(node_ids):
     ]
 
 
+def _complete_matrix(node_ids, cost=60.0):
+    """Symmetric complete matrix for the given node IDs."""
+    matrix = {}
+    for i in node_ids:
+        for j in node_ids:
+            matrix[(i, j)] = 0.0 if i == j else cost
+    return matrix
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  _bearing()
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestBearing:
     def test_north(self):
-        b = _bearing(0.0, 0.0, 1.0, 0.0)
-        assert abs(b - 0.0) < 0.5
+        assert abs(_bearing(0.0, 0.0, 1.0, 0.0) - 0.0) < 0.5
 
     def test_east(self):
-        b = _bearing(0.0, 0.0, 0.0, 1.0)
-        assert abs(b - 90.0) < 0.5
+        assert abs(_bearing(0.0, 0.0, 0.0, 1.0) - 90.0) < 0.5
 
     def test_south(self):
-        b = _bearing(0.0, 0.0, -1.0, 0.0)
-        assert abs(b - 180.0) < 0.5
+        assert abs(_bearing(0.0, 0.0, -1.0, 0.0) - 180.0) < 0.5
 
     def test_west(self):
-        b = _bearing(0.0, 0.0, 0.0, -1.0)
-        assert abs(b - 270.0) < 0.5
+        assert abs(_bearing(0.0, 0.0, 0.0, -1.0) - 270.0) < 0.5
 
     def test_result_in_0_360_range(self):
         for lat2, lon2 in [(1, 1), (-1, 1), (-1, -1), (1, -1)]:
@@ -260,109 +273,294 @@ class TestAssignStopsToModes:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  _solomon_i1() — Solomon Insertion Heuristic
+#  _decode_chromosome() — Split decoder
 # ══════════════════════════════════════════════════════════════════════════════
 
-class TestSolomonI1:
-    def _build_matrix(self, node_ids, cost=60.0):
-        """Build a symmetric complete matrix for the given node IDs."""
-        matrix = {}
-        for i in node_ids:
-            for j in node_ids:
-                matrix[(i, j)] = 0.0 if i == j else cost
-        return matrix
+class TestDecodeChromosome:
+    def test_empty_chromosome(self):
+        routes, unassigned = _decode_chromosome(
+            [], [], [Vehicle("V", "drive", 10)], _depot(), {}, 0, {}
+        )
+        assert routes == []
+        assert unassigned == []
 
-    def test_empty_stops_returns_empty(self):
-        result = _solomon_i1([], [Vehicle("V1", "drive", 10)], _depot(),
-                             {}, 0, {})
-        assert result == []
-
-    def test_single_stop_single_vehicle(self):
+    def test_single_customer_single_vehicle(self):
         depot = _depot()
         stops = _stops([1])
-        matrix = self._build_matrix([0, 1])
-        stop_nodes = {0: 1}
-        vehicles = [Vehicle("V1", "drive", 10)]
-        result = _solomon_i1(stops, vehicles, depot, matrix, 0, stop_nodes)
-        assert len(result) == 1
-        vehicle, route_indices = result[0]
-        assert vehicle.name == "V1"
-        assert route_indices == [0]
+        matrix = _complete_matrix([0, 1])
+        routes, unassigned = _decode_chromosome(
+            [0], stops, [Vehicle("V", "drive", 10)], depot, matrix, 0, {0: 1}
+        )
+        assert len(routes) == 1
+        assert routes[0][1] == [0]
+        assert unassigned == []
 
-    def test_multiple_stops_all_inserted(self):
-        depot = _depot()
-        stops = _stops([1, 2, 3])
-        matrix = self._build_matrix([0, 1, 2, 3])
-        stop_nodes = {0: 1, 1: 2, 2: 3}
-        vehicles = [Vehicle("V1", "drive", 10)]
-        result = _solomon_i1(stops, vehicles, depot, matrix, 0, stop_nodes)
-        total_inserted = sum(len(indices) for _, indices in result)
-        assert total_inserted == 3
-
-    def test_capacity_constraint_splits_routes(self):
+    def test_capacity_splits_across_vehicles(self):
         depot = _depot()
         stops = _stops([1, 2, 3])
         for s in stops:
             s.weight_kg = 5.0
-        matrix = self._build_matrix([0, 1, 2, 3])
-        stop_nodes = {0: 1, 1: 2, 2: 3}
+        matrix = _complete_matrix([0, 1, 2, 3])
         vehicles = [
             Vehicle("V1", "drive", 10),
             Vehicle("V2", "drive", 10),
         ]
-        result = _solomon_i1(stops, vehicles, depot, matrix, 0, stop_nodes)
-        assert len(result) == 2
-        total = sum(len(indices) for _, indices in result)
+        routes, unassigned = _decode_chromosome(
+            [0, 1, 2], stops, vehicles, depot, matrix, 0, {0: 1, 1: 2, 2: 3}
+        )
+        total = sum(len(r) for _, r in routes)
         assert total == 3
+        # Two vehicles needed (10 kg capacity each, 15 kg total load)
+        assert len(routes) == 2
+        assert unassigned == []
 
-    def test_seed_is_farthest_from_depot(self):
-        depot = _depot()
-        stops = _stops([1, 2])
-        # Make stop 1 (node 1) far from depot, stop 2 (node 2) close
-        matrix = {
-            (0, 0): 0.0, (0, 1): 200.0, (0, 2): 50.0,
-            (1, 0): 200.0, (1, 1): 0.0, (1, 2): 60.0,
-            (2, 0): 50.0, (2, 1): 60.0, (2, 2): 0.0,
-        }
-        stop_nodes = {0: 1, 1: 2}
-        vehicles = [Vehicle("V1", "drive", 10)]
-        result = _solomon_i1(stops, vehicles, depot, matrix, 0, stop_nodes)
-        # Both stops should be in one route (farthest is seed, then closer one inserted)
-        _, route_indices = result[0]
-        assert len(route_indices) == 2
-        assert 0 in route_indices  # farthest stop (index 0, node 1) is in the route
-
-    def test_time_window_prevents_insertion(self):
-        depot = _depot()
-        depot.tw_open = 0.0
-        depot.tw_close = 100.0  # depot closes at 100s
-        stops = _stops([1])
-        stops[0].tw_open = 0.0
-        stops[0].tw_close = 50.0  # stop closes at 50s
-        # Travel time 200s > tw_close → infeasible
-        matrix = {
-            (0, 0): 0.0, (0, 1): 200.0,
-            (1, 0): 200.0, (1, 1): 0.0,
-        }
-        stop_nodes = {0: 1}
-        vehicles = [Vehicle("V1", "drive", 10)]
-        result = _solomon_i1(stops, vehicles, depot, matrix, 0, stop_nodes)
-        # Stop cannot be inserted due to time window violation
-        total = sum(len(indices) for _, indices in result)
-        assert total == 0
-
-    def test_fleet_exhausted_leaves_unrouted(self):
+    def test_fleet_exhausted_leaves_unassigned(self):
         depot = _depot()
         stops = _stops([1, 2, 3])
         for s in stops:
             s.weight_kg = 5.0
-        matrix = self._build_matrix([0, 1, 2, 3])
-        stop_nodes = {0: 1, 1: 2, 2: 3}
-        # Only 1 vehicle with capacity 5 → can fit 1 stop, 2 unrouted
-        vehicles = [Vehicle("V1", "drive", 5)]
-        result = _solomon_i1(stops, vehicles, depot, matrix, 0, stop_nodes)
-        total = sum(len(indices) for _, indices in result)
+        matrix = _complete_matrix([0, 1, 2, 3])
+        vehicles = [Vehicle("V1", "drive", 5)]  # fits one stop only
+        routes, unassigned = _decode_chromosome(
+            [0, 1, 2], stops, vehicles, depot, matrix, 0, {0: 1, 1: 2, 2: 3}
+        )
+        total = sum(len(r) for _, r in routes)
         assert total == 1
+        assert len(unassigned) == 2
+
+    def test_penalty_travel_time_prevents_feasibility(self):
+        depot = _depot()
+        stops = _stops([1])
+        matrix = {
+            (0, 0): 0.0, (0, 1): PENALTY,
+            (1, 0): PENALTY, (1, 1): 0.0,
+        }
+        vehicles = [Vehicle("V", "drive", 10)]
+        routes, unassigned = _decode_chromosome(
+            [0], stops, vehicles, depot, matrix, 0, {0: 1}
+        )
+        assert routes == []
+        assert unassigned == [0]
+
+    def test_time_window_prevents_feasibility(self):
+        depot = _depot()
+        depot.tw_open = 0.0
+        depot.tw_close = 100.0
+        stops = _stops([1])
+        stops[0].tw_close = 50.0  # stop must be reached before 50s
+        matrix = {
+            (0, 0): 0.0, (0, 1): 200.0,  # travel of 200s > tw_close
+            (1, 0): 200.0, (1, 1): 0.0,
+        }
+        routes, unassigned = _decode_chromosome(
+            [0], stops, [Vehicle("V", "drive", 10)], depot, matrix, 0, {0: 1}
+        )
+        assert routes == []
+        assert unassigned == [0]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  _compute_route_time() and _evaluate()
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestComputeRouteTime:
+    def test_empty_route(self):
+        assert _compute_route_time([], {}, 0, {}) == 0.0
+
+    def test_single_customer(self):
+        matrix = _complete_matrix([0, 1], cost=60.0)
+        assert _compute_route_time([0], matrix, 0, {0: 1}) == 120.0  # 60 out + 60 back
+
+    def test_multi_customer(self):
+        matrix = _complete_matrix([0, 1, 2, 3], cost=30.0)
+        t = _compute_route_time([0, 1, 2], matrix, 0, {0: 1, 1: 2, 2: 3})
+        # depot→1→2→3→depot = 4 × 30 = 120
+        assert t == 120.0
+
+
+class TestEvaluate:
+    def test_routed_customers_contribute_travel_time(self):
+        depot = _depot()
+        stops = _stops([1])
+        matrix = _complete_matrix([0, 1], cost=60.0)
+        fitness, routes, unassigned = _evaluate(
+            [0], stops, [Vehicle("V", "drive", 10)], depot, matrix, 0, {0: 1}
+        )
+        assert unassigned == []
+        assert len(routes) == 1
+        assert fitness == 120.0  # 60 + 60, A=1, B=0
+
+    def test_unrouted_customers_penalised(self):
+        depot = _depot()
+        stops = _stops([1])
+        matrix = _complete_matrix([0, 1], cost=60.0)
+        # Zero-capacity vehicle — customer can't be placed
+        fitness, _, unassigned = _evaluate(
+            [0], stops, [Vehicle("V", "drive", 0.0)], depot, matrix, 0, {0: 1}
+        )
+        assert len(unassigned) == 1
+        assert fitness >= 1.0e6  # UNROUTED_PENALTY dominates
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Genetic operators
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestOrderCrossover:
+    def test_child_is_permutation(self):
+        rng = random.Random(0)
+        p1 = [0, 1, 2, 3, 4, 5]
+        p2 = [5, 4, 3, 2, 1, 0]
+        child = _order_crossover(p1, p2, rng)
+        assert sorted(child) == [0, 1, 2, 3, 4, 5]
+
+    def test_empty_and_singleton_safe(self):
+        rng = random.Random(0)
+        assert _order_crossover([], [], rng) == []
+        assert _order_crossover([0], [0], rng) == [0]
+
+    def test_identical_parents_yields_same_permutation(self):
+        rng = random.Random(123)
+        p = [0, 1, 2, 3, 4]
+        child = _order_crossover(p, p, rng)
+        assert sorted(child) == p
+
+
+class TestSwapMutation:
+    def test_permutation_preserved(self):
+        rng = random.Random(0)
+        p = [0, 1, 2, 3, 4]
+        m = _swap_mutation(p[:], rng)
+        assert sorted(m) == [0, 1, 2, 3, 4]
+
+    def test_singleton_unchanged(self):
+        rng = random.Random(0)
+        assert _swap_mutation([7], rng) == [7]
+
+    def test_empty_unchanged(self):
+        rng = random.Random(0)
+        assert _swap_mutation([], rng) == []
+
+
+class TestTournamentSelect:
+    def test_returns_fittest_of_group(self):
+        rng = random.Random(42)
+        pop = [[0], [1], [2], [3]]
+        fitnesses = [10.0, 2.0, 50.0, 100.0]
+        # Larger k => more likely to hit the best
+        winner = _tournament_select(pop, fitnesses, k=4, rng=rng)
+        assert winner == [1]
+
+    def test_k_greater_than_population_size(self):
+        rng = random.Random(0)
+        pop = [[0], [1]]
+        fitnesses = [5.0, 1.0]
+        winner = _tournament_select(pop, fitnesses, k=100, rng=rng)
+        assert winner == [1]
+
+
+class TestNearestNeighbourSeed:
+    def test_empty(self):
+        assert _nearest_neighbour_seed(0, {}, 0, {}) == []
+
+    def test_greedy_order(self):
+        # Depot closest to customer 0 (idx 0), then 1, then 2.
+        matrix = {
+            (0, 10): 1.0, (0, 20): 5.0, (0, 30): 9.0,
+            (10, 20): 1.0, (10, 30): 5.0, (10, 0): 1.0,
+            (20, 10): 1.0, (20, 30): 1.0, (20, 0): 5.0,
+            (30, 10): 5.0, (30, 20): 1.0, (30, 0): 9.0,
+        }
+        stop_nodes = {0: 10, 1: 20, 2: 30}
+        chromo = _nearest_neighbour_seed(3, matrix, 0, stop_nodes)
+        assert chromo == [0, 1, 2]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  _genetic_algorithm()
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestGeneticAlgorithm:
+    def test_empty_stops_returns_empty(self):
+        result = _genetic_algorithm(
+            [], [Vehicle("V", "drive", 10)], _depot(), {}, 0, {},
+            pop_size=4, n_generations=2, seed=0,
+        )
+        assert result == []
+
+    def test_single_stop(self):
+        depot = _depot()
+        stops = _stops([1])
+        matrix = _complete_matrix([0, 1])
+        result = _genetic_algorithm(
+            stops, [Vehicle("V", "drive", 10)], depot, matrix, 0, {0: 1},
+            pop_size=4, n_generations=2, seed=0,
+        )
+        assert len(result) == 1
+        assert result[0][1] == [0]
+
+    def test_multiple_stops_all_routed(self):
+        depot = _depot()
+        stops = _stops([1, 2, 3])
+        matrix = _complete_matrix([0, 1, 2, 3])
+        result = _genetic_algorithm(
+            stops, [Vehicle("V", "drive", 10)], depot, matrix, 0,
+            {0: 1, 1: 2, 2: 3},
+            pop_size=10, n_generations=10, seed=0,
+        )
+        total = sum(len(r) for _, r in result)
+        assert total == 3
+
+    def test_capacity_forces_multiple_vehicles(self):
+        depot = _depot()
+        stops = _stops([1, 2, 3])
+        for s in stops:
+            s.weight_kg = 5.0
+        matrix = _complete_matrix([0, 1, 2, 3])
+        vehicles = [
+            Vehicle("V1", "drive", 10),
+            Vehicle("V2", "drive", 10),
+        ]
+        result = _genetic_algorithm(
+            stops, vehicles, depot, matrix, 0, {0: 1, 1: 2, 2: 3},
+            pop_size=10, n_generations=10, seed=0,
+        )
+        total = sum(len(r) for _, r in result)
+        assert total == 3
+        assert len(result) == 2
+
+    def test_time_window_infeasible_stop_dropped(self):
+        depot = _depot()
+        depot.tw_close = 100.0
+        stops = _stops([1])
+        stops[0].tw_close = 50.0
+        matrix = {
+            (0, 0): 0.0, (0, 1): 200.0,
+            (1, 0): 200.0, (1, 1): 0.0,
+        }
+        result = _genetic_algorithm(
+            stops, [Vehicle("V", "drive", 10)], depot, matrix, 0, {0: 1},
+            pop_size=6, n_generations=3, seed=0,
+        )
+        # No route contains the infeasible customer
+        total = sum(len(r) for _, r in result)
+        assert total == 0
+
+    def test_deterministic_with_seed(self):
+        depot = _depot()
+        stops = _stops([1, 2, 3])
+        matrix = _complete_matrix([0, 1, 2, 3])
+        r1 = _genetic_algorithm(
+            stops, [Vehicle("V", "drive", 10)], depot, matrix, 0,
+            {0: 1, 1: 2, 2: 3},
+            pop_size=8, n_generations=5, seed=123,
+        )
+        r2 = _genetic_algorithm(
+            stops, [Vehicle("V", "drive", 10)], depot, matrix, 0,
+            {0: 1, 1: 2, 2: 3},
+            pop_size=8, n_generations=5, seed=123,
+        )
+        assert [r[1] for r in r1] == [r[1] for r in r2]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -376,13 +574,11 @@ class TestComputeObjective:
     def test_single_route(self):
         v = Vehicle("V", "drive", 10)
         vr = VehicleRoute(v, [], [0, 1, 0], [0, 1, 0], total_time_s=120.0, total_dist_m=500.0)
-        # F = A*120 + B*1 = 1*120 + 0*1 = 120
         assert compute_objective([vr]) == 120.0
 
     def test_with_vehicle_penalty(self):
         v = Vehicle("V", "drive", 10)
         vr = VehicleRoute(v, [], [0, 1, 0], [0, 1, 0], total_time_s=100.0, total_dist_m=500.0)
-        # F = 1*100 + 10*1 = 110
         assert compute_objective([vr], A=1.0, B=10.0) == 110.0
 
     def test_multiple_routes(self):
@@ -390,7 +586,6 @@ class TestComputeObjective:
         v2 = Vehicle("V2", "drive", 10)
         vr1 = VehicleRoute(v1, [], [], [], total_time_s=100.0, total_dist_m=0)
         vr2 = VehicleRoute(v2, [], [], [], total_time_s=200.0, total_dist_m=0)
-        # F = 1*(100+200) + 5*2 = 310
         assert compute_objective([vr1, vr2], A=1.0, B=5.0) == 310.0
 
 
