@@ -5,7 +5,7 @@ skinparam classFontSize 13
 skinparam groupInheritance 2
 hide empty members
 
-title DeliveryIQ — Class Diagram
+title Діаграма класів
 
 ' ══════════════════════════════════════════════════════
 '  ENUMS
