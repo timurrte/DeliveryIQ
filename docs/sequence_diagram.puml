@@ -6,9 +6,9 @@ skinparam maxMessageSize 220
 skinparam BoxPadding 12
 skinparam ParticipantPadding 20
 
-title DeliveryIQ — Optimization Sequence Diagram
+title Діаграма послідовності оптимізації
 
-actor       "User"                  as User
+actor       "Користувач"                  as User
 participant "app.py"                as App
 participant "geocoder.py"           as Geo
 participant "graph_builder.py"      as GB
@@ -18,54 +18,49 @@ participant "visualizer.py"         as Viz
 participant "Nominatim / OSMnx"     as Ext
 
 ' ──────────────────────────────────────────────────────────────────────────────
-== 1. Startup & Initialisation ==
+== 1. Запуск та ініціалізація ==
 ' ──────────────────────────────────────────────────────────────────────────────
 
 User  ->  App  : streamlit run app.py
-App   ->  App  : _init() — populate st.session_state\n{city, depot=None, stops=[], fleet=[Vehicle], click_mode=False}
-App  -->  User : Empty map + sidebar rendered
+App   ->  App  : _init() — заповнення st.session_state\n{city, depot=None, stops=[], fleet=[Vehicle], click_mode=False}
+App  -->  User : Відображення порожньої карти та бічної панелі
 
 ' ──────────────────────────────────────────────────────────────────────────────
-== 2. Input — Depot & Delivery Stops ==
+== 2. Введення — Депо та точки доставки ==
 ' ──────────────────────────────────────────────────────────────────────────────
 
-User  ->  App  : Enter depot address
+User  ->  App  : Ввести адресу депо
 App   ->  Geo  : geocode("address, Dnipro, Ukraine")
 Geo   ->  Ext  : Nominatim HTTP request
 Ext  -->  Geo  : (lat, lon)
 Geo  -->  App  : (lat, lon)
 App   ->  App  : depot = DeliveryStop(address, lat, lon, source="typed")
-App  -->  User : Green depot marker on map
+App  -->  User : Зелений маркер депо на карті
 
-group Add stops (repeated)
-    alt Typed address
-        User  ->  App : Enter delivery address
+group Додавання точок (повторювано)
+    alt Введена адреса
+        User  ->  App : Ввести адресу доставки
         App   ->  Geo : geocode(address + city)
         Geo   ->  Ext : Nominatim HTTP request
         Ext  -->  Geo : (lat, lon)
         Geo  -->  App : (lat, lon)
-    else Map click
-        User  ->  App : Click on map
+    else Клік на карті
+        User  ->  App : Клік на карті
         App   ->  Geo : reverse_geocode(lat, lon)
         Geo   ->  Ext : Nominatim reverse HTTP request
         Ext  -->  Geo : address string
         Geo  -->  App : address string
     end
     App  ->  App  : stops.append(DeliveryStop(...))
-    App -->  User  : Numbered red marker on map
+    App -->  User  : Нумерований червоний маркер на карті
 end
 
 ' ──────────────────────────────────────────────────────────────────────────────
-== 3. OSM Network Download ==
+== 3. Завантаження мережі OSM ==
 ' ──────────────────────────────────────────────────────────────────────────────
 
-User  ->  App  : Click "Optimize Route"
+User  ->  App  : Клік на "Optimize Route"
 App   ->  GB   : cached_network_at(depot.lat, depot.lon, radius)
-
-note right of GB
-  Uses depot coordinates, NOT city string.
-  Avoids Nominatim misplacing city centroid.
-end note
 
 GB    ->  GB   : _configure_osmnx_tags()
 GB    ->  Ext  : ox.graph_from_point(lat, lon, dist=radius, network_type="all")
@@ -74,13 +69,13 @@ GB    ->  GB   : ox.truncate.largest_component(G_raw, strongly=True)
 GB   -->  App  : G : LSCC-pruned MultiDiGraph
 
 ' ──────────────────────────────────────────────────────────────────────────────
-== 4. Address Snapping ==
+== 4. Прив'язка адрес до вузлів ==
 ' ──────────────────────────────────────────────────────────────────────────────
 
-loop for each stop (depot first, then delivery stops)
+loop для кожної точки (спочатку депо, потім точки доставки)
     alt source == "map_click"
         App  ->  GB : nearest_node_safe(G, lat, lon, tolerance_m=500)
-        GB   ->  GB : bbox check → raise ValueError if out of bounds
+        GB   ->  GB : перевірка bbox → raise ValueError, якщо поза межами
     else source == "typed"
         App  ->  GB : nearest_node(G, lat, lon)
     end
@@ -90,42 +85,42 @@ loop for each stop (depot first, then delivery stops)
     App  ->  App : stop.node_id = node_id
 end
 
-App  ->  App : Detect node collisions → warn user
-App  ->  App : unique_nodes = deduplicated [depot_node] + [stop_nodes]
+App  ->  App : Виявлення колізій вузлів → попередити користувача
+App  ->  App : unique_nodes = дедупліковані [depot_node] + [stop_nodes]
 
 ' ──────────────────────────────────────────────────────────────────────────────
-== 5. Travel-Time Stamping ==
+== 5. Розрахунок часових міток ==
 ' ──────────────────────────────────────────────────────────────────────────────
 
 App  ->  GB  : cached_mode_graphs_at(depot.lat, depot.lon, radius)
 GB   ->  GB  : add_travel_times(G)
 
 note right of GB
-  Three deep copies of G.
-  Each edge gets travel_time (seconds).
-  Impassable edges → PENALTY = 1e9 s.
+  Три копії G.
+  Кожне ребро отримує travel_time (секунди).
+  Непрохідні ребра → PENALTY = 1e9 s.
   drive: footways, motor_vehicle=no → PENALTY
-  bike: steps, wrong-way one-ways → PENALTY
+  bike: steps, односторонній рух проти напрямку → PENALTY
   walk: foot=no, access=private → PENALTY
-  steps (walk): speed × 0.5
+  steps (walk): швидкість × 0.5
 end note
 
 GB  -->  App : {"drive": G_drive, "bike": G_bike, "walk": G_walk}
 
 ' ──────────────────────────────────────────────────────────────────────────────
-== 6. Route Optimisation (TSP or VRP) ==
+== 6. Оптимізація маршруту (TSP або VRP) ==
 ' ──────────────────────────────────────────────────────────────────────────────
 
-alt Single-vehicle TSP  [run_optimization()]
+alt TSP для одного транспортного засобу [run_optimization()]
 
-    group Drive Mode — Hybrid Last-Meter
-        loop for each stop
+    group Режим Drive — Гібридна "Остання миля"
+        loop для кожної точки
             App  ->  GB : nearest_car_accessible_node(G_drive, lat, lon)
             GB  -->  App : n_car : int
             App  ->  GB : distance_m_between_nodes(G_drive, n_ped, n_car)
             GB  -->  App : gap_m : float
             alt gap_m > 100 m
-                App  ->  App : mark stop as car-unreachable
+                App  ->  App : позначити точку як недоступну для авто
             else gap_m ≤ 100 m
                 App  ->  App : walk_time_s = gap_m / walk_speed
             end
@@ -134,19 +129,19 @@ alt Single-vehicle TSP  [run_optimization()]
         RS  -->  App : (matrix, car_nodes)
     end
 
-    group Bike & Walk Modes
+    group Режими Bike та Walk
         App  ->  RS : build_distance_matrix(G_bike, unique_nodes)
         RS  -->  App : bike_matrix
         App  ->  RS : build_distance_matrix(G_walk, unique_nodes)
         RS  -->  App : walk_matrix
     end
 
-    loop for mode in [drive, bike, walk]
+    loop для кожної моделі у [drive, bike, walk]
         App  ->  RS : audit_reachability(matrix, nodes, labels)
         RS  -->  App : [UnreachableStop, ...]
         App  ->  RS : solve_tsp(nodes, matrix, method="auto")
         note right of RS
-          auto: nn (1-2 stops),
+          auto: nn (1-2 точки),
                 2opt (3-20),
                 genetic (21+)
         end note
@@ -156,16 +151,16 @@ alt Single-vehicle TSP  [run_optimization()]
         App  ->  App : results[mode] = ModeResult(...)
     end
 
-else Multi-vehicle VRP  [run_vrp_optimization()]
+else VRP для декількох транспортних засобів [run_vrp_optimization()]
 
     App  ->  VRP : solve_vrp(stops, depot, fleet, mode_graphs, tsp_method)
 
-    VRP  ->  VRP : Phase 1: _assign_stops_to_modes(stops, fleet, depot, graphs)\n→ group stops by compatible vehicle modes
+    VRP  ->  VRP : Фаза 1: _assign_stops_to_modes(stops, fleet, depot, graphs)\n→ групування точок за сумісними режимами ТЗ
 
-    loop for each mode group
+    loop для кожної групи режимів
         VRP  ->  RS : build_distance_matrix(G_mode, group_nodes)
         RS  -->  VRP : matrix
-        VRP  ->  VRP : _genetic_algorithm(stops, vehicles, depot, matrix, ...)\n  POP=50, GEN=150, OX crossover, swap mutation\n  Fitness = A·T_total + B·K (time + vehicle count)
+        VRP  ->  VRP : _genetic_algorithm(stops, vehicles, depot, matrix, ...)\n  POP=50, GEN=150, OX crossover, swap mutation\n  Fitness = A·T_total + B·K (час + кількість ТЗ)
         VRP  ->  VRP : _build_ga_routes(pool_stops, vehicles, depot, graphs)
     end
 
@@ -174,32 +169,32 @@ else Multi-vehicle VRP  [run_vrp_optimization()]
 end
 
 ' ──────────────────────────────────────────────────────────────────────────────
-== 7. Result Rendering ==
+== 7. Відображення результатів ==
 ' ──────────────────────────────────────────────────────────────────────────────
 
 App  ->  App  : session_state ← {opt_results, opt_graphs, opt_warnings}
 
-alt TSP result
+alt Результат TSP
     App  ->  Viz : build_result_map(mode_graphs, results, depot, stops)
     note right of Viz
-      AntPath per mode (drive/bike/walk).
-      LayerControl for mode toggle.
-      Depot = green home icon.
-      Stops = numbered red circles.
+      AntPath для кожного режиму (drive/bike/walk).
+      LayerControl для перемикання режимів.
+      Депо = зелена іконка.
+      Точки = нумеровані червоні.
     end note
     Viz -->  App  : folium.Map
-else VRP result
+else Результат VRP
     App  ->  Viz : build_vrp_result_map(mode_graphs, vrp_routes, depot)
     note right of Viz
-      Coloured polyline per vehicle.
-      Stop markers with vehicle assignment.
+      Кольорова полілінія для кожного ТЗ.
+      Маркери точок із призначенням ТЗ.
     end note
     Viz -->  App  : folium.Map
 end
 
-App  -->  User : Interactive animated map
-App  -->  User : Metric cards (drive / bike / walk total time)
-App  -->  User : Stop-order table per mode (from → to, distance, leg time, ETA)
-App  -->  User : Warning banners (collisions, unreachable, car-inaccessible)
+App  -->  User : Інтерактивна анімована карта
+App  -->  User : Картки метрик (загальний час drive / bike / walk)
+App  -->  User : Таблиця черговості точок за режимом (від → до, відстань, час етапу, ETA)
+App  -->  User : Банери попереджень (колізії, недосяжність, недоступність для авто)
 
 @enduml
