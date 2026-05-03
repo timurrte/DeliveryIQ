@@ -1,0 +1,204 @@
+@startuml DeliveryIQ_SequenceDiagram
+!theme cerulean-outline
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+skinparam maxMessageSize 220
+skinparam BoxPadding 12
+skinparam ParticipantPadding 20
+
+title Діаграма послідовності процесу оптимізації маршруту
+
+actor       "User"                  as User
+participant "app.py"                as App
+participant "geocoder.py"           as Geo
+participant "graph_builder.py"      as GB
+participant "route_solver.py"       as RS
+participant "vrp_solver.py"         as VRP
+participant "visualizer.py"         as Viz
+participant "Nominatim / OSMnx"     as Ext
+
+' ──────────────────────────────────────────────────────────────────────────────
+== 1. Startup & Initialisation ==
+' ──────────────────────────────────────────────────────────────────────────────
+
+User  ->  App  : streamlit run app.py
+App   ->  App  : _init() — populate st.session_state\n{city, depot=None, stops=[], fleet=[Vehicle], click_mode=False}
+App  -->  User : Відображено порожню мапу та бічну панель
+
+' ──────────────────────────────────────────────────────────────────────────────
+== 2. Input — Depot & Delivery Stops ==
+' ──────────────────────────────────────────────────────────────────────────────
+
+User  ->  App  : Введення адреси доставки
+App   ->  Geo  : geocode("address, Dnipro, Ukraine")
+Geo   ->  Ext  : Nominatim HTTP запит
+Ext  -->  Geo  : (lat, lon)
+Geo  -->  App  : (lat, lon)
+App   ->  App  : depot = DeliveryStop(address, lat, lon, source="typed")
+App  -->  User : Зелений маркер хабу на мапі
+
+group Add stops (repeated)
+    alt Ручне введення адреси
+        User  ->  App : Додавання адреси доставки
+        App   ->  Geo : geocode(address + city)
+        Geo   ->  Ext : Nominatim HTTP запит
+        Ext  -->  Geo : (lat, lon)
+        Geo  -->  App : (lat, lon)
+    else Натискання на мапі
+        User  ->  App : Натискання на мапі
+        App   ->  Geo : reverse_geocode(lat, lon)
+        Geo   ->  Ext : Nominatim reverse HTTP запит
+        Ext  -->  Geo : address string
+        Geo  -->  App : address string
+    end
+    App  ->  App  : stops.append(DeliveryStop(...))
+    App -->  User  : Червоний пронумерований маркер на мапі
+end
+
+' ──────────────────────────────────────────────────────────────────────────────
+== 3. OSM Network Download ==
+' ──────────────────────────────────────────────────────────────────────────────
+
+User  ->  App  : Натискання "Оптимізація маршруту"
+App   ->  GB   : cached_network_at(depot.lat, depot.lon, radius)
+
+note right of GB
+  Використовує координати хабу для завантаження мережі.
+end note
+
+GB    ->  GB   : _configure_osmnx_tags()
+GB    ->  Ext  : ox.graph_from_point(lat, lon, dist=radius, network_type="all")
+Ext  -->  GB   : G_raw : MultiDiGraph
+GB    ->  GB   : ox.truncate.largest_component(G_raw, strongly=True)
+GB   -->  App  : G : LSCC MultiDiGraph
+
+' ──────────────────────────────────────────────────────────────────────────────
+== 4. Address Snapping ==
+' ──────────────────────────────────────────────────────────────────────────────
+
+loop for each stop (depot first, then delivery stops)
+    alt source == "map_click"
+        App  ->  GB : nearest_node_safe(G, lat, lon, tolerance_m=500)
+        GB   ->  GB : bbox check → raise ValueError if out of bounds
+    else source == "typed"
+        App  ->  GB : nearest_node(G, lat, lon)
+    end
+    GB   ->  Ext : ox.nearest_nodes(G, X=lon, Y=lat)
+    Ext -->  GB  : node_id : int
+    GB  -->  App : node_id
+    App  ->  App : stop.node_id = node_id
+end
+
+App  ->  App : Знайдено колізії між нодами → попередити користувача
+App  ->  App : unique_nodes = deduplicated [depot_node] + [stop_nodes]
+
+' ──────────────────────────────────────────────────────────────────────────────
+== 5. Travel-Time Stamping ==
+' ──────────────────────────────────────────────────────────────────────────────
+
+App  ->  GB  : cached_mode_graphs_at(depot.lat, depot.lon, radius)
+GB   ->  GB  : add_travel_times(G)
+
+note right of GB
+  Три копії G.
+  Кожне ребро має travel_time (секунди).
+  Непрохідне ребро → PENALTY = 1e9 секунди.
+  drive: footways, motor_vehicle=no → PENALTY
+  bike: steps, wrong-way one-ways → PENALTY
+  walk: foot=no, access=private → PENALTY
+  steps (walk): speed × 0.5
+end note
+
+GB  -->  App : {"drive": G_drive, "bike": G_bike, "walk": G_walk}
+
+' ──────────────────────────────────────────────────────────────────────────────
+== 6. Route Optimisation (TSP or VRP) ==
+' ──────────────────────────────────────────────────────────────────────────────
+
+alt TSP для одного транспортного засобу  [run_optimization()]
+
+    group Метод доставки — Гібридний метод з функціоналом "Остання миля"
+        loop for each stop
+            App  ->  GB : nearest_car_accessible_node(G_drive, lat, lon)
+            GB  -->  App : n_car : int
+            App  ->  GB : distance_m_between_nodes(G_drive, n_ped, n_car)
+            GB  -->  App : gap_m : float
+            alt gap_m > 100 m
+                App  ->  App : позначити пункт доставки як недоступний для доставки машиною
+            else gap_m ≤ 100 m
+                App  ->  App : walk_time_s = gap_m / walk_speed
+            end
+        end
+        App  ->  RS : build_drive_matrix_hybrid(G_drive, depot_node, car_stops)
+        RS  -->  App : (matrix, car_nodes)
+    end
+
+    group Bike & Walk Modes
+        App  ->  RS : build_distance_matrix(G_bike, unique_nodes)
+        RS  -->  App : bike_matrix
+        App  ->  RS : build_distance_matrix(G_walk, unique_nodes)
+        RS  -->  App : walk_matrix
+    end
+
+    loop for mode in [drive, bike, walk]
+        App  ->  RS : audit_reachability(matrix, nodes, labels)
+        RS  -->  App : [UnreachableStop, ...]
+        App  ->  RS : solve_tsp(nodes, matrix, method="auto")
+        note right of RS
+          auto: nn (1-2 stops),
+                2opt (3-20),
+                genetic (21+)
+        end note
+        RS  -->  App : (tsp_route, total_time_s)
+        App  ->  RS : reconstruct_full_route(G_mode, tsp_route)
+        RS  -->  App : full_route : list[int]
+        App  ->  App : results[mode] = ModeResult(...)
+    end
+
+else Мультитрансортна оптимізація VRP  [run_vrp_optimization()]
+
+    App  ->  VRP : solve_vrp(stops, depot, fleet, mode_graphs, tsp_method)
+
+    VRP  ->  VRP : Фаза 1: _assign_stops_to_modes(stops, fleet, depot, graphs)\n→ групування пунктів доставки по доступним методам доставки
+
+    loop for each mode group
+        VRP  ->  RS : build_distance_matrix(G_mode, group_nodes)
+        RS  -->  VRP : matrix
+        VRP  ->  VRP : _genetic_algorithm(stops, vehicles, depot, matrix, ...)\n  POP=50, GEN=150, OX crossover, swap mutation\n  Fitness = A·T_total + B·K (time + vehicle count)
+        VRP  ->  VRP : _build_ga_routes(pool_stops, vehicles, depot, graphs)
+    end
+
+    VRP -->  App  : (routes: list[VehicleRoute], warnings: list[str])
+
+end
+
+' ──────────────────────────────────────────────────────────────────────────────
+== 7. Result Rendering ==
+' ──────────────────────────────────────────────────────────────────────────────
+
+App  ->  App  : session_state ← {opt_results, opt_graphs, opt_warnings}
+
+alt TSP result
+    App  ->  Viz : build_result_map(mode_graphs, results, depot, stops)
+    note right of Viz
+      AntPath для кожного методу доставки (drive/bike/walk).
+      LayerControl для контролю методу.
+      Depot = зелений маркер хабу.
+      Stops = червоний пронумерований маркер адреси доставки.
+    end note
+    Viz -->  App  : folium.Map
+else VRP result
+    App  ->  Viz : build_vrp_result_map(mode_graphs, vrp_routes, depot)
+    note right of Viz
+      Кольрова лінія маршруту для кожного транспортного засобу.
+      Маркери адрес доставок з інформацією про призначений транспортний засіб.
+    end note
+    Viz -->  App  : folium.Map
+end
+
+App  -->  User : Інтерактивна анімована мапа.
+App  -->  User : Картки з метриками часу доставки. (drive / bike / walk total time)
+App  -->  User : Stop-order table per mode Таблиця з порядком зупинок для кожного транспортного засобу (from → to, distance, leg time, ETA)
+App  -->  User : Повідомлення з попередженнями (колізії, недоступність для доставки, недоступність адреси машиною)
+
+@enduml
