@@ -6,7 +6,7 @@ skinparam maxMessageSize 220
 skinparam BoxPadding 12
 skinparam ParticipantPadding 20
 
-title Діаграма послідовності оптимізації
+title Діаграма послідовності оптимізації - Частина 1
 
 actor       "Користувач"                  as User
 participant "app.py"                as App
@@ -106,95 +106,5 @@ note right of GB
 end note
 
 GB  -->  App : {"drive": G_drive, "bike": G_bike, "walk": G_walk}
-
-' ──────────────────────────────────────────────────────────────────────────────
-== 6. Оптимізація маршруту (TSP або VRP) ==
-' ──────────────────────────────────────────────────────────────────────────────
-
-alt TSP для одного транспортного засобу [run_optimization()]
-
-    group Режим Drive — Гібридна "Остання миля"
-        loop для кожної точки
-            App  ->  GB : nearest_car_accessible_node(G_drive, lat, lon)
-            GB  -->  App : n_car : int
-            App  ->  GB : distance_m_between_nodes(G_drive, n_ped, n_car)
-            GB  -->  App : gap_m : float
-            alt gap_m > 100 m
-                App  ->  App : позначити точку як недоступну для авто
-            else gap_m ≤ 100 m
-                App  ->  App : walk_time_s = gap_m / walk_speed
-            end
-        end
-        App  ->  RS : build_drive_matrix_hybrid(G_drive, depot_node, car_stops)
-        RS  -->  App : (matrix, car_nodes)
-    end
-
-    group Режими Bike та Walk
-        App  ->  RS : build_distance_matrix(G_bike, unique_nodes)
-        RS  -->  App : bike_matrix
-        App  ->  RS : build_distance_matrix(G_walk, unique_nodes)
-        RS  -->  App : walk_matrix
-    end
-
-    loop для кожної моделі у [drive, bike, walk]
-        App  ->  RS : audit_reachability(matrix, nodes, labels)
-        RS  -->  App : [UnreachableStop, ...]
-        App  ->  RS : solve_tsp(nodes, matrix, method="auto")
-        note right of RS
-          auto: nn (1-2 точки),
-                2opt (3-20),
-                genetic (21+)
-        end note
-        RS  -->  App : (tsp_route, total_time_s)
-        App  ->  RS : reconstruct_full_route(G_mode, tsp_route)
-        RS  -->  App : full_route : list[int]
-        App  ->  App : results[mode] = ModeResult(...)
-    end
-
-else VRP для декількох транспортних засобів [run_vrp_optimization()]
-
-    App  ->  VRP : solve_vrp(stops, depot, fleet, mode_graphs, tsp_method)
-
-    VRP  ->  VRP : Фаза 1: _assign_stops_to_modes(stops, fleet, depot, graphs)\n→ групування точок за сумісними режимами ТЗ
-
-    loop для кожної групи режимів
-        VRP  ->  RS : build_distance_matrix(G_mode, group_nodes)
-        RS  -->  VRP : matrix
-        VRP  ->  VRP : _genetic_algorithm(stops, vehicles, depot, matrix, ...)\n  POP=50, GEN=150, OX crossover, swap mutation\n  Fitness = A·T_total + B·K (час + кількість ТЗ)
-        VRP  ->  VRP : _build_ga_routes(pool_stops, vehicles, depot, graphs)
-    end
-
-    VRP -->  App  : (routes: list[VehicleRoute], warnings: list[str])
-
-end
-
-' ──────────────────────────────────────────────────────────────────────────────
-== 7. Відображення результатів ==
-' ──────────────────────────────────────────────────────────────────────────────
-
-App  ->  App  : session_state ← {opt_results, opt_graphs, opt_warnings}
-
-alt Результат TSP
-    App  ->  Viz : build_result_map(mode_graphs, results, depot, stops)
-    note right of Viz
-      AntPath для кожного режиму (drive/bike/walk).
-      LayerControl для перемикання режимів.
-      Депо = зелена іконка.
-      Точки = нумеровані червоні.
-    end note
-    Viz -->  App  : folium.Map
-else Результат VRP
-    App  ->  Viz : build_vrp_result_map(mode_graphs, vrp_routes, depot)
-    note right of Viz
-      Кольорова полілінія для кожного ТЗ.
-      Маркери точок із призначенням ТЗ.
-    end note
-    Viz -->  App  : folium.Map
-end
-
-App  -->  User : Інтерактивна анімована карта
-App  -->  User : Картки метрик (загальний час drive / bike / walk)
-App  -->  User : Таблиця черговості точок за режимом (від → до, відстань, час етапу, ETA)
-App  -->  User : Банери попереджень (колізії, недосяжність, недоступність для авто)
 
 @enduml
