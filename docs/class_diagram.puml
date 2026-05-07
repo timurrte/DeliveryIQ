@@ -1,242 +1,115 @@
 @startuml DeliveryIQ_ClassDiagram
 !theme cerulean-outline
 skinparam classAttributeIconSize 0
-skinparam classFontSize 13
-skinparam groupInheritance 2
+skinparam defaultFontSize 14
+skinparam classFontSize 14
+skinparam nodesep 40
+skinparam ranksep 40
 hide empty members
 
 title Діаграма класів
 
-' ══════════════════════════════════════════════════════
-'  ENUMS
-' ══════════════════════════════════════════════════════
-
 enum DeliveryStatus {
-    PENDING   = "pending"
-    IN_TRANSIT = "in_transit"
-    DELIVERED  = "delivered"
+    PENDING
+    IN_TRANSIT
+    DELIVERED
 }
 
-' ══════════════════════════════════════════════════════
-'  CORE DATA MODELS  (app.py)
-' ══════════════════════════════════════════════════════
-
 class DeliveryStop {
-    + address    : str
-    + lat        : float
-    + lon        : float
-    + source     : str = "typed"
-    + node_id    : int | None = None
-    + weight_kg  : float = 1.0
-    + tw_open    : float = 0.0
-    + tw_close   : float = 86400.0
-    + service_time : float = 0.0
+    + address, lat, lon
+    + node_id, weight_kg
+    + tw_open, tw_close, service_time
 }
 
 class LegInfo {
-    + from_label       : str
-    + to_label         : str
-    + distance_m       : float
-    + travel_time_s    : float
-    + cumulative_time_s : float
+    + from_label, to_label
+    + distance_m, travel_time_s
+    + cumulative_time_s
 }
 
 class ModeResult {
-    + mode             : str
-    + tsp_route        : list[int]
-    + full_route       : list[int]
-    + total_time_s     : float
-    + legs             : list[LegInfo]
-    + stop_visit_order : list[DeliveryStop] | None
+    + mode
+    + tsp_route, full_route
+    + total_time_s
+    + legs
 }
-
-' ══════════════════════════════════════════════════════
-'  GEOCODER  (geocoder.py)
-' ══════════════════════════════════════════════════════
-
-class Location {
-    + address  : str
-    + lat      : float
-    + lon      : float
-    + node_id  : int | None = None
-}
-
-class Geocoder <<module>> {
-    + geocode(address: str, retries: int = 3) : tuple[float, float]
-    + geocode_all(addresses: list[str]) : list[Location]
-}
-
-' ══════════════════════════════════════════════════════
-'  PACKAGE DATABASE  (package_db.py)
-' ══════════════════════════════════════════════════════
-
-class Package {
-    + id         : str
-    + address    : str
-    + weight_kg  : float
-    + status     : DeliveryStatus
-    + created_at : datetime
-    + lat        : float | None = None
-    + lon        : float | None = None
-    --
-    + status_label() : str
-    + status_color()  : str
-}
-
-class PackageDB {
-    - db_path : Path
-    --
-    + add_package(address, weight_kg, lat, lon) : Package
-    + get_all() : list[Package]
-    + get_by_status(status: DeliveryStatus) : list[Package]
-    + get_by_id(package_id: str) : Package | None
-    + set_status(package_id: str, status: DeliveryStatus) : None
-    + set_coordinates(package_id: str, lat, lon) : None
-    + delete_package(package_id: str) : None
-    + count_by_status() : dict[DeliveryStatus, int]
-}
-
-' ══════════════════════════════════════════════════════
-'  VRP SOLVER  (vrp_solver.py)
-' ══════════════════════════════════════════════════════
 
 class Vehicle {
-    + name        : str
-    + mode        : str
-    + capacity_kg : float
-    + color       : str = ""
+    + name, mode
+    + capacity_kg, color
 }
 
 class VehicleRoute {
-    + vehicle        : Vehicle
-    + stops          : list[DeliveryStop]
-    + tsp_route      : list[int]
-    + full_route     : list[int]
-    + total_time_s   : float
-    + total_dist_m   : float
-    + legs           : list[LegInfo]
-    + skipped_stops  : list[DeliveryStop]
+    + vehicle, stops
+    + tsp_route, full_route
+    + total_time_s, total_dist_m
+    + legs
 }
 
-class VRPSolver <<module>> {
-    + POP_SIZE         : int = 50
-    + N_GENERATIONS    : int = 150
-    + CROSSOVER_RATE   : float = 0.85
-    + MUTATION_RATE    : float = 0.15
-    + ELITE_SIZE       : int = 2
-    + TOURNAMENT_SIZE  : int = 3
-    --
-    + solve_vrp(stops, depot, fleet, graphs, tsp_method) : tuple[list[VehicleRoute], list[str]]
-    + compute_objective(routes, A, B) : float
+class Package {
+    + id, address, weight_kg
+    + status, lat, lon
 }
-
-' ══════════════════════════════════════════════════════
-'  ROUTE SOLVER  (route_solver.py)
-' ══════════════════════════════════════════════════════
 
 class UnreachableStop {
-    + node_id          : int
-    + label            : str
-    + unreachable_from : list[str]
-    + unreachable_to   : list[str]
-    --
-    + is_isolated()  : bool
-    + summary()      : str
+    + node_id, label
+    + unreachable_from/to
+}
+
+class App <<module>> {
+    + run_optimization()
+    + run_vrp_optimization()
+    + build_result_map()
+}
+
+class Geocoder <<module>> {
+    + geocode() / geocode_all()
+}
+
+class GraphBuilder <<module>> {
+    + PENALTY = 1e9
+    + SPEED = {30/15/5}
+    + get_network()
+    + add_travel_times()
+    + nearest_node[_safe]()
 }
 
 class RouteSolver <<module>> {
-    + PENALTY : float = 1e9
-    --
-    + audit_reachability(matrix, nodes, labels) : list[UnreachableStop]
-    + build_distance_matrix(G, nodes, weight) : dict
-    + build_drive_matrix_hybrid(G_drive, depot_node, car_stops) : tuple[dict, list]
-    + build_drive_matrix_mapbox(stops, api_key) : dict
-    + solve_tsp(nodes, matrix, method, seed) : tuple[list[int], float]
-    + get_full_path(G, src, dst, weight) : list[int]
-    + reconstruct_full_route(G, tsp_route, weight) : list[int]
+    + build_distance_matrix()
+    + build_drive_matrix_hybrid()
+    + solve_tsp()
+    + audit_reachability()
 }
 
-' ══════════════════════════════════════════════════════
-'  GRAPH BUILDER  (graph_builder.py)
-' ══════════════════════════════════════════════════════
-
-class GraphBuilder <<module>> {
-    + PENALTY : float = 1e9
-    + SPEED_KMH : dict = {drive:30, bike:15, walk:5}
-    --
-    + get_network(location, dist) : MultiDiGraph
-    + get_network_from_point(lat, lon, dist) : MultiDiGraph
-    + get_network_from_place(place, which_result) : MultiDiGraph
-    + add_travel_times(G) : dict[str, MultiDiGraph]
-    + add_travel_times_to_single_graph(G) : MultiDiGraph
-    + nearest_node(G, lat, lon) : int
-    + nearest_node_safe(G, lat, lon, tolerance_m) : int
-    + nearest_car_accessible_node(G_drive, lat, lon) : int
-    + distance_m_between_nodes(G, node_a, node_b) : float
-    + graph_summary(G) : dict
+class VRPSolver <<module>> {
+    + POP=50, GEN=150
+    + solve_vrp()
 }
-
-' ══════════════════════════════════════════════════════
-'  VISUALIZER  (visualizer.py)
-' ══════════════════════════════════════════════════════
 
 class Visualizer <<module>> {
-    + MODE_COLOURS : dict = {drive:#E74C3C, bike:#2ECC71, walk:#3498DB}
-    --
-    + build_map(mode_graphs, mode_routes, mode_times,\n  depot_node, stop_nodes, output_path, default_mode) : Path
+    + build_map()
 }
 
-' ══════════════════════════════════════════════════════
-'  STREAMLIT APP  (app.py)
-' ══════════════════════════════════════════════════════
-
-class App <<module>> {
-    + DEFAULT_CITY : str = "Dnipro, Ukraine"
-    --
-    + forward_geocode(raw, city) : DeliveryStop | None
-    + reverse_geocode(lat, lon) : DeliveryStop | None
-    + cached_network(city, radius) : MultiDiGraph
-    + cached_network_at(lat, lon, radius) : MultiDiGraph
-    + cached_mode_graphs(city, radius) : dict
-    + cached_mode_graphs_at(lat, lon, radius) : dict
-    + run_optimization(depot, stops, city, radius, tsp_method) : tuple
-    + run_vrp_optimization(depot, stops, fleet, radius, tsp_method) : tuple
-    + build_selection_map(city, depot, stops) : Map
-    + build_result_map(mode_graphs, results, depot, stops) : Map
-    + build_vrp_result_map(mode_graphs, vrp_routes, depot) : Map
-    + hms(s) : str
-    + render_stop_table(result: ModeResult) : str
+class PackageDB <<module>> {
+    + add / get / set_status / delete
 }
 
-' ══════════════════════════════════════════════════════
-'  RELATIONSHIPS
-' ══════════════════════════════════════════════════════
+ModeResult   "1" *-- "*" LegInfo
+VehicleRoute "1" *-- "*" LegInfo
+VehicleRoute "1" *-- "1" Vehicle
+VehicleRoute "1" *-- "*" DeliveryStop
+Package --> DeliveryStatus
+PackageDB ..> Package
 
-' Composition
-ModeResult         "1"  *--  "many"  LegInfo          : legs
-VehicleRoute       "1"  *--  "many"  LegInfo          : legs
-VehicleRoute       "1"  *--  "1"     Vehicle           : vehicle
-VehicleRoute       "1"  *--  "many"  DeliveryStop      : stops / skipped
+App ..> Geocoder
+App ..> GraphBuilder
+App ..> RouteSolver
+App ..> VRPSolver
+App ..> Visualizer
+App ..> PackageDB
+App ..> ModeResult
 
-' Association
-Package            "1"  o--  "1"     DeliveryStatus    : status
-PackageDB               ..>          Package            : manages
-PackageDB               ..>          DeliveryStatus     : filters by
-
-' Module dependencies
-App                     ..>          Geocoder           : geocode / reverse
-App                     ..>          GraphBuilder       : network & node snap
-App                     ..>          RouteSolver        : matrix & TSP
-App                     ..>          VRPSolver          : multi-vehicle routing
-App                     ..>          Visualizer         : map rendering
-App                     ..>          PackageDB          : package management
-
-VRPSolver               ..>          RouteSolver        : solve_tsp per mode
-VRPSolver               ..>          GraphBuilder       : modal graphs
-
-Geocoder                ..>          Location           : produces
-App                     ..>          DeliveryStop       : creates & owns
-App                     ..>          ModeResult         : creates
-RouteSolver             ..>          UnreachableStop    : audit_reachability
+VRPSolver ..> RouteSolver
+RouteSolver ..> UnreachableStop
 
 @enduml

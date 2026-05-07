@@ -1,108 +1,39 @@
 @startuml DeliveryIQ_Optimization_and_Results
 !theme cerulean-outline
 skinparam sequenceMessageAlign center
-skinparam responseMessageBelowArrow true
-skinparam maxMessageSize 220
-skinparam BoxPadding 12
-skinparam ParticipantPadding 20
+skinparam defaultFontSize 18
+skinparam ParticipantPadding 70
+skinparam BoxPadding 16
+skinparam ArrowFontSize 16
+skinparam minClassWidth 90
 
-title Діаграма послідовності оптимізації - Частина 2
+title Діаграма послідовності — Частина 2 (оптимізація + вивід)
 
-actor       "Користувач"            as User
-participant "app.py"                as App
-participant "graph_builder.py"      as GB
-participant "route_solver.py"       as RS
-participant "vrp_solver.py"         as VRP
-participant "visualizer.py"         as Viz
+actor       "Користувач" as U
+participant "app.py"          as A
+participant "route_solver.py" as R
+participant "vrp_solver.py"   as V
+participant "visualizer.py"   as Z
 
-' ──────────────────────────────────────────────────────────────────────────────
-== 6. Оптимізація маршруту (TSP або VRP) ==
-' ──────────────────────────────────────────────────────────────────────────────
-
-alt TSP для одного транспортного засобу [run_optimization()]
-
-    group Режим Drive — Гібридна "Остання миля"
-        loop для кожної точки
-            App  ->  GB : nearest_car_accessible_node(G_drive, lat, lon)
-            GB  -->  App : n_car : int
-            App  ->  GB : distance_m_between_nodes(G_drive, n_ped, n_car)
-            GB  -->  App : gap_m : float
-            alt gap_m > 100 m
-                App  ->  App : позначити точку як недоступну для авто
-            else gap_m ≤ 100 m
-                App  ->  App : walk_time_s = gap_m / walk_speed
-            end
-        end
-        App  ->  RS : build_drive_matrix_hybrid(G_drive, depot_node, car_stops)
-        RS  -->  App : (matrix, car_nodes)
-    end
-
-    group Режими Bike та Walk
-        App  ->  RS : build_distance_matrix(G_bike, unique_nodes)
-        RS  -->  App : bike_matrix
-        App  ->  RS : build_distance_matrix(G_walk, unique_nodes)
-        RS  -->  App : walk_matrix
-    end
-
-    loop для кожної моделі у [drive, bike, walk]
-        App  ->  RS : audit_reachability(matrix, nodes, labels)
-        RS  -->  App : [UnreachableStop, ...]
-        App  ->  RS : solve_tsp(nodes, matrix, method="auto")
-        note right of RS
-          auto: nn (1-2 точки),
-                2opt (3-20),
-                genetic (21+)[cite: 2]
-        end note
-        RS  -->  App : (tsp_route, total_time_s)
-        App  ->  RS : reconstruct_full_route(G_mode, tsp_route)
-        RS  -->  App : full_route : list[int]
-        App  ->  App : results[mode] = ModeResult(...)
-    end
-
-else VRP для декількох транспортних засобів [run_vrp_optimization()]
-
-    App  ->  VRP : solve_vrp(stops, depot, fleet, mode_graphs, tsp_method)
-
-    VRP  ->  VRP : Фаза 1: _assign_stops_to_modes(stops, fleet, depot, graphs)\n→ групування точок за сумісними режимами ТЗ[cite: 2]
-
-    loop для кожної групи режимів
-        VRP  ->  RS : build_distance_matrix(G_mode, group_nodes)
-        RS  -->  VRP : matrix
-        VRP  ->  VRP : _genetic_algorithm(stops, vehicles, depot, matrix, ...)\n  POP=50, GEN=150, OX crossover, swap mutation\n  Fitness = A·T_total + B·K (час + кількість ТЗ)[cite: 2]
-        VRP  ->  VRP : _build_ga_routes(pool_stops, vehicles, depot, graphs)
-    end
-
-    VRP -->  App  : (routes: list[VehicleRoute], warnings: list[str])
-
+== Оптимізація ==
+alt TSP — один ТЗ
+    A -> R : build_distance_matrix × 3
+    R --> A : matrices
+    A -> R : solve_tsp(method="auto")
+    note right of R : nn (1-2) / 2opt (3-20) / genetic (21+)
+    R --> A : (route, time)
+else VRP — флот
+    A -> V : solve_vrp(stops, depot, fleet, graphs)
+    V -> V : Фаза 1: групування за режимом + місткістю
+    V -> R : build_distance_matrix
+    R --> V : matrix
+    V -> V : Фаза 2: GA (POP=50, GEN=150)\nF = A·T + B·K
+    V --> A : (routes, warnings)
 end
 
-' ──────────────────────────────────────────────────────────────────────────────
-== 7. Відображення результатів ==
-' ──────────────────────────────────────────────────────────────────────────────
-
-App  ->  App  : session_state ← {opt_results, opt_graphs, opt_warnings}
-
-alt Результат TSP
-    App  ->  Viz : build_result_map(mode_graphs, results, depot, stops)
-    note right of Viz
-      AntPath для кожного режиму (drive/bike/walk).
-      LayerControl для перемикання режимів.
-      Депо = зелена іконка.
-      Точки = нумеровані червоні[cite: 2].
-    end note
-    Viz -->  App  : folium.Map
-else Результат VRP
-    App  ->  Viz : build_vrp_result_map(mode_graphs, vrp_routes, depot)
-    note right of Viz
-      Кольорова полілінія для кожного ТЗ.
-      Маркери точок із призначенням ТЗ[cite: 2].
-    end note
-    Viz -->  App  : folium.Map
-end
-
-App  -->  User : Інтерактивна анімована карта
-App  -->  User : Картки метрик (загальний час drive / bike / walk)
-App  -->  User : Таблиця черговості точок за режимом (від → до, відстань, час етапу, ETA)
-App  -->  User : Банери попереджень (колізії, недосяжність, недоступність для авто)[cite: 2]
+== Результат ==
+A -> Z : build_result_map / build_vrp_result_map
+Z --> A : folium.Map
+A --> U : карта + метрики + таблиця
 
 @enduml

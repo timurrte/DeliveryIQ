@@ -1,110 +1,36 @@
 @startuml DeliveryIQ_SequenceDiagram
 !theme cerulean-outline
 skinparam sequenceMessageAlign center
-skinparam responseMessageBelowArrow true
-skinparam maxMessageSize 220
-skinparam BoxPadding 12
-skinparam ParticipantPadding 20
+skinparam defaultFontSize 18
+skinparam ParticipantPadding 70
+skinparam BoxPadding 16
+skinparam ArrowFontSize 16
+skinparam minClassWidth 90
 
-title Діаграма послідовності оптимізації - Частина 1
+title Діаграма послідовності — Частина 1 (підготовка)
 
-actor       "Користувач"                  as User
-participant "app.py"                as App
-participant "geocoder.py"           as Geo
-participant "graph_builder.py"      as GB
-participant "route_solver.py"       as RS
-participant "vrp_solver.py"         as VRP
-participant "visualizer.py"         as Viz
-participant "Nominatim / OSMnx"     as Ext
+actor       "Користувач" as U
+participant "app.py"           as A
+participant "geocoder.py"      as G
+participant "graph_builder.py" as B
+participant "Nominatim/OSMnx"  as X
 
-' ──────────────────────────────────────────────────────────────────────────────
-== 1. Запуск та ініціалізація ==
-' ──────────────────────────────────────────────────────────────────────────────
+== Введення ==
+U -> A : депо + точки
+A -> G : geocode / reverse
+G -> X : HTTP
+X --> G : (lat, lon)
+G --> A : координати
 
-User  ->  App  : streamlit run app.py
-App   ->  App  : _init() — заповнення st.session_state\n{city, depot=None, stops=[], fleet=[Vehicle], click_mode=False}
-App  -->  User : Відображення порожньої карти та бічної панелі
+== Мережа OSM ==
+A -> B : cached_network_at(lat, lon, r)
+B -> X : graph_from_point("all")
+X --> B : G_raw
+B --> A : G (LSCC)
 
-' ──────────────────────────────────────────────────────────────────────────────
-== 2. Введення — Депо та точки доставки ==
-' ──────────────────────────────────────────────────────────────────────────────
-
-User  ->  App  : Ввести адресу депо
-App   ->  Geo  : geocode("address, Dnipro, Ukraine")
-Geo   ->  Ext  : Nominatim HTTP request
-Ext  -->  Geo  : (lat, lon)
-Geo  -->  App  : (lat, lon)
-App   ->  App  : depot = DeliveryStop(address, lat, lon, source="typed")
-App  -->  User : Зелений маркер депо на карті
-
-group Додавання точок (повторювано)
-    alt Введена адреса
-        User  ->  App : Ввести адресу доставки
-        App   ->  Geo : geocode(address + city)
-        Geo   ->  Ext : Nominatim HTTP request
-        Ext  -->  Geo : (lat, lon)
-        Geo  -->  App : (lat, lon)
-    else Клік на карті
-        User  ->  App : Клік на карті
-        App   ->  Geo : reverse_geocode(lat, lon)
-        Geo   ->  Ext : Nominatim reverse HTTP request
-        Ext  -->  Geo : address string
-        Geo  -->  App : address string
-    end
-    App  ->  App  : stops.append(DeliveryStop(...))
-    App -->  User  : Нумерований червоний маркер на карті
-end
-
-' ──────────────────────────────────────────────────────────────────────────────
-== 3. Завантаження мережі OSM ==
-' ──────────────────────────────────────────────────────────────────────────────
-
-User  ->  App  : Клік на "Optimize Route"
-App   ->  GB   : cached_network_at(depot.lat, depot.lon, radius)
-
-GB    ->  GB   : _configure_osmnx_tags()
-GB    ->  Ext  : ox.graph_from_point(lat, lon, dist=radius, network_type="all")
-Ext  -->  GB   : G_raw : MultiDiGraph
-GB    ->  GB   : ox.truncate.largest_component(G_raw, strongly=True)
-GB   -->  App  : G : LSCC-pruned MultiDiGraph
-
-' ──────────────────────────────────────────────────────────────────────────────
-== 4. Прив'язка адрес до вузлів ==
-' ──────────────────────────────────────────────────────────────────────────────
-
-loop для кожної точки (спочатку депо, потім точки доставки)
-    alt source == "map_click"
-        App  ->  GB : nearest_node_safe(G, lat, lon, tolerance_m=500)
-        GB   ->  GB : перевірка bbox → raise ValueError, якщо поза межами
-    else source == "typed"
-        App  ->  GB : nearest_node(G, lat, lon)
-    end
-    GB   ->  Ext : ox.nearest_nodes(G, X=lon, Y=lat)
-    Ext -->  GB  : node_id : int
-    GB  -->  App : node_id
-    App  ->  App : stop.node_id = node_id
-end
-
-App  ->  App : Виявлення колізій вузлів → попередити користувача
-App  ->  App : unique_nodes = дедупліковані [depot_node] + [stop_nodes]
-
-' ──────────────────────────────────────────────────────────────────────────────
-== 5. Розрахунок часових міток ==
-' ──────────────────────────────────────────────────────────────────────────────
-
-App  ->  GB  : cached_mode_graphs_at(depot.lat, depot.lon, radius)
-GB   ->  GB  : add_travel_times(G)
-
-note right of GB
-  Три копії G.
-  Кожне ребро отримує travel_time (секунди).
-  Непрохідні ребра → PENALTY = 1e9 s.
-  drive: footways, motor_vehicle=no → PENALTY
-  bike: steps, односторонній рух проти напрямку → PENALTY
-  walk: foot=no, access=private → PENALTY
-  steps (walk): швидкість × 0.5
-end note
-
-GB  -->  App : {"drive": G_drive, "bike": G_bike, "walk": G_walk}
+== Прив'язка + часові мітки ==
+A -> B : nearest_node + add_travel_times
+note right of B : 3 копії: drive / bike / walk\nнепрохідні -> PENALTY = 1e9 s
+B --> A : {drive, bike, walk}
 
 @enduml
