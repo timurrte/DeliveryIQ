@@ -202,6 +202,22 @@ section[data-testid="stSidebar"] .stButton>button:hover{
 .mono{font-family:'DM Mono',monospace;font-size:.78rem;}
 
 #MainMenu,footer,header{visibility:hidden;}
+
+/* sidebar reopen button (shown when sidebar collapsed) */
+[data-testid="stSidebarCollapsedControl"]{
+  visibility:visible!important;display:flex!important;
+  position:fixed!important;top:14px!important;left:14px!important;z-index:9999!important;
+  background:linear-gradient(135deg,#1d4ed8,#2563eb)!important;
+  border:none!important;border-radius:10px!important;
+  padding:10px 12px!important;
+  box-shadow:0 4px 14px rgba(37,99,235,.45)!important;
+  transition:transform .15s,box-shadow .15s!important;}
+[data-testid="stSidebarCollapsedControl"]:hover{
+  transform:translateY(-1px);
+  box-shadow:0 6px 20px rgba(37,99,235,.6)!important;}
+[data-testid="stSidebarCollapsedControl"] button,
+[data-testid="stSidebarCollapsedControl"] svg{
+  color:white!important;fill:white!important;}
 </style>
 """, unsafe_allow_html=True)
 

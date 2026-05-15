@@ -6,6 +6,15 @@ skinparam ParticipantPadding 70
 skinparam BoxPadding 16
 skinparam ArrowFontSize 16
 skinparam minClassWidth 90
+skinparam ArrowThickness 2
+skinparam ParticipantBorderThickness 2
+skinparam ActorBorderThickness 2
+skinparam LifeLineBorderThickness 1.5
+skinparam ArrowColor #000000
+skinparam ParticipantBorderColor #333333
+skinparam LifeLineBorderColor #000000
+skinparam DefaultFontColor #000000
+
 
 title Діаграма послідовності — Частина 2 (оптимізація + вивід)
 
