@@ -187,6 +187,14 @@ class PackageDB:
                 (lat, lon, package_id),
             )
 
+    def set_weight(self, package_id: str, weight_kg: float) -> None:
+        """Update the weight of a package."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE packages SET weight_kg = ? WHERE id = ?",
+                (float(weight_kg), package_id),
+            )
+
     def delete_package(self, package_id: str) -> None:
         """Permanently remove a package from the database."""
         with self._connect() as conn:

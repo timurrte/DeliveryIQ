@@ -291,12 +291,74 @@ def _init():
         "fleet": [Vehicle("Vehicle 1", "drive", 500.0, VEHICLE_COLORS[0])],
         "opt_vrp_results": None,
         "opt_vrp_warnings": [],
+        # Stop awaiting weight input via the popup dialog (None when no popup)
+        "pending_stop": None,
+        # Network download radius — slider + number-input stay in sync
+        "radius_slider": 8000,
+        "radius_input": 8000,
     }
     for k, v in defs.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
 _init()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PACKAGE-WEIGHT POPUP (new-stop flow)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@st.dialog("📦 Package Weight")
+def _ask_package_weight() -> None:
+    """
+    Modal asking the user for the weight of a newly-added delivery stop.
+    On Save: the stop is appended to st.session_state.stops AND persisted to
+    the package database with status PENDING.
+    """
+    pending: Optional[DeliveryStop] = st.session_state.get("pending_stop")
+    if pending is None:
+        return
+
+    short = pending.address[:90] + ("…" if len(pending.address) > 90 else "")
+    st.markdown(f"**Address:**  \n{short}")
+    st.caption(f"📍 {pending.lat:.5f}, {pending.lon:.5f}")
+
+    w = st.number_input(
+        "Package weight (kg)",
+        min_value=0.01,
+        max_value=10_000.0,
+        value=float(pending.weight_kg or 1.0),
+        step=0.1,
+        format="%.2f",
+        key="pending_stop_weight",
+    )
+
+    col_save, col_cancel = st.columns(2)
+    with col_save:
+        if st.button("💾 Save", type="primary", use_container_width=True,
+                     key="pending_stop_save"):
+            pending.weight_kg = float(w)
+            st.session_state.stops.append(pending)
+            try:
+                _pkg_db.add_package(
+                    address=pending.address,
+                    weight_kg=float(w),
+                    lat=pending.lat,
+                    lon=pending.lon,
+                )
+            except Exception as exc:
+                logging.getLogger(__name__).warning(
+                    "Failed to persist package for new stop: %s", exc
+                )
+            st.session_state.pending_stop = None
+            st.session_state.opt_results = None
+            st.session_state.opt_vrp_results = None
+            st.rerun()
+    with col_cancel:
+        if st.button("✕ Cancel", use_container_width=True,
+                     key="pending_stop_cancel"):
+            st.session_state.pending_stop = None
+            st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1093,6 +1155,14 @@ def render_stop_table(result: ModeResult) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  WEIGHT-POPUP TRIGGER
+# ══════════════════════════════════════════════════════════════════════════════
+# Opens the modal whenever a newly-geocoded stop is waiting for a weight.
+if st.session_state.get("pending_stop") is not None:
+    _ask_package_weight()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  SIDEBAR
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1127,7 +1197,32 @@ with st.sidebar:
 
     # ── Network settings ──────────────────────────────────────────────────────
     st.markdown('<div style="font-size:.61rem;font-weight:700;letter-spacing:1.2px;color:#475569;text-transform:uppercase;margin:12px 0 5px">⚙️ Settings</div>', unsafe_allow_html=True)
-    radius = st.slider("Radius (m)", 2000, 8000, 4000, 500)
+
+    def _sync_radius_from_slider() -> None:
+        st.session_state.radius_input = st.session_state.radius_slider
+
+    def _sync_radius_from_input() -> None:
+        st.session_state.radius_slider = int(st.session_state.radius_input)
+
+    st.markdown(
+        '<div style="font-size:.78rem;color:#cbd5e1;margin-bottom:2px">Radius (m)</div>',
+        unsafe_allow_html=True,
+    )
+    rc_slider, rc_input = st.columns([3, 2])
+    with rc_slider:
+        st.slider(
+            "Radius slider", min_value=2000, max_value=16000, step=500,
+            key="radius_slider", on_change=_sync_radius_from_slider,
+            label_visibility="collapsed",
+        )
+    with rc_input:
+        st.number_input(
+            "Radius value", min_value=2000, max_value=16000, step=500,
+            key="radius_input", on_change=_sync_radius_from_input,
+            label_visibility="collapsed",
+        )
+    radius = int(st.session_state.radius_slider)
+
     tsp_method = st.selectbox("TSP solver",
                               ["auto", "christofides", "2opt", "genetic", "nn"])
 
@@ -1184,26 +1279,10 @@ with st.sidebar:
         with st.spinner("Geocoding…"):
             r = forward_geocode(stop_txt.strip(), city)
         if r:
-            st.session_state.stops.append(r)
-            st.session_state.opt_results = None
-            st.session_state.opt_vrp_results = None
+            st.session_state.pending_stop = r
             st.rerun()
         else:
             st.error(f"Not found in {city}")
-
-    # ── Click-to-add toggle ───────────────────────────────────────────────────
-    click_label = "🖱 Disable Map Click" if st.session_state.click_mode else "🖱 Enable Map Click"
-    if st.button(click_label, key="click_tog", use_container_width=True):
-        st.session_state.click_mode = not st.session_state.click_mode
-        st.rerun()
-
-    if st.session_state.click_mode:
-        target = "depot" if st.session_state.depot is None else "stop"
-        st.markdown(f"""
-        <div class="click-active">
-          🖱 Click Mode <b>ON</b><br>
-          <span style="font-size:.75rem">Next click adds a <b>{target}</b></span>
-        </div>""", unsafe_allow_html=True)
 
     st.markdown('<hr style="border-color:#161d2e;margin:12px 0">', unsafe_allow_html=True)
 
@@ -1227,7 +1306,7 @@ with st.sidebar:
               <div class="di-num">{i+1}</div>
               <div style="flex:1">
                 <div class="di-addr">{src} {short}</div>
-                <div class="di-coords">{stop.lat:.5f}, {stop.lon:.5f}</div>
+                <div class="di-coords">{stop.lat:.5f}, {stop.lon:.5f} · ⚖️ {stop.weight_kg:.2f} kg</div>
               </div>
             </div>""", unsafe_allow_html=True)
             if st.button("✕", key=f"rm_{i}", help=f"Remove stop #{i+1}"):
@@ -1291,18 +1370,40 @@ with map_tab:
         st.markdown('<div class="sec-head">🗺️ Coordinator Map — Build Your Delivery List</div>',
                     unsafe_allow_html=True)
 
-        if st.session_state.click_mode:
-            target_hint = "depot location" if depot is None else "delivery stop"
-            st.markdown(f"""
-            <div class="click-active" style="text-align:left;padding:10px 18px;margin-bottom:10px">
-              🖱 <b>Click Mode Active</b> — click the map to place a
-              <b>{target_hint}</b>. Coordinates are reverse-geocoded automatically.
-            </div>""", unsafe_allow_html=True)
-        elif depot is None:
+        # ── Map-click toggle (visual indicator) ──────────────────────────────
+        tc_l, tc_r = st.columns([1.2, 3])
+        with tc_l:
+            click_on = st.toggle(
+                "🖱 Map Click Mode",
+                value=st.session_state.click_mode,
+                key="click_toggle_main",
+                help="When ON, clicking the map adds a depot or a delivery stop.",
+            )
+            if click_on != st.session_state.click_mode:
+                st.session_state.click_mode = click_on
+                st.rerun()
+        with tc_r:
+            if st.session_state.click_mode:
+                target_hint = "depot location" if depot is None else "delivery stop"
+                st.markdown(f"""
+                <div class="click-active" style="text-align:left;padding:10px 18px;margin:4px 0">
+                  🟢 <b>ON</b> — next click on the map adds a <b>{target_hint}</b>.
+                  Coordinates are reverse-geocoded automatically.
+                </div>""", unsafe_allow_html=True)
+            else:
+                st.markdown("""
+                <div style="background:#f1f5f9;border:1px solid #e2e8f0;
+                            border-left:4px solid #94a3b8;border-radius:8px;
+                            padding:10px 18px;color:#475569;font-size:.83rem;
+                            margin:4px 0;text-align:left">
+                  ⚪ <b>OFF</b> — enable the toggle to click-place markers on the map.
+                </div>""", unsafe_allow_html=True)
+
+        if not st.session_state.click_mode and depot is None:
             st.markdown("""
             <div class="info-box">
-              👈 Set a <b>depot</b> in the sidebar or enable <b>Map Click</b> to place it
-              on the map, then add delivery stops to begin.
+              👈 Set a <b>depot</b> in the sidebar or enable <b>Map Click Mode</b>
+              above to place it on the map, then add delivery stops to begin.
             </div>""", unsafe_allow_html=True)
 
         sel_map = build_selection_map(city, depot, stops)
@@ -1329,11 +1430,12 @@ with map_tab:
                     if st.session_state.depot is None:
                         new.source = "map_click"
                         st.session_state.depot = new
+                        st.session_state.opt_results = None
+                        st.session_state.opt_vrp_results = None
+                        st.rerun()
                     else:
-                        st.session_state.stops.append(new)
-                    st.session_state.opt_results = None
-                    st.session_state.opt_vrp_results = None
-                    st.rerun()
+                        st.session_state.pending_stop = new
+                        st.rerun()
 
     # ── Run optimisation ──────────────────────────────────────────────────────
     if run_btn and can_run:
@@ -1713,7 +1815,7 @@ with pkg_tab:
         )
     else:
         for pkg in packages:
-            col_info, col_status, col_actions = st.columns([4, 2, 2])
+            col_info, col_weight, col_status, col_actions = st.columns([4, 1.6, 2, 2])
 
             with col_info:
                 short_addr = pkg.address[:55] + ("…" if len(pkg.address) > 55 else "")
@@ -1726,13 +1828,32 @@ with pkg_tab:
                     f"""<div style="padding:6px 0">
                       <div style="font-weight:600;font-size:.88rem">{short_addr}</div>
                       <div style="font-size:.75rem;color:#64748b">
-                        ⚖️ {pkg.weight_kg:.2f} kg &nbsp;·&nbsp;
                         📍 {coords_txt} &nbsp;·&nbsp;
                         🕐 {pkg.created_at.strftime('%d %b %Y %H:%M')} UTC
                       </div>
                     </div>""",
                     unsafe_allow_html=True,
                 )
+
+            with col_weight:
+                new_weight = st.number_input(
+                    "Weight (kg)",
+                    min_value=0.01,
+                    max_value=10_000.0,
+                    value=float(pkg.weight_kg),
+                    step=0.1,
+                    format="%.2f",
+                    key=f"pkg_weight_{pkg.id}",
+                    label_visibility="collapsed",
+                )
+                if abs(float(new_weight) - float(pkg.weight_kg)) > 1e-6:
+                    if st.button(
+                        "💾 Save weight",
+                        key=f"pkg_save_weight_{pkg.id}",
+                        use_container_width=True,
+                    ):
+                        _pkg_db.set_weight(pkg.id, float(new_weight))
+                        st.rerun()
 
             with col_status:
                 st.markdown(

@@ -69,13 +69,22 @@ def forward_geocode(raw: str, city: str) -> Optional[DeliveryStop]
 
 ### 1.3 Delivery Stop Geocoding
 
-The user types a delivery address and presses **➜**.  The same `forward_geocode()` is
-called; the result is appended to `st.session_state.stops`.
+The user types a delivery address in the sidebar and presses **➜**. `forward_geocode()`
+is called as in 1.2; on success the result is **not** appended to `st.session_state.stops`
+directly. Instead it is staged in `st.session_state.pending_stop` and the
+**Package Weight popup** (see 1.5) opens on the next render. Only after the user confirms
+the weight is the stop appended to `stops` **and** a new row is persisted in
+`PackageDB` with status `PENDING`.
 
 ### 1.4 Click-to-Add (Map Click)
 
-When **Map Click** is enabled, `st_folium` captures the click coordinates and returns
-them as `{"lat": …, "lng": …}` in `map_output["last_clicked"]`.
+The **🖱 Map Click Mode** toggle now lives **directly above the coordinator map** (left
+column of the row, with a coloured status pill on the right) rather than in the sidebar.
+The pill turns green (`.click-active`, animated) when the toggle is ON and grey when
+OFF, also stating whether the next click will place the depot or a delivery stop.
+
+When the toggle is ON, `st_folium` captures the click coordinates and returns them as
+`{"lat": …, "lng": …}` in `map_output["last_clicked"]`.
 
 ```python
 def reverse_geocode(lat: float, lon: float) -> Optional[DeliveryStop]
@@ -86,16 +95,49 @@ def reverse_geocode(lat: float, lon: float) -> Optional[DeliveryStop]
   HTTP GET to `https://nominatim.openstreetmap.org/reverse`.
 - **Output:** `DeliveryStop(address, lat, lon, source="map_click")`.
 - If the reverse call fails or times out, the address string is set to
-  `"<lat>, <lon>"` as a fallback. The stop is still added.
+  `"<lat>, <lon>"` as a fallback.
 
-### 1.5 Fleet Configuration (Fleet Settings Tab)
+Routing of the resulting stop:
+
+- If `st.session_state.depot is None` → the stop is assigned directly to
+  `st.session_state.depot` (depots carry no weight, so no popup is shown).
+- Otherwise → the stop is staged in `st.session_state.pending_stop`; the Package Weight
+  popup (see 1.5) opens and persists the package on confirmation.
+
+### 1.5 Package Weight Popup
+
+```python
+@st.dialog("📦 Package Weight")
+def _ask_package_weight() -> None
+```
+
+A modal that is opened from the top of the script whenever
+`st.session_state.pending_stop` is not `None`:
+
+```python
+if st.session_state.get("pending_stop") is not None:
+    _ask_package_weight()
+```
+
+- Renders the staged stop's address and coordinates and a `st.number_input` for the
+  weight (range `0.01 … 10 000 kg`, default `1.0`).
+- **💾 Save** → writes `weight_kg` onto the pending stop, appends it to
+  `st.session_state.stops`, then calls
+  `_pkg_db.add_package(address, weight_kg, lat, lon)` so the package shows up in the
+  **Packages** tab with status `PENDING`. Clears `pending_stop` and reruns.
+- **✕ Cancel** → discards the pending stop (no DB write, no `stops` append).
+
+Both 1.3 (sidebar typed entry) and 1.4 (map click while depot is set) funnel into this
+popup before a stop becomes visible in the optimisation pipeline.
+
+### 1.6 Fleet Configuration (Fleet Settings Tab)
 
 The **Fleet Settings** tab (`fleet_tab`) lets the user manage the vehicle fleet stored
 in `st.session_state.fleet` (a `list[Vehicle]`). The fleet is initialised on first load
 with a single default drive vehicle:
 
 ```python
-Vehicle("Vehicle 1", mode="drive", capacity=50, color=VEHICLE_COLORS[0])
+Vehicle("Vehicle 1", mode="drive", capacity_kg=500.0, color=VEHICLE_COLORS[0])
 ```
 
 Users can:
@@ -109,7 +151,46 @@ Users can:
 Any fleet edit resets `st.session_state.opt_vrp_results` and `opt_results` so stale
 results are not shown.
 
-### 1.6 Run Button
+### 1.7 Packages Tab (Persistent Package Database)
+
+Packages are persisted independently of `st.session_state.stops` in a SQLite database
+(`packages.db`) managed by `PackageDB` (`package_db.py`).
+
+The Packages tab exposes the full CRUD surface:
+
+- **Add new package** — an inline form geocodes the typed address (using
+  `forward_geocode`), then calls `_pkg_db.add_package(address, weight_kg, lat, lon)`.
+  Coordinates are persisted when geocoding succeeds; on failure the row is saved without
+  coordinates and a warning is shown.
+- **Edit weight** — every package row renders a `st.number_input` bound to
+  `pkg_weight_{pkg.id}`. When the displayed value differs from the stored
+  `pkg.weight_kg`, a **💾 Save weight** button appears and calls
+  `PackageDB.set_weight(package_id, weight_kg)`.
+- **Change status** — a `st.selectbox` per row dispatches
+  `PackageDB.set_status(package_id, DeliveryStatus(...))`.
+- **➜ Add to Route** — promotes a geocoded `PENDING`/`IN_TRANSIT` package to
+  `st.session_state.stops` as a `DeliveryStop` (carrying the stored `weight_kg`) and
+  flips its status to `IN_TRANSIT`. Duplicate addresses are skipped.
+- **🗑 Delete** — `PackageDB.delete_package(package_id)`.
+
+`PackageDB` schema:
+
+```sql
+CREATE TABLE packages (
+    id          TEXT PRIMARY KEY,   -- uuid4 hex
+    address     TEXT NOT NULL,
+    weight_kg   REAL NOT NULL,
+    status      TEXT NOT NULL,      -- pending | in_transit | delivered
+    created_at  TEXT NOT NULL,      -- ISO8601 UTC
+    lat         REAL,
+    lon         REAL
+);
+```
+
+Note: a package created via the Weight Popup (1.5) and a package created via the
+Packages tab's "Add new package" form both end up in this same table.
+
+### 1.8 Run Button
 
 ```python
 run_btn = st.button("🚀  Optimize Routes", disabled=not can_run)
@@ -144,7 +225,10 @@ def run_optimization(
   - `depot` — the geocoded depot stop.
   - `stops` — list of geocoded delivery stops.
   - `city` — active city string (used only for cache key on the city-name network).
-  - `radius` — OSM download radius in metres (user-selected slider, default 4 000 m).
+  - `radius` — OSM download radius in metres. Controlled in the sidebar by a
+    synced **slider + number-input** pair (range `2 000 … 16 000`, step `500`,
+    default `8 000`). The number-input lets the user type an exact value; both
+    widgets stay in sync via `on_change` callbacks.
   - `tsp_method` — one of `"auto"`, `"nn"`, `"2opt"`, `"christofides"`, `"genetic"`.
 - **Output:**
   - `results` — `dict[mode → ModeResult]` with keys `"drive"`, `"bike"`, `"walk"`.
@@ -598,14 +682,17 @@ travel-time stamping happen only once.
 ### Step 4 — Fleet Capacity Pre-flight
 
 ```python
-total_cap = sum(v.capacity for v in fleet)
-if total_cap < len(valid_stops):
+total_cap_kg    = sum(v.capacity_kg for v in fleet)
+total_weight_kg = sum(s.weight_kg   for s in valid_stops)
+if total_cap_kg < total_weight_kg:
     raise ValueError(...)
 ```
 
-Raises a `ValueError` (caught as `st.error` in `app.py`) if the fleet cannot
-theoretically hold all stops. Per-mode capacity exhaustion is caught separately by
-`_distribute_within_mode` and surfaces with a user-facing error message.
+Raises a `ValueError` (caught as `st.error` in `app.py`) if the combined fleet payload
+capacity cannot carry the total package weight. Each `DeliveryStop.weight_kg` is either
+the value entered in the Package Weight popup (1.5) or the value imported from a row in
+the `PackageDB` via **➜ Add to Route** (1.7). Per-mode capacity exhaustion is caught
+separately by `_distribute_within_mode` and surfaces with a user-facing error message.
 
 ---
 
@@ -792,19 +879,34 @@ Fleet-level warnings (unreachable stops, idle vehicles) appear above the expande
 
 ### `DeliveryStop`
 ```
-address : str              full geocoded address string
-lat     : float            WGS-84 latitude
-lon     : float            WGS-84 longitude
-source  : str              "typed" | "map_click"
-node_id : int | None       OSM node ID after snapping (set by run_optimization / run_vrp_optimization)
+address      : str              full geocoded address string
+lat          : float            WGS-84 latitude
+lon          : float            WGS-84 longitude
+source       : str              "typed" | "map_click"
+node_id      : int | None       OSM node ID after snapping (set by run_optimization / run_vrp_optimization)
+weight_kg    : float            package weight q_k (kg); captured via the weight popup or imported from PackageDB
+tw_open      : float            time-window open  δ_min (seconds from midnight)
+tw_close     : float            time-window close δ_max (seconds from midnight)
+service_time : float            service time s_i (seconds)
 ```
 
 ### `Vehicle`
 ```
-name     : str    display name (e.g. "Van 1")
-mode     : str    "drive" | "bike" | "walk"
-capacity : int    maximum number of stops this vehicle can serve
-color    : str    hex colour from VEHICLE_COLORS palette, assigned at creation time
+name        : str    display name (e.g. "Van 1")
+mode        : str    "drive" | "bike" | "walk"
+capacity_kg : float  maximum payload weight this vehicle can carry, in kilograms
+color       : str    hex colour from VEHICLE_COLORS palette, assigned at creation time
+```
+
+### `Package` (`package_db.Package`)
+```
+id         : str                UUID4 hex
+address    : str                delivery address (human-readable)
+weight_kg  : float              weight in kilograms (editable inline in Packages tab)
+status     : DeliveryStatus     PENDING | IN_TRANSIT | DELIVERED
+created_at : datetime.datetime  UTC creation timestamp
+lat        : float | None       geocoded latitude (None if geocoding failed)
+lon        : float | None       geocoded longitude
 ```
 
 ### `VehicleRoute`
