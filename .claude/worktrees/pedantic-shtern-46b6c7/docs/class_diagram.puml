@@ -1,0 +1,115 @@
+@startuml DeliveryIQ_ClassDiagram
+!theme cerulean-outline
+skinparam classAttributeIconSize 0
+skinparam defaultFontSize 14
+skinparam classFontSize 14
+skinparam nodesep 40
+skinparam ranksep 40
+hide empty members
+
+title Діаграма класів
+
+enum DeliveryStatus {
+    PENDING
+    IN_TRANSIT
+    DELIVERED
+}
+
+class DeliveryStop {
+    + address, lat, lon
+    + node_id, weight_kg
+    + tw_open, tw_close, service_time
+}
+
+class LegInfo {
+    + from_label, to_label
+    + distance_m, travel_time_s
+    + cumulative_time_s
+}
+
+class ModeResult {
+    + mode
+    + tsp_route, full_route
+    + total_time_s
+    + legs
+}
+
+class Vehicle {
+    + name, mode
+    + capacity_kg, color
+}
+
+class VehicleRoute {
+    + vehicle, stops
+    + tsp_route, full_route
+    + total_time_s, total_dist_m
+    + legs
+}
+
+class Package {
+    + id, address, weight_kg
+    + status, lat, lon
+}
+
+class UnreachableStop {
+    + node_id, label
+    + unreachable_from/to
+}
+
+class App <<module>> {
+    + run_optimization()
+    + run_vrp_optimization()
+    + build_result_map()
+}
+
+class Geocoder <<module>> {
+    + geocode() / geocode_all()
+}
+
+class GraphBuilder <<module>> {
+    + PENALTY = 1e9
+    + SPEED = {30/15/5}
+    + get_network()
+    + add_travel_times()
+    + nearest_node[_safe]()
+}
+
+class RouteSolver <<module>> {
+    + build_distance_matrix()
+    + build_drive_matrix_hybrid()
+    + solve_tsp()
+    + audit_reachability()
+}
+
+class VRPSolver <<module>> {
+    + POP=50, GEN=150
+    + solve_vrp()
+}
+
+class Visualizer <<module>> {
+    + build_map()
+}
+
+class PackageDB <<module>> {
+    + add / get / set_status / delete
+}
+
+ModeResult   "1" *-- "*" LegInfo
+VehicleRoute "1" *-- "*" LegInfo
+VehicleRoute "1" *-- "1" Vehicle
+VehicleRoute "1" *-- "*" DeliveryStop
+Package --> DeliveryStatus
+PackageDB ..> Package
+
+App ..> Geocoder
+App ..> GraphBuilder
+App ..> RouteSolver
+App ..> VRPSolver
+App ..> Visualizer
+App ..> PackageDB
+App ..> ModeResult
+
+VRPSolver ..> RouteSolver
+RouteSolver ..> UnreachableStop
+
+@enduml

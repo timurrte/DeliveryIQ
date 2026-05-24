@@ -1,0 +1,46 @@
+@startuml Deployment_DeliveryIQ
+!theme plain
+
+title Діаграма розгортання -- DeliveryIQ
+
+node "Клієнтський пристрій" as Client {
+    component [Веб-браузер\n(Chrome / Firefox)] as Browser
+}
+
+node "Сервер додатку" as Server {
+    node "Python 3.11+ Runtime" as Runtime {
+        component [Streamlit Server\n(порт 8501)] as ST
+
+        artifact "app.py" as APP
+        artifact "geocoder.py" as GEO
+        artifact "graph_builder.py" as GB
+        artifact "route_solver.py" as RS
+        artifact "vrp_solver.py" as VRP
+        artifact "visualizer.py" as VIS
+        artifact "package_db.py" as PKG
+
+        ST --> APP
+
+        database "packages.db\n<<SQLite>>" as DB
+        folder "cache/\n<<GraphML файли>>" as Cache
+    }
+
+    PKG --> DB
+    GB --> Cache : кешування\nOSM-графів
+}
+
+cloud "OpenStreetMap" as OSM_Cloud {
+    component [Nominatim\nGeocoding API] as NOM_API
+    component [Overpass API\n(дорожня мережа)] as OVP_API
+}
+
+cloud "Mapbox" as Mapbox_Cloud {
+    component [Directions Matrix API\n(driving-traffic)] as MBX_API
+}
+
+Browser <--> ST : HTTP/WebSocket\n(Streamlit protocol)
+GEO --> NOM_API : HTTPS\n(геокодування)
+GB --> OVP_API : HTTPS\n(завантаження графа)
+RS --> MBX_API : HTTPS\n(матриця трафіку,\nопціонально)
+
+@enduml

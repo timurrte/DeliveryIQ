@@ -1,0 +1,571 @@
+\documentclass[12pt, a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{mathtools}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{lmodern}
+
+\geometry{margin=2.5cm}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    urlcolor=blue,
+    citecolor=blue
+}
+
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}[section]
+\newtheorem{remark}{Remark}[section]
+
+\title{%
+  \textbf{Mathematical Formulation of the Optimization Problem}\\[0.5em]
+  \large DeliveryIQ --- Route Optimizer
+}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\newpage
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Overview}
+% ─────────────────────────────────────────────────────────────────────────────
+
+DeliveryIQ solves two related combinatorial optimization problems depending on
+the number of vehicles in the fleet:
+
+\begin{enumerate}
+  \item \textbf{Single-vehicle mode} (fleet size $= 1$):
+        the \emph{Travelling Salesman Problem} (TSP) --- find the shortest
+        round-trip tour visiting all delivery stops exactly once and returning
+        to the depot.
+
+  \item \textbf{Multi-vehicle mode} (fleet size $\geq 2$):
+        a \emph{Capacitated Vehicle Routing Problem} (CVRP) --- partition
+        stops across a heterogeneous fleet of vehicles with per-vehicle
+        transport mode and stop-capacity constraints, then solve a TSP for each
+        vehicle's assigned cluster.
+\end{enumerate}
+
+Both problems operate on a \emph{weighted directed graph} extracted from
+OpenStreetMap (OSM) via the OSMnx library.  Travel times along graph edges
+encode modal accessibility rules (drive / bike / walk) and serve as the
+optimization objective.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Road-Network Graph Model}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Directed Weighted Graph}
+
+The street network is modelled as a directed multigraph
+
+\[
+  G = (V,\, E,\, w),
+\]
+
+\noindent where:
+\begin{itemize}
+  \item $V$ is the set of OSM \emph{nodes} (road intersections and endpoints),
+  \item $E \subseteq V \times V$ is the set of directed \emph{edges} (road
+        segments),
+  \item $w : E \to \mathbb{R}_{>0} \cup \{\mathcal{P}\}$ is the
+        \emph{travel-time weight function}, mapping each directed edge to a
+        travel time in seconds or to the penalty sentinel
+        $\mathcal{P} = 10^9$ (impassable edge).
+\end{itemize}
+
+\subsection{Largest Strongly Connected Component (LSCC)}
+
+After download, the graph is pruned to its \emph{Largest Strongly Connected
+Component}:
+
+\[
+  G^* = \operatorname{LSCC}(G),
+\]
+
+\noindent ensuring that for every pair of nodes $u, v \in V^*$ a directed
+path from $u$ to $v$ exists within $G^*$.  All subsequent computations use
+$G^*$ exclusively.
+
+\subsection{Modal Travel-Time Stamping}
+\label{sec:modal}
+
+Three independent copies of $G^*$ are built, one per transport mode
+$m \in \mathcal{M} = \{\texttt{drive},\, \texttt{bike},\, \texttt{walk}\}$.
+The travel-time weight of edge $(u, v)$ under mode $m$ is:
+
+\begin{equation}
+  \label{eq:travel_time}
+  w_m(u,v) =
+  \begin{cases}
+    \dfrac{\ell(u,v)}{s_m}
+      & \text{if mode $m$ may legally traverse $(u,v)$,} \\[8pt]
+    \dfrac{\ell(u,v)}{s_m \cdot \alpha_{\text{steps}}}
+      & \text{if } m = \texttt{walk} \text{ and } \texttt{highway} = \texttt{steps},\\[8pt]
+    \mathcal{P}
+      & \text{otherwise (mode-impassable edge),}
+  \end{cases}
+\end{equation}
+
+\noindent where:
+\begin{itemize}
+  \item $\ell(u,v) \geq 1$ is the physical length of the edge in metres,
+  \item $s_m$ is the assumed constant travel speed in metres per second
+        (Table~\ref{tab:speeds}),
+  \item $\alpha_{\text{steps}} = 0.5$ is the speed-reduction factor for stairs.
+\end{itemize}
+
+\begin{table}[h]
+  \centering
+  \caption{Assumed travel speeds by mode.}
+  \label{tab:speeds}
+  \begin{tabular}{lcc}
+    \toprule
+    Mode & Speed (km/h) & Speed (m/s) \\
+    \midrule
+    Drive (\texttt{drive}) & 30.0 & $8.\overline{3}$ \\
+    Bicycle (\texttt{bike}) & 15.0 & $4.1\overline{6}$ \\
+    Walking (\texttt{walk}) & 5.0  & $1.3\overline{8}$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+The modal accessibility rules applied in~\eqref{eq:travel_time} are
+summarised in Table~\ref{tab:modal_rules}.
+
+\begin{table}[h]
+  \centering
+  \caption{Edge accessibility rules (PENALTY = impassable, else passable).}
+  \label{tab:modal_rules}
+  \small
+  \begin{tabular}{lp{4.8cm}p{4.8cm}p{3.5cm}}
+    \toprule
+    Edge type & \texttt{drive} & \texttt{bike} & \texttt{walk} \\
+    \midrule
+    \texttt{highway} $\in$ \{footway, pedestrian, steps, \ldots\}
+      & $\mathcal{P}$ & passable & passable (steps: $\times 0.5$) \\
+    \texttt{motor\_vehicle} $\in$ \{no, private, destination\}
+      & $\mathcal{P}$ & passable & passable \\
+    \texttt{bicycle} $\in$ \{no, dismount\}
+      & n/a & $\mathcal{P}$ & passable \\
+    \texttt{highway} = cycleway
+      & passable & passable & passable \\
+    One-way reversed edge (no bike contra-flow tag)
+      & --- & $\mathcal{P}$ & passable \\
+    \texttt{foot} $\in$ \{no, private\}
+      & n/a & n/a & $\mathcal{P}$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Shortest-Path Distance Matrix}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{All-Pairs Shortest Paths (Dijkstra)}
+
+Given the modal graph $G_m = (V^*, E, w_m)$ and a set of locations
+$L = \{0, 1, \ldots, n\}$ where node $0$ is the \emph{depot} and nodes
+$1, \ldots, n$ are delivery stops, the \emph{distance matrix} is defined as:
+
+\begin{equation}
+  \label{eq:matrix}
+  d_m(i, j) =
+  \begin{cases}
+    0 & \text{if } i = j, \\
+    \displaystyle\min_{\text{path } p: i \to j}
+      \sum_{(u,v) \in p} w_m(u,v)
+      & \text{if a finite-cost path exists,} \\
+    \mathcal{P} & \text{otherwise.}
+  \end{cases}
+\end{equation}
+
+The minimisation in~\eqref{eq:matrix} is computed by Dijkstra's algorithm for
+every ordered pair $(i, j)$ with $i \neq j$:
+
+\[
+  d_m(i, j) = \operatorname{Dijkstra}(G_m,\, i,\, j,\, w_m).
+\]
+
+Building the full matrix requires $n(n+1)$ Dijkstra calls
+($(n+1)$ nodes, $n(n+1)$ ordered pairs).
+
+\subsection{Penalty Sentinel}
+
+Any pair $(i, j)$ with $d_m(i, j) \geq \mathcal{P}$ is considered
+\emph{mode-unreachable}.  The value $\mathcal{P} = 10^9$ seconds
+($\approx 31.7$ years) is chosen to dominate any realistic travel time while
+remaining a finite float, so TSP solvers can still construct a valid (if
+suboptimal) tour when unreachable stops are present.
+
+\subsection{Hybrid Last-Meter (Drive Mode)}
+
+For drive-mode routing, a stop $j$ may lie in a pedestrian zone unreachable
+by car.  In this case the car parks at the nearest car-accessible node
+$v_j^{\text{car}} \in V^*$ and the driver walks the remaining distance.
+The adjusted drive cost to stop $j$ from stop $i$ is:
+
+\begin{equation}
+  \label{eq:hybrid}
+  d_{\text{hybrid}}(i, j) = d_{\text{drive}}(i,\, v_j^{\text{car}})
+    + \frac{\ell(v_j^{\text{car}},\, j)}{s_{\text{walk}}},
+\end{equation}
+
+\noindent where $\ell(v_j^{\text{car}}, j)$ is the straight-line (Haversine)
+distance from the parking node to the actual stop location.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Single-Vehicle: Travelling Salesman Problem}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Problem Formulation}
+
+Let $L = \{0, 1, \ldots, n\}$ with depot $0$.  A \emph{tour} is a permutation
+$\pi$ of $\{1, \ldots, n\}$ that specifies the visit order.  The total
+round-trip cost is:
+
+\begin{equation}
+  \label{eq:tsp_cost}
+  C(\pi) = d(0,\, \pi_1)
+    + \sum_{k=1}^{n-1} d(\pi_k,\, \pi_{k+1})
+    + d(\pi_n,\, 0),
+\end{equation}
+
+\noindent where $d = d_m$ is the distance matrix for the chosen mode $m$.
+
+The TSP seeks a permutation $\pi^*$ minimising the tour cost:
+
+\begin{equation}
+  \label{eq:tsp}
+  \pi^* = \underset{\pi \in \Pi_n}{\arg\min}\; C(\pi),
+\end{equation}
+
+\noindent where $\Pi_n$ is the set of all permutations of $n$ stops.
+
+The tour is encoded as a \emph{closed sequence} starting and ending at the
+depot:
+\[
+  [0,\; \pi_1,\; \pi_2,\; \ldots,\; \pi_n,\; 0].
+\]
+
+\subsection{Solution Methods}
+
+The TSP is NP-hard in general.  The system selects a heuristic or
+approximation algorithm automatically based on the number of stops $n$
+(Table~\ref{tab:tsp_methods}).
+
+\begin{table}[h]
+  \centering
+  \caption{Automatic TSP method selection.}
+  \label{tab:tsp_methods}
+  \begin{tabular}{cc}
+    \toprule
+    Stop count $n$ & Method \\
+    \midrule
+    $1$--$2$  & Nearest Neighbour (NN) \\
+    $3$--$20$ & NN + 2-opt \\
+    $21+$     & Genetic Algorithm (OX) \\
+    any       & Christofides (explicit) \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsubsection{Nearest Neighbour (NN)}
+
+Starting from the depot, greedily append the closest unvisited stop at each
+step:
+
+\begin{equation}
+  \label{eq:nn}
+  \pi_{k+1} = \underset{j \,\notin\, \{\pi_1, \ldots, \pi_k\}}{\arg\min}\;
+    d(\pi_k,\, j), \qquad \pi_0 = 0.
+\end{equation}
+
+The NN heuristic runs in $O(n^2)$ time and produces a feasible tour even
+when some matrix entries carry the penalty $\mathcal{P}$.
+
+\subsubsection{2-opt Local Search}
+
+Starting from the NN tour, iteratively swap two non-adjacent edges
+$(r_i, r_{i+1})$ and $(r_j, r_{j+1})$ if the swap decreases tour cost.
+For a tour $r = [r_0, r_1, \ldots, r_n, r_0]$, the \emph{2-opt swap}
+of positions $i$ and $j$ reverses the sub-sequence $r_i, \ldots, r_j$:
+
+\[
+  r' = [r_0, \ldots, r_{i-1},\; r_j, r_{j-1}, \ldots, r_i,\; r_{j+1}, \ldots, r_n, r_0].
+\]
+
+The swap is accepted when:
+
+\begin{equation}
+  \label{eq:2opt}
+  C(r') < C(r).
+\end{equation}
+
+The procedure repeats until no improving swap exists or a maximum of
+$2\,000$ iterations is reached.  Complexity per iteration pass: $O(n^2)$.
+
+\subsubsection{Christofides Approximation}
+
+The Christofides algorithm gives a $\tfrac{3}{2}$-approximation for the metric
+TSP.  It requires a \emph{complete, connected, undirected} helper graph
+$H = (L, E_H)$ where $E_H$ contains only edges with $d(i,j) < \mathcal{P}$.
+If $H$ is disconnected (i.e.\ some stop is unreachable), the algorithm falls
+back to 2-opt.  When applicable, it proceeds as follows:
+
+\begin{enumerate}[noitemsep]
+  \item Compute a minimum spanning tree $T$ of $H$.
+  \item Find the set $O \subset L$ of nodes with odd degree in $T$.
+  \item Compute a minimum-weight perfect matching $M$ on the subgraph
+        induced by $O$.
+  \item Form an Eulerian multigraph $H' = T \cup M$ and extract an
+        Eulerian circuit.
+  \item Shortcut repeated vertices to obtain a Hamiltonian tour.
+\end{enumerate}
+
+\subsubsection{Genetic Algorithm (Order-Crossover, OX)}
+
+For large instances ($n \geq 21$), an evolutionary algorithm is used.  The
+\emph{chromosome} is a permutation $\pi$ of stops $\{1,\ldots,n\}$ (depot
+excluded).  The \emph{fitness} function is:
+
+\begin{equation}
+  \label{eq:fitness}
+  f(\pi) = \frac{1}{C(\pi) + 1},
+\end{equation}
+
+\noindent so lower tour cost yields higher fitness.
+
+\paragraph{Order crossover (OX).}
+Given parents $p_1$ and $p_2$, select a random sub-sequence slice $[a, b)$:
+
+\begin{enumerate}[noitemsep]
+  \item Copy $p_1[a:b]$ directly into the child at positions $[a, b)$.
+  \item Fill remaining positions left-to-right with genes from $p_2$ in their
+        original order, skipping genes already placed.
+\end{enumerate}
+
+\paragraph{Swap mutation.}
+With probability $\mu = 0.02$, exchange two randomly chosen genes:
+$\pi_i \leftrightarrow \pi_j$.
+
+\paragraph{Generational loop.}
+With population size $N_{\text{pop}} = 120$ and $G_{\text{max}} = 400$
+generations:
+\begin{enumerate}[noitemsep]
+  \item Sort population by fitness (descending).
+  \item Retain the top $10\%$ as elites.
+  \item Fill the rest via OX crossover of randomly chosen elite parents,
+        followed by swap mutation.
+\end{enumerate}
+
+The best chromosome after $G_{\text{max}}$ generations is returned as the
+approximate solution.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Multi-Vehicle: Capacitated Vehicle Routing Problem}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Problem Formulation}
+
+Let:
+\begin{itemize}
+  \item $S = \{s_1, \ldots, s_n\}$ be the set of delivery stops,
+  \item $\mathcal{V} = \{v_1, \ldots, v_K\}$ be the fleet of $K$ vehicles,
+  \item $m_k \in \mathcal{M}$ be the transport mode of vehicle $v_k$,
+  \item $Q_k \in \mathbb{Z}_{>0}$ be the stop capacity of vehicle $v_k$,
+  \item $d_0 \in V^*$ be the depot node.
+\end{itemize}
+
+The CVRP seeks an assignment $\sigma : S \to \mathcal{V}$ and, for each
+vehicle $v_k$, a tour $\pi^{(k)}$ over the stops assigned to it, minimising
+the total fleet travel time:
+
+\begin{equation}
+  \label{eq:cvrp}
+  \min_{\sigma,\, \{\pi^{(k)}\}} \sum_{k=1}^{K} C_k\!\left(\pi^{(k)}\right)
+\end{equation}
+
+\noindent subject to:
+
+\begin{align}
+  \sigma(s_i) \neq \varnothing
+    &\implies d_{m_{\sigma(s_i)}}(d_0, s_i) < \mathcal{P}
+    & &\text{(mode-compatibility)}, \label{eq:cvrp_mode}\\
+  \left|\sigma^{-1}(v_k)\right| &\leq Q_k
+    & &\forall\, k \in \{1,\ldots,K\}\quad\text{(capacity)},\label{eq:cvrp_cap}\\
+  \sigma^{-1}(v_k) &\cap \sigma^{-1}(v_j) = \varnothing
+    & &\forall\, k \neq j\quad\text{(each stop assigned once)}, \label{eq:cvrp_part}
+\end{align}
+
+\noindent where $C_k(\pi^{(k)})$ is the tour cost \eqref{eq:tsp_cost} for
+vehicle $v_k$ using distance matrix $d_{m_k}$.
+
+Stops unreachable by any fleet vehicle ($d_m(d_0, s_i) \geq \mathcal{P}$
+for all $m \in \{m_k\}$) are excluded from the optimization and reported as
+warnings.
+
+\subsection{Two-Phase Solution Algorithm}
+
+The CVRP is solved via a \emph{cluster-first, route-second} decomposition in
+two phases.
+
+\subsubsection{Phase 1: Mode-First Stop Assignment}
+
+Each stop $s_i$ is assigned to the transport mode $m^*(s_i)$ whose vehicles
+currently have the most remaining total capacity among compatible modes:
+
+\begin{equation}
+  \label{eq:mode_assign}
+  m^*(s_i) = \underset{m \in \mathcal{M}(s_i)}{\arg\max}\;
+    R_m, \qquad
+  R_m = \sum_{\substack{k:\, m_k = m}} \bigl(Q_k - |\sigma^{-1}(v_k)|\bigr),
+\end{equation}
+
+\noindent where $\mathcal{M}(s_i) = \{m \in \mathcal{M} : d_m(d_0, s_i) < \mathcal{P}\}$
+is the set of modes compatible with stop $s_i$, and $R_m$ is the total
+remaining capacity across all vehicles of mode $m$.
+
+After mode assignment, the stops are partitioned into mode-specific pools:
+$\mathcal{S}_m = \{s_i : m^*(s_i) = m\}$.
+
+\subsubsection{Phase 2: Intra-Mode Distribution via k-Means}
+
+Within each mode pool $\mathcal{S}_m$, stops are distributed across the
+$K_m = |\{k : m_k = m\}|$ vehicles of that mode using geographic k-means
+clustering.
+
+\paragraph{k-Means clustering.}
+Let $K_m' = \min(K_m,\, |\mathcal{S}_m|)$.  Run k-means on the geographic
+coordinates of the stops in $\mathcal{S}_m$:
+
+\begin{equation}
+  \label{eq:kmeans}
+  \min_{\{C_1,\ldots,C_{K_m'}\}}
+    \sum_{j=1}^{K_m'} \sum_{s_i \in C_j}
+    \left\| \begin{pmatrix} \varphi(s_i) \\ \lambda(s_i) \end{pmatrix}
+           - \boldsymbol{\mu}_j \right\|^2,
+\end{equation}
+
+\noindent where $\varphi(s_i)$ and $\lambda(s_i)$ are the latitude and
+longitude of stop $s_i$, $\boldsymbol{\mu}_j$ is the centroid of cluster $j$,
+and $\|\cdot\|$ denotes the Euclidean norm.
+
+\paragraph{Bearing-based cluster-to-vehicle assignment.}
+To assign clusters to vehicles in a geographically coherent way, cluster
+centroids are sorted by their \emph{compass bearing} from the depot.  The
+bearing from point $(\varphi_1, \lambda_1)$ to $(\varphi_2, \lambda_2)$ is:
+
+\begin{equation}
+  \label{eq:bearing}
+  \theta = \left(
+    \arctan2\!\left(
+      \sin(\Delta\lambda)\cos\varphi_2,\;
+      \cos\varphi_1 \sin\varphi_2 - \sin\varphi_1 \cos\varphi_2 \cos(\Delta\lambda)
+    \right) \cdot \frac{180}{\pi} + 360
+  \right) \bmod 360,
+\end{equation}
+
+\noindent where $\Delta\lambda = \lambda_2 - \lambda_1$.  Clusters are
+assigned to vehicles in ascending bearing order.
+
+\paragraph{Capacity rebalancing.}
+k-means ignores vehicle capacities.  After the initial assignment, any
+vehicle $v_k$ that exceeds its capacity $Q_k$ transfers excess stops to the
+next vehicle with remaining capacity:
+
+\begin{equation}
+  \label{eq:rebalance}
+  \text{while } |\sigma^{-1}(v_k)| > Q_k :
+  \quad\text{pop last stop from } \sigma^{-1}(v_k),
+  \quad\text{insert into first } v_j \text{ with } |\sigma^{-1}(v_j)| < Q_j.
+\end{equation}
+
+Candidate vehicles are scanned first forward ($j > k$) then backward ($j < k$)
+to avoid false over-capacity errors on the last vehicle in bearing order.
+If no vehicle has remaining capacity a \texttt{ValueError} is raised.
+
+\subsubsection{Per-Vehicle TSP}
+
+Once the assignment $\sigma$ is determined, each vehicle $v_k$ with
+$|\sigma^{-1}(v_k)| \geq 1$ independently solves the TSP
+\eqref{eq:tsp}--\eqref{eq:tsp_cost} on its cluster using the modal distance
+matrix $d_{m_k}$ and the auto-selected method from Table~\ref{tab:tsp_methods}.
+
+The total fleet cost decomposes as:
+
+\begin{equation}
+  \label{eq:fleet_cost}
+  C_{\text{fleet}} = \sum_{k=1}^{K} C_k(\pi^{(k)}).
+\end{equation}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Route Reconstruction}
+% ─────────────────────────────────────────────────────────────────────────────
+
+The TSP solution $\pi^*$ is a sequence of high-level location nodes
+$[0, \pi_1^*, \ldots, \pi_n^*, 0]$.  To render the route on the map, each
+consecutive pair $(r_k, r_{k+1})$ is expanded to the full sequence of
+intermediate OSM road nodes via Dijkstra:
+
+\begin{equation}
+  \label{eq:reconstruct}
+  \text{path}(r_k, r_{k+1}) = \underset{p:\, r_k \to r_{k+1}}{\arg\min}
+    \sum_{(u,v) \in p} w_m(u, v).
+\end{equation}
+
+The concatenation of all expanded sub-paths (with shared boundary nodes
+deduplicated) forms the \emph{full route polyline} drawn on the Folium map.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Summary of Notation}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\begin{table}[h]
+  \centering
+  \caption{Summary of mathematical notation.}
+  \begin{tabular}{cl}
+    \toprule
+    Symbol & Description \\
+    \midrule
+    $G = (V, E, w)$ & Directed weighted multigraph of the road network \\
+    $G^*$ & Largest Strongly Connected Component of $G$ \\
+    $G_m$ & Modal copy of $G^*$ for mode $m$ \\
+    $w_m(u, v)$ & Travel-time weight of edge $(u, v)$ under mode $m$ (seconds) \\
+    $\mathcal{P} = 10^9$ & Impassable / unreachable sentinel value (seconds) \\
+    $\ell(u, v)$ & Physical length of edge $(u, v)$ in metres \\
+    $s_m$ & Travel speed for mode $m$ in metres per second \\
+    $d_m(i, j)$ & Shortest-path travel time from $i$ to $j$ under mode $m$ \\
+    $n$ & Number of delivery stops (excluding depot) \\
+    $L = \{0, 1, \ldots, n\}$ & Set of locations; node $0$ is the depot \\
+    $\pi$ & Permutation of stops (TSP tour, excluding depot) \\
+    $C(\pi)$ & Total round-trip tour cost \\
+    $\pi^*$ & Optimal (or near-optimal) tour \\
+    $K$ & Number of vehicles in the fleet \\
+    $\mathcal{V} = \{v_1, \ldots, v_K\}$ & Fleet of vehicles \\
+    $m_k$ & Transport mode of vehicle $v_k$ \\
+    $Q_k$ & Stop capacity of vehicle $v_k$ \\
+    $\sigma : S \to \mathcal{V}$ & Stop-to-vehicle assignment function \\
+    $\mathcal{S}_m$ & Set of stops assigned to mode pool $m$ \\
+    $C_j$ & $j$-th k-means cluster of stops \\
+    $\boldsymbol{\mu}_j$ & Centroid of cluster $C_j$ \\
+    $\theta$ & Compass bearing (degrees, $[0, 360)$) \\
+    $f(\pi)$ & Genetic algorithm fitness (reciprocal cost) \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\end{document}

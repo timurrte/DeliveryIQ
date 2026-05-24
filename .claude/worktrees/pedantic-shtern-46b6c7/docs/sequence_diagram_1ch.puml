@@ -1,0 +1,44 @@
+@startuml DeliveryIQ_SequenceDiagram
+!theme cerulean-outline
+skinparam sequenceMessageAlign center
+skinparam defaultFontSize 18
+skinparam ParticipantPadding 70
+skinparam BoxPadding 16
+skinparam ArrowFontSize 16
+skinparam minClassWidth 90
+skinparam ArrowThickness 2
+skinparam ParticipantBorderThickness 2
+skinparam ActorBorderThickness 2
+skinparam LifeLineBorderThickness 1.5
+skinparam ArrowColor #000000
+skinparam ParticipantBorderColor #333333
+skinparam LifeLineBorderColor #000000
+skinparam DefaultFontColor #000000
+
+title Діаграма послідовності — Частина 1 (підготовка)
+
+actor       "Користувач" as U
+participant "app.py"           as A
+participant "geocoder.py"      as G
+participant "graph_builder.py" as B
+participant "Nominatim/OSMnx"  as X
+
+== Введення ==
+U -> A : депо + точки
+A -> G : geocode / reverse
+G -> X : HTTP
+X --> G : (lat, lon)
+G --> A : координати
+
+== Мережа OSM ==
+A -> B : cached_network_at(lat, lon, r)
+B -> X : graph_from_point("all")
+X --> B : G_raw
+B --> A : G (LSCC)
+
+== Прив'язка + часові мітки ==
+A -> B : nearest_node + add_travel_times
+note right of B : 3 копії: drive / bike / walk\nнепрохідні -> PENALTY = 1e9 s
+B --> A : {drive, bike, walk}
+
+@enduml

@@ -1,0 +1,61 @@
+@startuml Sequence_VRP
+!theme plain
+skinparam sequenceMessageAlign center
+
+title Діаграма послідовності -- Оптимізація VRP (декілька транспортних засобів)
+
+actor "Оператор" as User
+participant "app.py" as App
+participant "vrp_solver.py\n(VRPSolver)" as VRP
+participant "route_solver.py\n(RouteSolver)" as RS
+participant "graph_builder.py" as GB
+
+User -> App : Налаштовує парк ТЗ\n(тип, місткість) та\nнатискає "Optimize Fleet"
+
+activate App
+
+App -> VRP : solve_vrp(depot, stops, fleet,\nmode_graphs, G_raw, radius)
+activate VRP
+
+== Фаза 1: Призначення зупинок до типів ТЗ ==
+
+loop для кожної зупинки
+    loop для кожного типу ТЗ (drive, bike, walk)
+        VRP -> RS : build_distance_matrix(\nG_mode, [depot, stop], "travel_time")
+        RS --> VRP : matrix — час досяжності
+    end
+    VRP -> VRP : Обрати тип ТЗ з найбільшим\nзалишком місткості серед\nсумісних режимів
+end
+
+== Фаза 2: Географічна кластеризація (K-Means) ==
+
+loop для кожного типу ТЗ
+    VRP -> VRP : KMeans(n_clusters=k)\n.fit(stop_coords)
+    VRP -> VRP : _rebalance_clusters()\nпереміщення зупинок між\nкластерами за місткістю
+end
+
+== Фаза 3: TSP для кожного ТЗ ==
+
+loop для кожного ТЗ (vehicle)
+    VRP -> RS : build_distance_matrix(\nG_mode, [depot] + cluster_stops)
+    activate RS
+    RS --> VRP : matrix
+    deactivate RS
+
+    VRP -> RS : solve_tsp(nodes, matrix, "auto")
+    activate RS
+    RS --> VRP : (tsp_route, total_time)
+    deactivate RS
+
+    VRP -> RS : reconstruct_full_route(G, tsp_route)
+    RS --> VRP : full_route
+end
+
+VRP --> App : (list[VehicleRoute],\nwarnings)
+deactivate VRP
+
+App --> User : Карта з маршрутами\nкожного ТЗ різними\nкольорами + таблиця
+
+deactivate App
+
+@enduml

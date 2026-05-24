@@ -1,0 +1,70 @@
+@startuml Component_DeliveryIQ
+!theme plain
+skinparam componentStyle uml2
+
+title Діаграма компонентів -- DeliveryIQ
+
+package "DeliveryIQ Application" {
+
+    component [app.py\n<<Streamlit UI>>] as APP
+
+    component [geocoder.py\n<<Геокодування>>] as GEO
+
+    component [graph_builder.py\n<<Побудова графа>>] as GB
+
+    component [route_solver.py\n<<TSP-солвер>>] as RS
+
+    component [vrp_solver.py\n<<VRP-солвер>>] as VRP
+
+    component [visualizer.py\n<<Візуалізація>>] as VIS
+
+    component [package_db.py\n<<Керування пакунками>>] as PKG
+
+    database "packages.db\n<<SQLite>>" as DB
+}
+
+cloud "Зовнішні сервіси" {
+    component [Nominatim API\n(OpenStreetMap)] as NOM
+    component [Overpass API\n(OpenStreetMap)] as OVP
+    component [Mapbox Directions\nMatrix API] as MBX
+}
+
+package "Бібліотеки Python" {
+    component [OSMnx 2.x] as OSMNX
+    component [NetworkX] as NX
+    component [Folium] as FOL
+    component [Streamlit] as ST
+    component [geopy] as GEOPY
+    component [scikit-learn\n(KMeans)] as SK
+}
+
+' Зв'язки модулів
+APP --> GEO : геокодування
+APP --> GB : завантаження\nмережі
+APP --> RS : матриця\nвідстаней + TSP
+APP --> VRP : VRP-оптимізація
+APP --> VIS : побудова\nкарти
+APP --> PKG : CRUD\nпакунків
+
+VRP --> RS : TSP для\nкожного ТЗ
+VRP --> GB : nearest_car_\naccessible_node
+
+RS --> GB : PENALTY\nconstant
+
+PKG --> DB : SQL
+
+' Зв'язки з бібліотеками
+GEO ..> GEOPY
+GB ..> OSMNX
+GB ..> NX
+RS ..> NX
+VRP ..> SK
+VIS ..> FOL
+APP ..> ST
+
+' Зв'язки з зовнішніми сервісами
+GEOPY ..> NOM : HTTP
+OSMNX ..> OVP : HTTP
+RS ..> MBX : HTTP\n(опціонально)
+
+@enduml

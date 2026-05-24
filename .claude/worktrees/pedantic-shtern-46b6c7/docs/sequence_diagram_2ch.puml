@@ -1,0 +1,48 @@
+@startuml DeliveryIQ_Optimization_and_Results
+!theme cerulean-outline
+skinparam sequenceMessageAlign center
+skinparam defaultFontSize 18
+skinparam ParticipantPadding 70
+skinparam BoxPadding 16
+skinparam ArrowFontSize 16
+skinparam minClassWidth 90
+skinparam ArrowThickness 2
+skinparam ParticipantBorderThickness 2
+skinparam ActorBorderThickness 2
+skinparam LifeLineBorderThickness 1.5
+skinparam ArrowColor #000000
+skinparam ParticipantBorderColor #333333
+skinparam LifeLineBorderColor #000000
+skinparam DefaultFontColor #000000
+
+
+title Діаграма послідовності — Частина 2 (оптимізація + вивід)
+
+actor       "Користувач" as U
+participant "app.py"          as A
+participant "route_solver.py" as R
+participant "vrp_solver.py"   as V
+participant "visualizer.py"   as Z
+
+== Оптимізація ==
+alt TSP — один ТЗ
+    A -> R : build_distance_matrix × 3
+    R --> A : matrices
+    A -> R : solve_tsp(method="auto")
+    note right of R : nn (1-2) / 2opt (3-20) / genetic (21+)
+    R --> A : (route, time)
+else VRP — флот
+    A -> V : solve_vrp(stops, depot, fleet, graphs)
+    V -> V : Фаза 1: групування за режимом + місткістю
+    V -> R : build_distance_matrix
+    R --> V : matrix
+    V -> V : Фаза 2: GA (POP=50, GEN=150)\nF = A·T + B·K
+    V --> A : (routes, warnings)
+end
+
+== Результат ==
+A -> Z : build_result_map / build_vrp_result_map
+Z --> A : folium.Map
+A --> U : карта + метрики + таблиця
+
+@enduml

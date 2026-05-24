@@ -1,0 +1,250 @@
+@startuml DeliveryIQ_Architecture
+!theme cerulean-outline
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+skinparam maxMessageSize 200
+skinparam BoxPadding 10
+skinparam ParticipantPadding 20
+
+title DeliveryIQ — Full Execution & Optimization Flow
+
+actor       User                                            as User
+participant "app.py\n(Streamlit UI)"                       as App
+participant "Nominatim\n(Geopy / OSM)"                     as Geo
+participant "graph_builder.py"                             as GB
+participant "OSMnx 2.1 /\nOverpass API"                    as OSM
+participant "route_solver.py"                              as RS
+participant "NetworkX\n(Dijkstra / TSP)"                   as NX
+participant "Folium /\nstreamlit-folium"                   as Folium
+
+' ─────────────────────────────────────────────────────────────────────────────
+== App Startup ==
+' ─────────────────────────────────────────────────────────────────────────────
+
+User  ->  App    : streamlit run app.py
+App   ->  App    : _init()\nst.session_state ← {city, depot=None,\nstops=[], click_mode, opt_results, opt_graphs}
+App   ->  Folium : build_selection_map(city, depot=None, stops=[])
+Folium -> App    : folium.Map (city centre, zoom=13)
+App   ->  User   : Render sidebar + empty map
+
+' ─────────────────────────────────────────────────────────────────────────────
+== Phase 1 — Input Collection ==
+' ─────────────────────────────────────────────────────────────────────────────
+
+group Depot Address
+    User  ->  App  : Type depot address in sidebar
+    App   ->  App  : _lock(address, city)\n→ "address, Dnipro, Ukraine"
+    App   ->  Geo  : geocode(locked_query, timeout=10)
+    Geo   --> App  : geopy.Location (lat, lon, full_address)
+    App   ->  App  : session_state.depot = DeliveryStop(\n    address, lat, lon, source="typed")
+    App   ->  User : Depot marker (green home icon) appears on map
+end
+
+group Add Delivery Stops (repeated for each stop)
+    alt Typed address (sidebar text input)
+        User  ->  App  : Type delivery address
+        App   ->  Geo  : geocode(_lock(address, city))
+        Geo   --> App  : (lat, lon, address)
+        App   ->  App  : Append DeliveryStop(source="typed") to session_state.stops
+    else Map-click (Click-to-Add mode enabled)
+        User  ->  App  : Click location on map
+        App   ->  App  : st_folium returns {last_clicked: {lat, lng}}
+        App   ->  Geo  : reverse_geocode(lat, lon)
+        Geo   --> App  : address string (or "lat, lon" on timeout)
+        App   ->  App  : Append DeliveryStop(source="map_click")
+    end
+    App -> User : Red numbered marker added to map;\nSidebar delivery list updated
+end
+
+' ─────────────────────────────────────────────────────────────────────────────
+== Phase 2 — Route Optimization  [run_optimization()] ==
+' ─────────────────────────────────────────────────────────────────────────────
+
+User  ->  App  : Click "Optimize Route"
+App   ->  App  : run_optimization(depot, stops, city, radius, tsp_method)
+
+' ── Step 1 ───────────────────────────────────────────────────────────────────
+group Step 1 — OSM Network Download  [@st.cache_resource keyed by (city, radius)]
+    App   ->  GB   : cached_network(city, radius)
+    GB    ->  GB   : _configure_osmnx_tags()\nox.settings.useful_tags_way +=\n[bicycle, motor_vehicle, cycleway:*, foot, oneway:bicycle, …]
+    GB    ->  OSM  : ox.graph_from_address(\n    location, dist=radius,\n    network_type="all", simplify=True)
+    OSM   --> GB   : G_raw : MultiDiGraph\n(roads + bike lanes + footpaths)
+    GB    ->  GB   : _largest_strongly_connected_component(G_raw)\n→ ox.truncate.largest_component(G_raw, strongly=True)
+    note right of GB
+        Removes weakly-connected
+        sub-graphs (park alleys,
+        riverside paths) that
+        Dijkstra could enter
+        but never exit
+    end note
+    GB    --> App  : G : LSCC-pruned MultiDiGraph
+    App   ->  App  : graph_summary(G) → {nodes, edges, strongly_connected, …}
+end
+
+' ── Step 2 ───────────────────────────────────────────────────────────────────
+group Step 2 — Address Snapping to OSM Nodes
+    loop for depot, then each delivery stop
+        alt stop.source == "map_click"
+            App  ->  GB  : nearest_node_safe(G, lat, lon, tolerance_m=500)
+            GB   ->  GB  : Validate (lat,lon) within graph bbox ± 500 m\n→ raise ValueError if out of bounds
+        else stop.source == "typed"
+            App  ->  GB  : nearest_node(G, lat, lon)
+        end
+        GB   ->  OSM : ox.nearest_nodes(G, X=lon, Y=lat)
+        OSM  --> GB  : node_id : int  (OSM node ID)
+        GB   --> App : node_id
+        App  ->  App : stop.node_id = node_id
+    end
+
+    App  ->  App : Print NODE SNAP REPORT to stdout + logger\n(diagnostic: reveals addresses snapping to same node)
+    App  ->  App : Detect collisions: node_label_map {node_id → [labels]}\nLog & warn user for each collision
+    App  ->  App : unique_nodes = dict.fromkeys([depot_id] + [s.node_id for s in valid_stops])\n(depot stays at index 0; duplicates silently removed)
+    App  ->  App : labels = {node_id: "Depot" | "Stop #N (address)"}
+end
+
+' ── Step 3 ───────────────────────────────────────────────────────────────────
+group Step 3 — Build Travel-Time Graphs  [@st.cache_resource]
+    App  ->  GB  : cached_mode_graphs(city, radius)
+    GB   ->  GB  : add_travel_times(G)
+
+    loop for mode in [drive, bike, walk]
+        GB  ->  GB : H = G.copy()
+        loop for each edge (u, v, key, data) in H
+            GB  ->  GB : _compute_travel_time(data, mode, speed_ms)
+            note right of GB
+                drive: highway ∈ {footway,steps,pedestrian,path,…}
+                       or motor_vehicle=no/private/destination → PENALTY
+                bike:  steps → PENALTY
+                       one-way reversed + no contraflow tag → PENALTY
+                       cycleway / bicycle=yes → passable
+                walk:  access=no (no foot override) → PENALTY
+                       highway=steps → length / (speed × 0.5)
+                All others → length / speed_ms
+                PENALTY = 1e9 s ≈ 31 years
+            end note
+            GB  ->  GB : H[u][v][key]["travel_time"] = tt
+        end
+    end
+    GB  --> App : {"drive": G_drive, "bike": G_bike, "walk": G_walk}
+end
+
+' ── Step 3b ──────────────────────────────────────────────────────────────────
+group Step 3b — Hybrid Last-Meter Analysis (Drive only)
+    note over App, GB
+        Delivery vehicles cannot always reach the exact building.
+        For each stop: find nearest car-accessible node (N_car),
+        measure gap to pedestrian snap node (N_ped).
+        If gap > 100 m → car cannot serve this stop.
+        If gap ≤ 100 m → add walk_time to matrix cost.
+    end note
+
+    loop for each valid stop
+        App  ->  GB : nearest_car_accessible_node(G_drive, lat, lon)
+        GB   ->  OSM: ox.nearest_nodes(G_drive, X=lon, Y=lat) → nn
+        GB   ->  GB : _node_car_accessible(G_drive, nn)\n→ any incident edge with travel_time < PENALTY?
+        alt nn is car-accessible
+            GB  --> App : n_car = nn
+        else nn not car-accessible
+            GB   ->  GB : Scan all nodes, minimise haversine(lat,lon, ny, nx)\namong car-accessible nodes
+            GB  --> App : n_car = best_node
+        end
+        App  ->  GB : distance_m_between_nodes(G_drive, n_ped, n_car)
+        GB   ->  GB : ox.distance.great_circle(y1,x1, y2,x2)
+        GB  --> App : d_m (metres)
+        alt d_m > 100 m
+            App -> App : car_unreachable_notes.append(stop.address)\n"Address is Xm from nearest road"
+        else d_m ≤ 100 m
+            App -> App : walk_time_s = d_m / walk_speed\ncar_reachable.append((n_car, walk_time_s))
+        end
+    end
+end
+
+' ── Step 4 ───────────────────────────────────────────────────────────────────
+group Step 4 — Distance Matrix + TSP per Mode
+
+    group Drive Mode
+        App  ->  RS : build_drive_matrix_hybrid(\n    G_drive, depot_node, car_stops=[(n_car, walk_s), …])
+        RS   ->  RS : nodes_drive = [depot_node, n_car_1, n_car_2, …]\nwalk_times = [0.0, wt_1, wt_2, …]
+        loop for i, j in range(n) × range(n)  [i ≠ j]
+            RS   ->  NX : nx.shortest_path_length(\n    G_drive, src_id, dst_id, weight="travel_time")
+            NX  --> RS  : drive_seconds
+            RS   ->  RS : matrix[(i,j)] = min(drive_seconds + walk_times[j], PENALTY)
+        end
+        RS  --> App : (matrix_idx, nodes_drive)
+
+        App  ->  RS : solve_tsp(indices=[0..n], matrix_idx, method=tsp_method)
+        RS   ->  RS : Auto-select: nn if n≤2,\n2opt if 3≤n≤20, genetic if n>20
+        note right of RS
+            Nearest-Neighbour: greedy O(n²) seed
+            2-opt: swap edges until no improvement (O(n³)/iter)
+            Genetic: OX crossover, swap mutation,
+                     120 population × 400 generations
+            Christofides: only if complete connected graph
+        end note
+        RS  --> App : (tsp_route_indices, total_s)
+        App  ->  RS : reconstruct_full_route(\n    G_drive, [nodes_drive[i] for i in tsp_route_indices])
+        loop for consecutive (src, dst) in tsp_route
+            RS  ->  NX : nx.shortest_path(G_drive, src, dst, weight="travel_time")
+            NX --> RS  : [node_id, …, node_id]  (all intermediate road nodes)
+        end
+        RS  --> App : full_route : list[int]  (all OSM node IDs along road)
+        App  ->  App : Build LegInfo list\n(from_label, to_label, distance_m, travel_time_s, cumulative_s)
+        App  ->  App : results["drive"] = ModeResult(…)
+    end
+
+    group Bike Mode  [same pattern for Walk — different graph + all stops included]
+        App  ->  RS : build_distance_matrix(\n    G_bike, unique_nodes, weight="travel_time")
+        RS   ->  RS : Deduplicate unique_nodes (dict.fromkeys)\nValidate all nodes exist in G
+        loop for src, dst in unique_nodes × unique_nodes  [src ≠ dst]
+            RS   ->  NX : nx.shortest_path_length(G_bike, src, dst)
+            alt path found and cost > 0
+                NX --> RS : seconds
+            else no path (NetworkXNoPath)
+                RS   ->  RS : matrix[(src,dst)] = PENALTY (1e9)
+            else cost == 0.0 (missing travel_time attr)
+                RS   ->  RS : matrix[(src,dst)] = PENALTY
+            end
+        end
+        RS   ->  RS : Log summary: reachable / penalised / diagonal counts
+        RS  --> App : matrix {(src,dst) → seconds}
+
+        App  ->  RS : audit_reachability(matrix, unique_nodes, labels)
+        RS   ->  RS : Scan matrix for PENALTY entries;\nbuild UnreachableStop {node_id, label,\nunreachable_from, unreachable_to}
+        RS  --> App : [UnreachableStop, …]
+        App  ->  App : Append ⚠️ warnings to warnings_out
+
+        App  ->  RS : solve_tsp(unique_nodes, matrix, method=tsp_method)
+        RS  --> App : (tsp_route, total_s)
+        App  ->  RS : reconstruct_full_route(G_bike, tsp_route)
+        RS  --> App : full_route : list[int]
+        App  ->  App : Build LegInfo list\nresults["bike"] = ModeResult(…)
+    end
+
+    note over App, RS : Walk Mode: identical to Bike Mode using G_walk and unique_nodes
+
+end
+
+' ─────────────────────────────────────────────────────────────────────────────
+== Phase 3 — Result Rendering ==
+' ─────────────────────────────────────────────────────────────────────────────
+
+App  ->  App   : session_state.opt_results  = results\nsession_state.opt_graphs   = mode_graphs\nsession_state.opt_warnings = warnings_out
+App  ->  Folium : build_result_map(mode_graphs, results, depot, stops)
+
+loop for mode in [drive, bike, walk]
+    App  ->  Folium : folium.FeatureGroup(show = mode=="drive")
+    App  ->  Folium : AntPath(coords=[n_coords(G,n) for n in full_route],\n    color=MODE_COLOURS[mode], weight=5,\n    dash_array=[20,35], delay=600)
+end
+App  ->  Folium : Depot marker: folium.Icon(color="green", icon="home")
+loop for stop in drive_res.stop_visit_order  (route order)
+    App  ->  Folium : DivIcon red circle with stop number
+end
+App  ->  Folium : LayerControl(collapsed=False, position="topleft")
+Folium --> App  : folium.Map object
+
+App  ->  User  : st_folium(map) — interactive animated map in browser
+App  ->  User  : Metric cards: drive / bike / walk total time\n(best mode highlighted with green border)
+App  ->  User  : Per-mode stop table (HTML): From → To,\n    Distance, Leg Time, Est. Arrival, Elapsed
+App  ->  User  : Warning banners (⚠️ collisions, unreachable stops,\n    car-inaccessible addresses)
+
+@enduml
