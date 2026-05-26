@@ -1,0 +1,84 @@
+@startuml module_interaction
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam defaultFontName "Times New Roman"
+skinparam defaultFontSize 12
+skinparam ranksep 35
+skinparam nodesep 22
+
+skinparam component {
+    BackgroundColor #F5F7FB
+    BorderColor #1F3A68
+    FontColor #0F172A
+}
+skinparam cloud {
+    BackgroundColor #EAF2FB
+    BorderColor #2563EB
+}
+skinparam database {
+    BackgroundColor #F0FDF4
+    BorderColor #166534
+}
+skinparam folder {
+    BackgroundColor #FEF9C3
+    BorderColor #B45309
+}
+skinparam actor {
+    BackgroundColor #FFF7ED
+    BorderColor #B45309
+}
+
+actor "Користувач" as User
+
+package "Клієнт (браузер)" {
+    [Веб-інтерфейс\n(Leaflet / HTML)] as UI
+}
+
+package "Серверна частина (Python)" {
+    component "App\n(Streamlit-контролер)" as App
+
+    together {
+        component "Geocoder"     as Geo
+        component "PackageDB"    as Pkg
+        component "GraphBuilder" as Graph
+    }
+    together {
+        component "RouteSolver\n(TSP)"          as TSP
+        component "VRPSolver\n(GA CVRPTW)"      as VRP
+        component "Visualizer\n(Folium)"        as Vis
+    }
+}
+
+package "Зовнішні сервіси та сховища" {
+    cloud "Nominatim"            as Nom
+    cloud "OpenStreetMap\n(Overpass)" as OSM
+    cloud "Mapbox\nDirections"   as MB
+    database "SQLite\npackages.db" as DB
+    folder "Кеш графів\n*.graphml" as Cache
+}
+
+User --> UI       : ввід адрес
+UI   --> App      : HTTP / сесія
+App  --> Vis      : дані маршрутів
+Vis  --> UI       : HTML-карта
+
+App  --> Geo      : адреса
+Geo  --> Nom      : /search
+Nom  --> Geo      : (lat, lon)
+
+App  --> Pkg      : CRUD
+Pkg  --> DB       : SQL
+
+App  --> Graph    : (депо, R)
+Graph --> OSM     : запит мережі
+Graph --> Cache   : R/W .graphml
+Graph --> App     : G_drive/bike/walk
+
+App  --> TSP      : одно-ТЗ задача
+App  --> VRP      : багато-ТЗ задача
+VRP  --> TSP      : декодер хромосоми
+TSP  --> MB       : (опц.) трафік-матриця
+TSP  --> App      : маршрут, T, D
+VRP  --> App      : VehicleRoute[]
+
+@enduml
