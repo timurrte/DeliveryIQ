@@ -53,9 +53,9 @@ class Package:
     @property
     def status_label(self) -> str:
         labels = {
-            DeliveryStatus.PENDING:    "⏳ Pending",
-            DeliveryStatus.IN_TRANSIT: "🚚 In Transit",
-            DeliveryStatus.DELIVERED:  "✅ Delivered",
+            DeliveryStatus.PENDING:    "⏳ Очікує",
+            DeliveryStatus.IN_TRANSIT: "🚚 В дорозі",
+            DeliveryStatus.DELIVERED:  "✅ Доставлено",
         }
         return labels.get(self.status, self.status.value)
 

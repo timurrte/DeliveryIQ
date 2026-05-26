@@ -76,7 +76,7 @@ _geolocator = Nominatim(user_agent="deliveryiq_v3", timeout=10)
 #  PAGE CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 st.set_page_config(
-    page_title="DeliveryIQ · Route Optimizer",
+    page_title="DeliveryIQ · Оптимізатор маршрутів",
     page_icon="📦",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -288,7 +288,7 @@ def _init():
         "opt_warnings": [],
         "opt_car_unreachable": [],
         # Multi-vehicle fleet (VRP)
-        "fleet": [Vehicle("Vehicle 1", "drive", 500.0, VEHICLE_COLORS[0])],
+        "fleet": [Vehicle("Транспорт 1", "drive", 500.0, VEHICLE_COLORS[0])],
         "opt_vrp_results": None,
         "opt_vrp_warnings": [],
         # Stop awaiting weight input via the popup dialog (None when no popup)
@@ -308,7 +308,7 @@ _init()
 #  PACKAGE-WEIGHT POPUP (new-stop flow)
 # ══════════════════════════════════════════════════════════════════════════════
 
-@st.dialog("📦 Package Weight")
+@st.dialog("📦 Вага посилки")
 def _ask_package_weight() -> None:
     """
     Modal asking the user for the weight of a newly-added delivery stop.
@@ -320,11 +320,11 @@ def _ask_package_weight() -> None:
         return
 
     short = pending.address[:90] + ("…" if len(pending.address) > 90 else "")
-    st.markdown(f"**Address:**  \n{short}")
+    st.markdown(f"**Адреса:**  \n{short}")
     st.caption(f"📍 {pending.lat:.5f}, {pending.lon:.5f}")
 
     w = st.number_input(
-        "Package weight (kg)",
+        "Вага посилки (кг)",
         min_value=0.01,
         max_value=10_000.0,
         value=float(pending.weight_kg or 1.0),
@@ -335,7 +335,7 @@ def _ask_package_weight() -> None:
 
     col_save, col_cancel = st.columns(2)
     with col_save:
-        if st.button("💾 Save", type="primary", use_container_width=True,
+        if st.button("💾 Зберегти", type="primary", use_container_width=True,
                      key="pending_stop_save"):
             pending.weight_kg = float(w)
             st.session_state.stops.append(pending)
@@ -355,7 +355,7 @@ def _ask_package_weight() -> None:
             st.session_state.opt_vrp_results = None
             st.rerun()
     with col_cancel:
-        if st.button("✕ Cancel", use_container_width=True,
+        if st.button("✕ Скасувати", use_container_width=True,
                      key="pending_stop_cancel"):
             st.session_state.pending_stop = None
             st.rerun()
@@ -494,12 +494,13 @@ def run_optimization(depot, stops, city, radius, tsp_method):
     # Download centred on the depot's geocoded coordinates, not the city-name
     # string.  Nominatim may place a city label far from the actual depot
     # location, which causes the entire graph to miss the delivery area.
-    status("Downloading OSM network (largest strongly-connected component)…")
+    status("Завантаження мережі OSM (найбільша сильно зв`язна компонента)…")
     G_raw = cached_network_at(depot.lat, depot.lon, radius)
     summary = graph_summary(G_raw)
+    connected_txt = "✅ сильно зв`язна" if summary["strongly_connected"] else "⚠️ неповністю зв`язна"
     status(
-        f"Network ready — {summary['nodes']:,} nodes, {summary['edges']:,} edges "
-        f"({'✅ strongly connected' if summary['strongly_connected'] else '⚠️ not fully connected'})",
+        f"Мережу готово — {summary['nodes']:,} вузлів, {summary['edges']:,} ребер "
+        f"({connected_txt})",
         done=True,
     )
 
@@ -508,7 +509,7 @@ def run_optimization(depot, stops, city, radius, tsp_method):
     # to exist in the LSCC-pruned graph.
     # nearest_node()      — for typed/geocoded addresses (always in-bounds)
     # nearest_node_safe() — for map-click coordinates (may be out-of-bounds)
-    status("Snapping addresses to road nodes…")
+    status("Прив'язка адрес до вузлів дорожньої мережі…")
 
     def _snap(obj, label: str) -> None:
         """
@@ -523,15 +524,15 @@ def run_optimization(depot, stops, city, radius, tsp_method):
             except ValueError:
                 obj.node_id = nearest_node(G_raw, obj.lat, obj.lon)
                 warnings_out.append(
-                    f"⚠️ {label} was clicked slightly outside the downloaded "
-                    f"network area — snapped to the nearest road node."
+                    f"⚠️ {label} опинився трохи поза межами завантаженої "
+                    f"мережі — прив'язано до найближчого дорожнього вузла."
                 )
         else:
             obj.node_id = nearest_node(G_raw, obj.lat, obj.lon)
 
-    _snap(depot, "Depot")
+    _snap(depot, "Склад")
     for idx, stop in enumerate(stops, 1):
-        _snap(stop, f"Stop #{idx}")
+        _snap(stop, f"Зупинка #{idx}")
 
     # ── Step 2a: DEBUG — log every snap result to the terminal ───────────────
     # This is the primary diagnostic tool when all addresses map to the same
@@ -565,20 +566,20 @@ def run_optimization(depot, stops, city, radius, tsp_method):
     if len(valid_stops) < len(stops):
         skipped = len(stops) - len(valid_stops)
         warnings_out.append(
-            f"⚠️ {skipped} stop(s) could not be snapped to the road network "
-            f"and will be skipped."
+            f"⚠️ {skipped} зупинку(ок) не вдалося прив'язати до мережі — "
+            f"їх буде пропущено."
         )
 
     if depot.node_id is None:
         raise RuntimeError(
-            "Depot could not be snapped to the road network.  "
-            f"It may be outside the {radius} m download radius — "
-            "try increasing the network radius in Settings."
+            "Не вдалося прив'язати склад до дорожньої мережі. "
+            f"Він може бути за межами радіусу {radius} м — "
+            "спробуйте збільшити радіус у Налаштуваннях."
         )
     if not valid_stops:
         raise RuntimeError(
-            "No delivery stops could be snapped to the road network.  "
-            "All stops are outside the downloaded graph area."
+            "Жодну зупинку не вдалося прив'язати до дорожньої мережі. "
+            "Усі зупинки за межами завантаженої області графа."
         )
 
     # ── Step 2c: Build raw node list and detect duplicate snaps ──────────────
@@ -593,10 +594,10 @@ def run_optimization(depot, stops, city, radius, tsp_method):
 
     # Map: node_id → list of human labels that share it
     node_label_map: dict[int, list[str]] = {}
-    node_label_map[depot.node_id] = ["Depot"]
+    node_label_map[depot.node_id] = ["Склад"]
     for idx, stop in enumerate(valid_stops, 1):
         short = stop.address[:30]
-        lbl = f"Stop #{idx} ({short})"
+        lbl = f"Зупинка #{idx} ({short})"
         node_label_map.setdefault(stop.node_id, []).append(lbl)
 
     # Report collisions
@@ -604,11 +605,10 @@ def run_optimization(depot, stops, city, radius, tsp_method):
         if len(lbls) > 1:
             collision_str = " + ".join(lbls)
             msg = (
-                f"⚠️ Node collision: {collision_str} all snap to OSM node "
-                f"{node_id}.  These addresses are too close together to be "
-                f"distinguished on the road network (or Nominatim returned "
-                f"the same coordinates for both).  They will be treated as a "
-                f"single stop."
+                f"⚠️ Колізія вузлів: {collision_str} прив'язано до того ж "
+                f"OSM-вузла {node_id}. Адреси розташовані надто близько, "
+                f"щоб розрізнятися на дорожній мережі (або Nominatim повернув "
+                f"однакові координати). Вони будуть оброблені як одна зупинка."
             )
             warnings_out.append(msg)
             logging.getLogger(__name__).warning(
@@ -630,22 +630,22 @@ def run_optimization(depot, stops, city, radius, tsp_method):
     n_unique = len(unique_nodes)
     n_raw    = len(raw_nodes)
     status(
-        f"Snapped {n_raw} addresses → {n_unique} unique node(s)"
-        + (f" ({n_raw - n_unique} collision(s) merged)" if n_raw != n_unique else ""),
+        f"Прив'язано {n_raw} адрес → {n_unique} унікальних вузлів"
+        + (f" ({n_raw - n_unique} колізій об'єднано)" if n_raw != n_unique else ""),
         done=True,
     )
 
     if n_unique < 2:
         raise RuntimeError(
-            f"After deduplication only {n_unique} unique road node(s) remain.  "
-            f"All addresses resolve to the same location — please use more "
-            f"specific street addresses, or increase the network radius."
+            f"Після дедуплікації залишилось лише {n_unique} унікальних вузлів. "
+            f"Усі адреси розв'язуються в одну точку — використовуйте конкретніші "
+            f"вуличні адреси або збільшіть радіус мережі."
         )
 
     # ── Step 3: Build mode graphs ─────────────────────────────────────────────
-    status("Building travel-time graphs (drive / bike / walk)…")
+    status("Побудова графів часу подорожі (авто / велосипед / пішки)…")
     mode_graphs = cached_mode_graphs_at(depot.lat, depot.lon, radius)
-    status("Mode graphs ready", done=True)
+    status("Модальні графи готові", done=True)
 
     # ── Step 3b: Hybrid last-meter — dual-node mapping for car ─────────────────
     # N_ped = current node_id (nearest in full graph). N_car = nearest car-accessible.
@@ -660,18 +660,18 @@ def run_optimization(depot, stops, city, radius, tsp_method):
         n_car = nearest_car_accessible_node(G_drive, stop.lat, stop.lon)
         d_m = distance_m_between_nodes(G_drive, n_ped, n_car)
         short = stop.address[:30]
-        label = f"Stop #{idx} ({short})"
+        label = f"Зупинка #{idx} ({short})"
         if d_m > LAST_METER_THRESHOLD_M:
             car_unreachable_notes.append(
-                f"Address [{stop.address[:50]}{'…' if len(stop.address) > 50 else ''}] "
-                f"is {d_m:.0f} m from the nearest road and is inaccessible for vehicle delivery."
+                f"Адреса [{stop.address[:50]}{'…' if len(stop.address) > 50 else ''}] "
+                f"знаходиться за {d_m:.0f} м від найближчої дороги — недоступна для авто."
             )
         else:
             walk_time_s = d_m / walk_speed_ms
             car_reachable.append((n_car, walk_time_s, stop, label))
 
     # Build drive labels (merge when multiple stops share same n_car)
-    labels_drive: dict[int, str] = {depot.node_id: "Depot"}
+    labels_drive: dict[int, str] = {depot.node_id: "Склад"}
     for (n_car, _wt, _stop, lbl) in car_reachable:
         labels_drive[n_car] = labels_drive.get(n_car, "") + (" & " + lbl if n_car in labels_drive else lbl)
     node_to_stops_drive: dict[int, list] = {}
@@ -685,7 +685,7 @@ def run_optimization(depot, stops, city, radius, tsp_method):
         if mode == "drive":
             # Hybrid last-meter: only car-reachable stops; cost = drive to N_car + walk d.
             if len(car_reachable) < 1:
-                status("[drive] No car-reachable stops (all beyond 100 m) — skipping TSP")
+                status("[авто] Немає доступних для авто зупинок (всі понад 100 м) — пропускаємо TSP")
                 results["drive"] = ModeResult(
                     "drive",
                     tsp_route=[depot.node_id, depot.node_id],
@@ -694,7 +694,7 @@ def run_optimization(depot, stops, city, radius, tsp_method):
                     legs=[],
                     stop_visit_order=[],
                 )
-                status("[drive] done — 0 stops", done=True)
+                status("[авто] завершено — 0 зупинок", done=True)
                 continue
             car_stops = [(n_car, wt) for (n_car, wt, _s, _l) in car_reachable]
             n_drive = 1 + len(car_stops)
@@ -705,8 +705,8 @@ def run_optimization(depot, stops, city, radius, tsp_method):
                     + [(s.lat, s.lon) for (_n, _w, s, _l) in car_reachable]
                 )
                 status(
-                    f"[drive] Fetching traffic-aware matrix from Mapbox "
-                    f"({n_drive} stops)…"
+                    f"[авто] Отримання матриці з урахуванням трафіку від Mapbox "
+                    f"({n_drive} зупинок)…"
                 )
                 try:
                     matrix_drive_idx = build_drive_matrix_mapbox(
@@ -717,30 +717,30 @@ def run_optimization(depot, stops, city, radius, tsp_method):
                     ]
                 except Exception as exc:
                     warnings_out.append(
-                        f"⚠️ Mapbox API error ({exc}) — "
-                        f"falling back to static travel times."
+                        f"⚠️ Помилка Mapbox API ({exc}) — "
+                        f"перехід на статичний час подорожі."
                     )
                     matrix_drive_idx, nodes_drive = build_drive_matrix_hybrid(
                         G_drive, depot.node_id, car_stops, weight="travel_time"
                     )
             else:
                 status(
-                    f"[drive] Building static matrix "
-                    f"(depot + {len(car_stops)} stops, last-meter walk)…"
+                    f"[авто] Побудова статичної матриці "
+                    f"(склад + {len(car_stops)} зупинок, останній метр пішки)…"
                 )
                 matrix_drive_idx, nodes_drive = build_drive_matrix_hybrid(
                     G_drive, depot.node_id, car_stops, weight="travel_time"
                 )
             indices_drive = list(range(n_drive))
-            labels_drive_list = ["Depot"] + [lbl for (_n, _w, _s, lbl) in car_reachable]
-            status(f"[drive] Solving TSP ({tsp_method}, {n_drive} nodes)…")
+            labels_drive_list = ["Склад"] + [lbl for (_n, _w, _s, lbl) in car_reachable]
+            status(f"[авто] Розв'язання TSP ({tsp_method}, {n_drive} вузлів)…")
             tsp_route_indices, total_s_d = solve_tsp(
                 indices_drive, matrix_drive_idx, method=tsp_method
             )
             tsp_route_d = [nodes_drive[i] for i in tsp_route_indices]
             if total_s_d >= ROUTE_PENALTY:
                 warnings_out.append(
-                    "⚠️ [Car] Route cost is ≥ PENALTY — at least one stop unreachable."
+                    "⚠️ [Авто] Вартість маршруту ≥ PENALTY — принаймні одна зупинка недосяжна."
                 )
             full_route_d = reconstruct_full_route(G_drive, tsp_route_d, weight="travel_time")
             legs_d = []
@@ -767,26 +767,27 @@ def run_optimization(depot, stops, city, radius, tsp_method):
                 "drive", tsp_route_d, full_route_d, total_s_d, legs_d,
                 stop_visit_order=stop_visit_order_d,
             )
-            status(f"[drive] done — {hms(total_s_d)}", done=True)
+            status(f"[авто] завершено — {hms(total_s_d)}", done=True)
             continue
 
         # Bike and Walk: same node set for all stops (matrix consistency).
-        status(f"[{mode}] Building distance matrix ({n_unique}×{n_unique})…")
+        mode_ua = {"bike": "велосипед", "walk": "пішки"}.get(mode, mode)
+        status(f"[{mode_ua}] Побудова матриці відстаней ({n_unique}×{n_unique})…")
         matrix = build_distance_matrix(G_mode, unique_nodes, weight="travel_time")
         problems = audit_reachability(matrix, unique_nodes, labels)
         for problem in problems:
             msg = (
-                f"⚠️ [{mode}] {problem.label} has connectivity issues — "
+                f"⚠️ [{mode_ua}] {problem.label} має проблеми зі зв'язністю — "
                 + problem.summary().split("] ", 1)[-1]
             )
             if msg not in warnings_out:
                 warnings_out.append(msg)
-        status(f"[{mode}] Solving TSP ({tsp_method}, {n_unique} nodes)…")
+        status(f"[{mode_ua}] Розв'язання TSP ({tsp_method}, {n_unique} вузлів)…")
         tsp_route, total_s = solve_tsp(unique_nodes, matrix, method=tsp_method)
         if total_s >= ROUTE_PENALTY:
             warnings_out.append(
-                f"⚠️ [{mode}] Route cost is ≥ PENALTY — "
-                f"at least one stop is unreachable via this mode."
+                f"⚠️ [{mode_ua}] Вартість маршруту ≥ PENALTY — "
+                f"принаймні одна зупинка недосяжна цим способом."
             )
         full_route = reconstruct_full_route(G_mode, tsp_route, weight="travel_time")
         legs = []
@@ -803,7 +804,7 @@ def run_optimization(depot, stops, city, radius, tsp_method):
                 dist, t, cum,
             ))
         results[mode] = ModeResult(mode, tsp_route, full_route, total_s, legs)
-        status(f"[{mode}] done — {hms(total_s)}", done=True)
+        status(f"[{mode_ua}] завершено — {hms(total_s)}", done=True)
 
     prog.empty()
     return results, mode_graphs, warnings_out, car_unreachable_notes
@@ -830,16 +831,16 @@ def run_vrp_optimization(depot, stops, fleet, radius, tsp_method):
         )
 
     # ── Step 1: OSM network ───────────────────────────────────────────────────
-    status("Downloading OSM network…")
+    status("Завантаження мережі OSM…")
     G_raw = cached_network_at(depot.lat, depot.lon, radius)
     summary = graph_summary(G_raw)
     status(
-        f"Network ready — {summary['nodes']:,} nodes, {summary['edges']:,} edges",
+        f"Мережу готово — {summary['nodes']:,} вузлів, {summary['edges']:,} ребер",
         done=True,
     )
 
     # ── Step 2: Snap addresses to road nodes ─────────────────────────────────
-    status("Snapping addresses to road nodes…")
+    status("Прив'язка адрес до вузлів дорожньої мережі…")
 
     def _snap(obj, label: str) -> None:
         if obj.source == "map_click":
@@ -848,47 +849,47 @@ def run_vrp_optimization(depot, stops, fleet, radius, tsp_method):
             except ValueError:
                 obj.node_id = nearest_node(G_raw, obj.lat, obj.lon)
                 warnings_out.append(
-                    f"⚠️ {label} was clicked slightly outside the network — "
-                    f"snapped to the nearest road node."
+                    f"⚠️ {label} опинився трохи поза межами мережі — "
+                    f"прив'язано до найближчого дорожнього вузла."
                 )
         else:
             obj.node_id = nearest_node(G_raw, obj.lat, obj.lon)
 
-    _snap(depot, "Depot")
+    _snap(depot, "Склад")
     for idx, stop in enumerate(stops, 1):
-        _snap(stop, f"Stop #{idx}")
+        _snap(stop, f"Зупинка #{idx}")
 
     if depot.node_id is None:
-        raise RuntimeError("Depot could not be snapped to the road network.")
+        raise RuntimeError("Не вдалося прив'язати склад до дорожньої мережі.")
 
     valid_stops = [s for s in stops if s.node_id is not None]
     if len(valid_stops) < len(stops):
         warnings_out.append(
-            f"⚠️ {len(stops) - len(valid_stops)} stop(s) could not be snapped "
-            f"and will be skipped."
+            f"⚠️ {len(stops) - len(valid_stops)} зупинку(ок) не вдалося "
+            f"прив'язати — їх буде пропущено."
         )
     if not valid_stops:
-        raise RuntimeError("No delivery stops could be snapped to the road network.")
+        raise RuntimeError("Жодну зупинку не вдалося прив'язати до дорожньої мережі.")
 
-    status(f"Snapped {len(valid_stops)} stop(s)", done=True)
+    status(f"Прив'язано {len(valid_stops)} зупинок", done=True)
 
     # ── Step 3: Modal graphs ──────────────────────────────────────────────────
-    status("Building modal travel-time graphs…")
+    status("Побудова модальних графів часу подорожі…")
     mode_graphs = cached_mode_graphs_at(depot.lat, depot.lon, radius)
-    status("Modal graphs ready", done=True)
+    status("Модальні графи готові", done=True)
 
     # ── Step 4: Total fleet weight capacity check ────────────────────────────
     total_cap_kg = sum(v.capacity_kg for v in fleet)
     total_weight_kg = sum(s.weight_kg for s in valid_stops)
     if total_cap_kg < total_weight_kg:
         raise ValueError(
-            f"Total fleet capacity ({total_cap_kg:.1f} kg) is less than total "
-            f"package weight ({total_weight_kg:.1f} kg). "
-            f"Increase vehicle capacities or add more vehicles."
+            f"Загальна вантажомісткість флоту ({total_cap_kg:.1f} кг) менша за "
+            f"загальну вагу посилок ({total_weight_kg:.1f} кг). "
+            f"Збільште вантажомісткість транспорту або додайте більше одиниць."
         )
 
     # ── Step 5: Solve VRP ─────────────────────────────────────────────────────
-    status(f"Running VRP for {len(fleet)} vehicle(s), {len(valid_stops)} stop(s)…")
+    status(f"Запуск VRP для {len(fleet)} ТЗ, {len(valid_stops)} зупинок…")
     vrp_routes, vrp_warnings = solve_vrp(
         valid_stops, depot, fleet, mode_graphs, tsp_method
     )
@@ -897,9 +898,9 @@ def run_vrp_optimization(depot, stops, fleet, radius, tsp_method):
     # ── Step 6: Build leg info for each vehicle route ────────────────────────
     for vr in vrp_routes:
         G = mode_graphs[vr.vehicle.mode]
-        label_map = {depot.node_id: "Depot"}
+        label_map = {depot.node_id: "Склад"}
         for idx, s in enumerate(vr.stops, 1):
-            label_map[s.node_id] = f"Stop #{idx}"
+            label_map[s.node_id] = f"Зупинка #{idx}"
         legs = []
         cum = 0.0
         for i in range(len(vr.tsp_route) - 1):
@@ -912,14 +913,14 @@ def run_vrp_optimization(depot, stops, fleet, radius, tsp_method):
             dist = leg_dist(G, path)
             cum += t
             legs.append(LegInfo(
-                label_map.get(src, f"Node {src}"),
-                label_map.get(dst, f"Node {dst}"),
+                label_map.get(src, f"Вузол {src}"),
+                label_map.get(dst, f"Вузол {dst}"),
                 dist, t, cum,
             ))
         vr.legs = legs
 
     n_active = len(vrp_routes)
-    status(f"VRP solved — {n_active} active vehicle(s)", done=True)
+    status(f"VRP розв'язано — {n_active} активних ТЗ", done=True)
     prog.empty()
     return vrp_routes, mode_graphs, warnings_out
 
@@ -929,9 +930,9 @@ def run_vrp_optimization(depot, stops, fleet, radius, tsp_method):
 # ══════════════════════════════════════════════════════════════════════════════
 
 MODE_META = {
-    "drive": {"icon": "🚗", "colour": "#e74c3c", "label": "Car"},
-    "bike":  {"icon": "🚲", "colour": "#2ecc71", "label": "Bicycle"},
-    "walk":  {"icon": "🚶", "colour": "#3b82f6", "label": "Walking"},
+    "drive": {"icon": "🚗", "colour": "#e74c3c", "label": "Авто"},
+    "bike":  {"icon": "🚲", "colour": "#2ecc71", "label": "Велосипед"},
+    "walk":  {"icon": "🚶", "colour": "#3b82f6", "label": "Пішки"},
 }
 
 
@@ -959,8 +960,8 @@ def build_selection_map(city, depot, stops) -> folium.Map:
     if depot:
         folium.Marker(
             location=[depot.lat, depot.lon],
-            tooltip="<b>📦 Depot</b>",
-            popup=folium.Popup(f"<b>Depot</b><br><small>{depot.address}</small>", max_width=240),
+            tooltip="<b>📦 Склад</b>",
+            popup=folium.Popup(f"<b>Склад</b><br><small>{depot.address}</small>", max_width=240),
             icon=folium.Icon(color="green", icon="home", prefix="fa"),
         ).add_to(fmap)
 
@@ -968,8 +969,8 @@ def build_selection_map(city, depot, stops) -> folium.Map:
         src_icon = "🖱" if stop.source == "map_click" else "✏️"
         folium.Marker(
             location=[stop.lat, stop.lon],
-            tooltip=f"<b>Stop #{i}</b> {src_icon}",
-            popup=folium.Popup(f"<b>Stop #{i}</b><br><small>{stop.address}</small>", max_width=260),
+            tooltip=f"<b>Зупинка #{i}</b> {src_icon}",
+            popup=folium.Popup(f"<b>Зупинка #{i}</b><br><small>{stop.address}</small>", max_width=260),
             icon=_stop_div_icon(i),
         ).add_to(fmap)
 
@@ -996,20 +997,20 @@ def build_result_map(mode_graphs, results, depot, stops) -> folium.Map:
     # Depot — GREEN home icon
     folium.Marker(
         location=[depot.lat, depot.lon],
-        tooltip="<b>📦 Depot (Start &amp; End)</b>",
-        popup=folium.Popup(f"<b>Depot</b><br><small>{depot.address}</small>", max_width=260),
+        tooltip="<b>📦 Склад (старт &amp; фініш)</b>",
+        popup=folium.Popup(f"<b>Склад</b><br><small>{depot.address}</small>", max_width=260),
         icon=folium.Icon(color="green", icon="home", prefix="fa"),
     ).add_to(fmap)
 
     # Stops in route order — RED numbered (drive uses stop_visit_order when set)
     drive_res = results["drive"]
-    stop_layer = folium.FeatureGroup(name="📍 Delivery stops", show=True)
+    stop_layer = folium.FeatureGroup(name="📍 Точки доставки", show=True)
     if getattr(drive_res, "stop_visit_order", None):
         for idx, s in enumerate(drive_res.stop_visit_order, 1):
             folium.Marker(
                 location=[s.lat, s.lon],
-                tooltip=f"<b>Stop #{idx}</b>",
-                popup=folium.Popup(f"<b>Stop #{idx}</b><br>{s.address}", max_width=270),
+                tooltip=f"<b>Зупинка #{idx}</b>",
+                popup=folium.Popup(f"<b>Зупинка #{idx}</b><br>{s.address}", max_width=270),
                 icon=_stop_div_icon(idx),
             ).add_to(stop_layer)
     else:
@@ -1024,11 +1025,11 @@ def build_result_map(mode_graphs, results, depot, stops) -> folium.Map:
             s = node_to_stop.get(node)
             lat = s.lat if s else n_coords(G_ref, node)[0]
             lon = s.lon if s else n_coords(G_ref, node)[1]
-            addr = s.address if s else f"Node {node}"
+            addr = s.address if s else f"Вузол {node}"
             folium.Marker(
                 location=[lat, lon],
-                tooltip=f"<b>Stop #{idx}</b>",
-                popup=folium.Popup(f"<b>Stop #{idx}</b><br>{addr}", max_width=270),
+                tooltip=f"<b>Зупинка #{idx}</b>",
+                popup=folium.Popup(f"<b>Зупинка #{idx}</b><br>{addr}", max_width=270),
                 icon=_stop_div_icon(idx),
             ).add_to(stop_layer)
     stop_layer.add_to(fmap)
@@ -1042,6 +1043,7 @@ def build_vrp_result_map(mode_graphs, vrp_routes, depot) -> folium.Map:
     fmap = folium.Map(location=[depot.lat, depot.lon], zoom_start=14, tiles="CartoDB positron")
 
     mode_icons = {"drive": "🚗", "bike": "🚲", "walk": "🚶"}
+    mode_ua_map = {"drive": "авто", "bike": "велосипед", "walk": "пішки"}
 
     for vr in vrp_routes:
         # Use the vehicle's own modal graph for coordinate lookup — bike/walk routes
@@ -1049,6 +1051,7 @@ def build_vrp_result_map(mode_graphs, vrp_routes, depot) -> folium.Map:
         G_veh = mode_graphs[vr.vehicle.mode]
         coords = [n_coords(G_veh, n) for n in vr.full_route]
         icon = mode_icons.get(vr.vehicle.mode, "🚛")
+        mode_ua = mode_ua_map.get(vr.vehicle.mode, vr.vehicle.mode)
         total_time_label = hms(vr.total_time_s)
         layer = folium.FeatureGroup(
             name=f"{icon} {vr.vehicle.name} — {total_time_label}",
@@ -1062,12 +1065,12 @@ def build_vrp_result_map(mode_graphs, vrp_routes, depot) -> folium.Map:
             delay=600,
             dash_array=[20, 35],
             pulse_color="#fff",
-            tooltip=f"{vr.vehicle.name} · {vr.vehicle.mode} · {total_time_label}",
+            tooltip=f"{vr.vehicle.name} · {mode_ua} · {total_time_label}",
         ).add_to(layer)
 
         # Stop markers in this vehicle's colour
         stop_layer = folium.FeatureGroup(
-            name=f"📍 {vr.vehicle.name} stops",
+            name=f"📍 {vr.vehicle.name} — зупинки",
             show=True,
         )
         for idx, s in enumerate(vr.stops, 1):
@@ -1080,9 +1083,9 @@ def build_vrp_result_map(mode_graphs, vrp_routes, depot) -> folium.Map:
             )
             folium.Marker(
                 location=[s.lat, s.lon],
-                tooltip=f"<b>[{vr.vehicle.name}] Stop #{idx}</b>",
+                tooltip=f"<b>[{vr.vehicle.name}] Зупинка #{idx}</b>",
                 popup=folium.Popup(
-                    f"<b>[{vr.vehicle.name}] Stop #{idx}</b><br>{s.address}",
+                    f"<b>[{vr.vehicle.name}] Зупинка #{idx}</b><br>{s.address}",
                     max_width=270,
                 ),
                 icon=folium.DivIcon(
@@ -1097,8 +1100,8 @@ def build_vrp_result_map(mode_graphs, vrp_routes, depot) -> folium.Map:
     # Depot marker — always visible
     folium.Marker(
         location=[depot.lat, depot.lon],
-        tooltip="<b>📦 Depot (Start &amp; End)</b>",
-        popup=folium.Popup(f"<b>Depot</b><br><small>{depot.address}</small>", max_width=260),
+        tooltip="<b>📦 Склад (старт &amp; фініш)</b>",
+        popup=folium.Popup(f"<b>Склад</b><br><small>{depot.address}</small>", max_width=260),
         icon=folium.Icon(color="green", icon="home", prefix="fa"),
     ).add_to(fmap)
 
@@ -1111,9 +1114,9 @@ def build_vrp_result_map(mode_graphs, vrp_routes, depot) -> folium.Map:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def hms(s: float) -> str:
-    if not math.isfinite(s): return "N/A"
+    if not math.isfinite(s): return "Н/Д"
     h, r = divmod(int(s), 3600); m, sc = divmod(r, 60)
-    return f"{h}h {m:02d}m {sc:02d}s" if h else f"{m}m {sc:02d}s" if m else f"{sc}s"
+    return f"{h}г {m:02d}хв {sc:02d}с" if h else f"{m}хв {sc:02d}с" if m else f"{sc}с"
 
 
 def render_stop_table(result: ModeResult) -> str:
@@ -1121,25 +1124,25 @@ def render_stop_table(result: ModeResult) -> str:
     dep_time = datetime.datetime.now().replace(second=0, microsecond=0)
     for leg in result.legs:
         arr = dep_time + datetime.timedelta(seconds=leg.cumulative_time_s)
-        ret = leg.to_label == "Depot"
+        ret = leg.to_label == "Склад"
 
-        if leg.from_label == "Depot":
-            fb = '<span class="snum snum-depot">D</span>'
-            ft = '<span class="tag tag-depot">Depot</span>'
+        if leg.from_label == "Склад":
+            fb = '<span class="snum snum-depot">С</span>'
+            ft = '<span class="tag tag-depot">Склад</span>'
         else:
-            n = leg.from_label.replace("Stop #","")
+            n = leg.from_label.replace("Зупинка #","")
             fb = f'<span class="snum snum-stop">{n}</span>'
             ft = f'<span class="tag tag-stop">{leg.from_label}</span>'
 
         if ret:
-            tb = '<span class="snum snum-depot">D</span>'
-            tt = '<span class="tag tag-return">Return</span>'
+            tb = '<span class="snum snum-depot">С</span>'
+            tt = '<span class="tag tag-return">Повернення</span>'
         else:
-            n = leg.to_label.replace("Stop #","")
+            n = leg.to_label.replace("Зупинка #","")
             tb = f'<span class="snum snum-stop">{n}</span>'
             tt = f'<span class="tag tag-stop">{leg.to_label}</span>'
 
-        d = f"{leg.distance_m/1000:.2f} km" if leg.distance_m >= 100 else f"{leg.distance_m:.0f} m"
+        d = f"{leg.distance_m/1000:.2f} км" if leg.distance_m >= 100 else f"{leg.distance_m:.0f} м"
         rows += (f"<tr>"
                  f"<td>{fb}&nbsp;{ft}</td><td>{tb}&nbsp;{tt}</td>"
                  f'<td class="mono">{d}</td>'
@@ -1149,8 +1152,8 @@ def render_stop_table(result: ModeResult) -> str:
                  f"</tr>")
 
     return (f'<table class="stop-table"><thead><tr>'
-            f'<th>From</th><th>To</th><th>Distance</th>'
-            f'<th>Leg Time</th><th>Est. Arrival</th><th>Elapsed</th>'
+            f'<th>Звідки</th><th>Куди</th><th>Відстань</th>'
+            f'<th>Час відрізку</th><th>Орієнт. прибуття</th><th>Витрачено</th>'
             f'</tr></thead><tbody>{rows}</tbody></table>')
 
 
@@ -1170,24 +1173,31 @@ with st.sidebar:
     st.markdown("""
     <div style="padding:18px 0 6px">
       <div style="font-size:1.3rem;font-weight:800;color:#f0f9ff">📦 DeliveryIQ</div>
-      <div style="font-size:.68rem;color:#334155;letter-spacing:.5px">Route Optimizer · v3.0</div>
+      <div style="font-size:.68rem;color:#334155;letter-spacing:.5px">Оптимізатор маршрутів · v3.0</div>
     </div>
     <hr style="border-color:#161d2e;margin:6px 0 14px">
     """, unsafe_allow_html=True)
 
     # ── City lock ─────────────────────────────────────────────────────────────
-    st.markdown('<div style="font-size:.61rem;font-weight:700;letter-spacing:1.2px;color:#475569;text-transform:uppercase;margin-bottom:5px">🌆 City Lock</div>', unsafe_allow_html=True)
-    city_opts = list(CITY_CENTRES.keys()) + ["Custom…"]
+    st.markdown('<div style="font-size:.61rem;font-weight:700;letter-spacing:1.2px;color:#475569;text-transform:uppercase;margin-bottom:5px">🌆 Місто</div>', unsafe_allow_html=True)
+    city_opts = list(CITY_CENTRES.keys()) + ["Інше…"]
+    _city_ua = {
+        "Dnipro, Ukraine": "Дніпро, Україна",
+        "Kyiv, Ukraine":   "Київ, Україна",
+        "Lviv, Ukraine":   "Львів, Україна",
+        "Odesa, Ukraine":  "Одеса, Україна",
+    }
     sel_city = st.selectbox("city_sel", city_opts,
                             index=city_opts.index(st.session_state.city)
                             if st.session_state.city in city_opts else 0,
+                            format_func=lambda v: _city_ua.get(v, v),
                             label_visibility="collapsed")
-    if sel_city == "Custom…":
-        custom = st.text_input("custom_city", placeholder="e.g. Barcelona, Spain",
+    if sel_city == "Інше…":
+        custom = st.text_input("custom_city", placeholder="напр. Барселона, Іспанія",
                                label_visibility="collapsed")
         if custom.strip():
             sel_city = custom.strip()
-    if sel_city != "Custom…" and sel_city != st.session_state.city:
+    if sel_city != "Інше…" and sel_city != st.session_state.city:
         st.session_state.update(city=sel_city, depot=None, stops=[],
                                 opt_results=None, opt_graphs=None, last_click=None,
                                 opt_vrp_results=None, opt_vrp_warnings=[])
@@ -1196,7 +1206,7 @@ with st.sidebar:
     city = st.session_state.city
 
     # ── Network settings ──────────────────────────────────────────────────────
-    st.markdown('<div style="font-size:.61rem;font-weight:700;letter-spacing:1.2px;color:#475569;text-transform:uppercase;margin:12px 0 5px">⚙️ Settings</div>', unsafe_allow_html=True)
+    st.markdown('<div style="font-size:.61rem;font-weight:700;letter-spacing:1.2px;color:#475569;text-transform:uppercase;margin:12px 0 5px">⚙️ Налаштування</div>', unsafe_allow_html=True)
 
     def _sync_radius_from_slider() -> None:
         st.session_state.radius_input = st.session_state.radius_slider
@@ -1205,7 +1215,7 @@ with st.sidebar:
         st.session_state.radius_slider = int(st.session_state.radius_input)
 
     st.markdown(
-        '<div style="font-size:.78rem;color:#cbd5e1;margin-bottom:2px">Radius (m)</div>',
+        '<div style="font-size:.78rem;color:#cbd5e1;margin-bottom:2px">Радіус (м)</div>',
         unsafe_allow_html=True,
     )
     rc_slider, rc_input = st.columns([3, 2])
@@ -1223,22 +1233,30 @@ with st.sidebar:
         )
     radius = int(st.session_state.radius_slider)
 
-    tsp_method = st.selectbox("TSP solver",
-                              ["auto", "christofides", "2opt", "genetic", "nn"])
+    _tsp_ua = {
+        "auto":         "Авто",
+        "christofides": "Крістофідес",
+        "2opt":         "2-opt",
+        "genetic":      "Генетичний",
+        "nn":           "Найближчий сусід",
+    }
+    tsp_method = st.selectbox("Алгоритм TSP",
+                              ["auto", "christofides", "2opt", "genetic", "nn"],
+                              format_func=lambda v: _tsp_ua.get(v, v))
 
     st.markdown('<hr style="border-color:#161d2e;margin:14px 0">', unsafe_allow_html=True)
 
     # ── Depot ─────────────────────────────────────────────────────────────────
-    st.markdown('<div style="font-size:.61rem;font-weight:700;letter-spacing:1.2px;color:#475569;text-transform:uppercase;margin-bottom:5px">🏢 Depot Address</div>', unsafe_allow_html=True)
+    st.markdown('<div style="font-size:.61rem;font-weight:700;letter-spacing:1.2px;color:#475569;text-transform:uppercase;margin-bottom:5px">🏢 Адреса складу</div>', unsafe_allow_html=True)
     dc1, dc2 = st.columns([4, 1])
     with dc1:
         depot_txt = st.text_input("dep_txt",
-                                  placeholder=f"Street in {city.split(',')[0]}…",
+                                  placeholder=f"Вулиця в {city.split(',')[0]}…",
                                   label_visibility="collapsed")
     with dc2:
         dep_go = st.button("➜", key="dep_go")
     if dep_go and depot_txt.strip():
-        with st.spinner("Geocoding…"):
+        with st.spinner("Геокодування…"):
             r = forward_geocode(depot_txt.strip(), city)
         if r:
             st.session_state.depot = r
@@ -1246,19 +1264,19 @@ with st.sidebar:
             st.session_state.opt_vrp_results = None
             st.rerun()
         else:
-            st.error(f"Not found in {city}")
+            st.error(f"Не знайдено у {city}")
 
     if st.session_state.depot:
         dep = st.session_state.depot
         st.markdown(f"""
         <div class="delivery-item depot-item">
-          <div class="di-num depot">D</div>
+          <div class="di-num depot">С</div>
           <div>
             <div class="di-addr">{dep.address[:65]}{"…" if len(dep.address)>65 else ""}</div>
             <div class="di-coords">{dep.lat:.5f}, {dep.lon:.5f}</div>
           </div>
         </div>""", unsafe_allow_html=True)
-        if st.button("✕ Clear depot", key="clr_dep"):
+        if st.button("✕ Видалити склад", key="clr_dep"):
             st.session_state.depot = None
             st.session_state.opt_results = None
             st.session_state.opt_vrp_results = None
@@ -1267,22 +1285,22 @@ with st.sidebar:
     st.markdown('<hr style="border-color:#161d2e;margin:12px 0">', unsafe_allow_html=True)
 
     # ── Add stop by typing ────────────────────────────────────────────────────
-    st.markdown('<div style="font-size:.61rem;font-weight:700;letter-spacing:1.2px;color:#475569;text-transform:uppercase;margin-bottom:5px">📍 Add Delivery Stop</div>', unsafe_allow_html=True)
+    st.markdown('<div style="font-size:.61rem;font-weight:700;letter-spacing:1.2px;color:#475569;text-transform:uppercase;margin-bottom:5px">📍 Додати точку доставки</div>', unsafe_allow_html=True)
     sc1, sc2 = st.columns([4, 1])
     with sc1:
         stop_txt = st.text_input("stop_txt",
-                                 placeholder=f"Address in {city.split(',')[0]}…",
+                                 placeholder=f"Адреса у {city.split(',')[0]}…",
                                  label_visibility="collapsed")
     with sc2:
         stop_go = st.button("➜", key="stop_go")
     if stop_go and stop_txt.strip():
-        with st.spinner("Geocoding…"):
+        with st.spinner("Геокодування…"):
             r = forward_geocode(stop_txt.strip(), city)
         if r:
             st.session_state.pending_stop = r
             st.rerun()
         else:
-            st.error(f"Not found in {city}")
+            st.error(f"Не знайдено у {city}")
 
     st.markdown('<hr style="border-color:#161d2e;margin:12px 0">', unsafe_allow_html=True)
 
@@ -1291,11 +1309,11 @@ with st.sidebar:
     st.markdown(
         f'<div style="font-size:.61rem;font-weight:700;letter-spacing:1.2px;'
         f'color:#475569;text-transform:uppercase;margin-bottom:7px">'
-        f'📋 Selected Deliveries ({n_stops})</div>',
+        f'📋 Обрані точки ({n_stops})</div>',
         unsafe_allow_html=True)
 
     if n_stops == 0:
-        st.markdown('<div style="font-size:.74rem;color:#374151;padding:4px 0">No stops yet.</div>',
+        st.markdown('<div style="font-size:.74rem;color:#374151;padding:4px 0">Поки що немає зупинок.</div>',
                     unsafe_allow_html=True)
     else:
         for i, stop in enumerate(st.session_state.stops):
@@ -1306,10 +1324,10 @@ with st.sidebar:
               <div class="di-num">{i+1}</div>
               <div style="flex:1">
                 <div class="di-addr">{src} {short}</div>
-                <div class="di-coords">{stop.lat:.5f}, {stop.lon:.5f} · ⚖️ {stop.weight_kg:.2f} kg</div>
+                <div class="di-coords">{stop.lat:.5f}, {stop.lon:.5f} · ⚖️ {stop.weight_kg:.2f} кг</div>
               </div>
             </div>""", unsafe_allow_html=True)
-            if st.button("✕", key=f"rm_{i}", help=f"Remove stop #{i+1}"):
+            if st.button("✕", key=f"rm_{i}", help=f"Видалити зупинку #{i+1}"):
                 st.session_state.stops.pop(i)
                 st.session_state.opt_results = None
                 st.session_state.opt_vrp_results = None
@@ -1320,17 +1338,17 @@ with st.sidebar:
     # ── Run button ────────────────────────────────────────────────────────────
     can_run = st.session_state.depot is not None and len(st.session_state.stops) >= 1
     run_btn = st.button(
-        "🚀  Optimize Routes",
+        "🚀  Оптимізувати маршрути",
         disabled=not can_run,
         use_container_width=True,
-        help="Add a depot + at least 1 stop first" if not can_run else "Run route optimization",
+        help="Спочатку додайте склад + хоча б 1 зупинку" if not can_run else "Запустити оптимізацію маршруту",
     )
 
     st.markdown("""
     <div style="font-size:.63rem;color:#1e293b;line-height:1.8;margin-top:8px">
-      <b style="color:#334155">Algorithms</b><br>Dijkstra · Christofides · 2-opt · Genetic<br>
-      <b style="color:#334155">Geocoder</b><br>Nominatim (city-locked)<br>
-      <b style="color:#334155">Data</b><br>OpenStreetMap / OSMnx
+      <b style="color:#334155">Алгоритми</b><br>Dijkstra · Christofides · 2-opt · Генетичний<br>
+      <b style="color:#334155">Геокодер</b><br>Nominatim (прив'язано до міста)<br>
+      <b style="color:#334155">Дані</b><br>OpenStreetMap / OSMnx
     </div>""", unsafe_allow_html=True)
 
 
@@ -1347,13 +1365,13 @@ st.markdown(f"""
 <div class="page-header">
   <div style="font-size:2.5rem">📦</div>
   <div>
-    <h1>DeliveryIQ · Route Optimizer</h1>
-    <p>City-locked routing · Click-to-Add markers · Real OSM street data · 3 travel modes</p>
-    <div class="city-pill">📍 Locked to: {city}</div>
+    <h1>DeliveryIQ · Оптимізатор маршрутів</h1>
+    <p>Маршрутизація з прив'язкою до міста · Маркери по кліку · Реальні OSM-дані · 3 режими пересування</p>
+    <div class="city-pill">📍 Прив'язано до: {city}</div>
   </div>
 </div>""", unsafe_allow_html=True)
 
-map_tab, fleet_tab, pkg_tab = st.tabs(["🗺️ Map & Optimize", "🚛 Fleet Settings", "📦 Packages"])
+map_tab, fleet_tab, pkg_tab = st.tabs(["🗺️ Карта та оптимізація", "🚛 Налаштування флоту", "📦 Посилки"])
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  MAP & OPTIMIZE TAB
@@ -1367,28 +1385,28 @@ with map_tab:
         and st.session_state.opt_vrp_results is None
     )
     if no_results:
-        st.markdown('<div class="sec-head">🗺️ Coordinator Map — Build Your Delivery List</div>',
+        st.markdown('<div class="sec-head">🗺️ Карта координатора — Сформуйте список доставки</div>',
                     unsafe_allow_html=True)
 
         # ── Map-click toggle (visual indicator) ──────────────────────────────
         tc_l, tc_r = st.columns([1.2, 3])
         with tc_l:
             click_on = st.toggle(
-                "🖱 Map Click Mode",
+                "🖱 Режим кліку по карті",
                 value=st.session_state.click_mode,
                 key="click_toggle_main",
-                help="When ON, clicking the map adds a depot or a delivery stop.",
+                help="Коли УВІМКНЕНО, клік по карті додає склад або точку доставки.",
             )
             if click_on != st.session_state.click_mode:
                 st.session_state.click_mode = click_on
                 st.rerun()
         with tc_r:
             if st.session_state.click_mode:
-                target_hint = "depot location" if depot is None else "delivery stop"
+                target_hint = "розташування складу" if depot is None else "точку доставки"
                 st.markdown(f"""
                 <div class="click-active" style="text-align:left;padding:10px 18px;margin:4px 0">
-                  🟢 <b>ON</b> — next click on the map adds a <b>{target_hint}</b>.
-                  Coordinates are reverse-geocoded automatically.
+                  🟢 <b>УВІМКНЕНО</b> — наступний клік по карті додасть <b>{target_hint}</b>.
+                  Координати автоматично перетворюються на адресу.
                 </div>""", unsafe_allow_html=True)
             else:
                 st.markdown("""
@@ -1396,14 +1414,14 @@ with map_tab:
                             border-left:4px solid #94a3b8;border-radius:8px;
                             padding:10px 18px;color:#475569;font-size:.83rem;
                             margin:4px 0;text-align:left">
-                  ⚪ <b>OFF</b> — enable the toggle to click-place markers on the map.
+                  ⚪ <b>ВИМКНЕНО</b> — увімкніть перемикач, щоб клацанням розміщувати маркери на карті.
                 </div>""", unsafe_allow_html=True)
 
         if not st.session_state.click_mode and depot is None:
             st.markdown("""
             <div class="info-box">
-              👈 Set a <b>depot</b> in the sidebar or enable <b>Map Click Mode</b>
-              above to place it on the map, then add delivery stops to begin.
+              👈 Задайте <b>склад</b> у бічній панелі або увімкніть <b>Режим кліку по карті</b>
+              вище, щоб розмістити його на карті, потім додайте точки доставки.
             </div>""", unsafe_allow_html=True)
 
         sel_map = build_selection_map(city, depot, stops)
@@ -1424,7 +1442,7 @@ with map_tab:
             ck = (round(raw["lat"], 5), round(raw["lng"], 5))
             if ck != st.session_state.last_click:
                 st.session_state.last_click = ck
-                with st.spinner("Reverse geocoding…"):
+                with st.spinner("Зворотнє геокодування…"):
                     new = reverse_geocode(raw["lat"], raw["lng"])
                 if new:
                     if st.session_state.depot is None:
@@ -1439,7 +1457,7 @@ with map_tab:
 
     # ── Run optimisation ──────────────────────────────────────────────────────
     if run_btn and can_run:
-        st.markdown('<div class="sec-head">⏳ Running Optimization</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sec-head">⏳ Виконання оптимізації</div>', unsafe_allow_html=True)
         if len(st.session_state.fleet) >= 2:
             # VRP mode — multi-vehicle fleet
             try:
@@ -1452,9 +1470,9 @@ with map_tab:
                 st.session_state.opt_results     = None
                 st.rerun()
             except ValueError as e:
-                st.error(f"Fleet configuration error: {e}")
+                st.error(f"Помилка конфігурації флоту: {e}")
             except Exception as e:
-                st.error(f"VRP optimization failed: {e}")
+                st.error(f"VRP-оптимізація не вдалася: {e}")
                 st.exception(e)
         else:
             # Single-vehicle mode — existing 3-mode comparison
@@ -1469,7 +1487,7 @@ with map_tab:
                 st.session_state.opt_vrp_results     = None
                 st.rerun()
             except Exception as e:
-                st.error(f"Optimization failed: {e}")
+                st.error(f"Оптимізація не вдалася: {e}")
                 st.exception(e)
 
     # ── Single-vehicle results dashboard ─────────────────────────────────────
@@ -1481,55 +1499,55 @@ with map_tab:
         best_mode   = min(results, key=lambda m: results[m].total_time_s)
 
         if warnings:
-            st.markdown('<div class="sec-head">⚠️ Connectivity Warnings</div>',
+            st.markdown('<div class="sec-head">⚠️ Попередження зв`язності</div>',
                         unsafe_allow_html=True)
             for w in warnings:
                 st.markdown(f'<div class="warn-box">{w}</div>', unsafe_allow_html=True)
 
-        st.markdown('<div class="sec-head">📊 Mode Comparison</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sec-head">📊 Порівняння режимів</div>', unsafe_allow_html=True)
         cols = st.columns(3)
         for col, mode in zip(cols, ["drive", "bike", "walk"]):
             res  = results[mode]
             meta = MODE_META[mode]
             win  = mode == best_mode
             tdist = sum(l.distance_m for l in res.legs)
-            badge = '<div class="winner-badge">⚡ Most Efficient</div>' if win else ""
+            badge = '<div class="winner-badge">⚡ Найефективніший</div>' if win else ""
             col.markdown(f"""
             <div class="metric-card {'winner' if win else ''}">
               <div class="m-icon">{meta['icon']}</div>
               <div class="m-mode">{meta['label']}</div>
               <div class="m-time">{hms(res.total_time_s)}</div>
-              <div class="m-sub">{tdist/1000:.1f} km · {SPEED_KMH[mode]:.0f} km/h · {len(stops)} stop{"s" if len(stops)!=1 else ""}</div>
+              <div class="m-sub">{tdist/1000:.1f} км · {SPEED_KMH[mode]:.0f} км/год · {len(stops)} зупинок</div>
               {badge}
             </div>""", unsafe_allow_html=True)
 
-        st.markdown('<div class="sec-head">🗺️ Optimized Routes</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sec-head">🗺️ Оптимізовані маршрути</div>', unsafe_allow_html=True)
         st.markdown("""
         <div class="info-box">
-          <b>Layer control</b> (top-left) toggles Car / Bike / Walk routes.
-          🟢 Green = Depot &nbsp;·&nbsp; 🔴 Red numbers = Delivery stops in optimized order.
+          <b>Керування шарами</b> (зверху-зліва) перемикає маршрути Авто / Велосипед / Пішки.
+          🟢 Зелений = Склад &nbsp;·&nbsp; 🔴 Червоні номери = Точки доставки в оптимальному порядку.
         </div>""", unsafe_allow_html=True)
         rmap = build_result_map(mode_graphs, results, depot, stops)
         st_folium(rmap, width="100%", height=530, returned_objects=[], key="result_map")
 
-        st.markdown('<div class="sec-head">📋 Detailed Stop Breakdown</div>',
+        st.markdown('<div class="sec-head">📋 Детальний розклад зупинок</div>',
                     unsafe_allow_html=True)
-        t1, t2, t3 = st.tabs(["🚗  Car", "🚲  Bike", "🚶  Walk"])
+        t1, t2, t3 = st.tabs(["🚗  Авто", "🚲  Велосипед", "🚶  Пішки"])
         for tab, mode in zip([t1, t2, t3], ["drive", "bike", "walk"]):
             with tab:
                 res = results[mode]
                 if mode == "drive" and car_unreachable_notes:
                     st.markdown(
-                        '<div class="warn-box"><strong>⚠️ Unreachable by car (last-meter)</strong><br>'
+                        '<div class="warn-box"><strong>⚠️ Недоступно для авто (останній метр)</strong><br>'
                         + "<br>".join(car_unreachable_notes)
                         + "</div>",
                         unsafe_allow_html=True,
                     )
                 tdist = sum(l.distance_m for l in res.legs)
                 c1, c2, c3 = st.columns(3)
-                c1.metric("Total Time",     hms(res.total_time_s))
-                c2.metric("Total Distance", f"{tdist/1000:.2f} km")
-                c3.metric("Avg Speed",      f"{SPEED_KMH[mode]:.0f} km/h")
+                c1.metric("Загальний час",       hms(res.total_time_s))
+                c2.metric("Загальна відстань",   f"{tdist/1000:.2f} км")
+                c3.metric("Середня швидкість",   f"{SPEED_KMH[mode]:.0f} км/год")
                 st.markdown(render_stop_table(res), unsafe_allow_html=True)
 
         st.markdown('<div style="height:14px"></div>', unsafe_allow_html=True)
@@ -1537,11 +1555,11 @@ with map_tab:
         with ca:
             st.markdown("""
             <div class="warn-box">
-              🔄 Add more stops via the sidebar or map click, then press
-              <b>Optimize Routes</b> again. The OSM network is cached automatically.
+              🔄 Додайте ще зупинки через бічну панель або клік по карті, потім натисніть
+              <b>Оптимізувати маршрути</b> знову. OSM-мережа кешується автоматично.
             </div>""", unsafe_allow_html=True)
         with cb:
-            if st.button("🗑 Clear & Restart", key="clear_single", use_container_width=True):
+            if st.button("🗑 Очистити та почати знову", key="clear_single", use_container_width=True):
                 st.session_state.update(
                     opt_results=None, opt_graphs=None, opt_warnings=[],
                     opt_car_unreachable=[], opt_vrp_results=None, opt_vrp_warnings=[],
@@ -1555,55 +1573,57 @@ with map_tab:
         vrp_warnings = st.session_state.get("opt_vrp_warnings", [])
 
         if vrp_warnings:
-            st.markdown('<div class="sec-head">⚠️ Routing Warnings</div>',
+            st.markdown('<div class="sec-head">⚠️ Попередження маршрутизації</div>',
                         unsafe_allow_html=True)
             for w in vrp_warnings:
                 st.markdown(f'<div class="warn-box">{w}</div>', unsafe_allow_html=True)
 
         # Per-vehicle summary cards
-        st.markdown('<div class="sec-head">🚛 Fleet Summary</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sec-head">🚛 Підсумок флоту</div>', unsafe_allow_html=True)
         mode_icons = {"drive": "🚗", "bike": "🚲", "walk": "🚶"}
+        mode_ua_map = {"drive": "авто", "bike": "велосипед", "walk": "пішки"}
         n_cols = min(len(vrp_routes), 4)
         vcols = st.columns(n_cols)
         for col, vr in zip(vcols, vrp_routes):
             icon = mode_icons.get(vr.vehicle.mode, "🚛")
             n_stops = len(vr.stops)
+            mode_ua = mode_ua_map.get(vr.vehicle.mode, vr.vehicle.mode)
             col.markdown(f"""
             <div class="metric-card" style="border-top:4px solid {vr.vehicle.color}">
               <div class="m-icon">{icon}</div>
               <div class="m-mode">{vr.vehicle.name}</div>
               <div class="m-time">{hms(vr.total_time_s)}</div>
               <div class="m-sub">
-                {vr.total_dist_m/1000:.1f} km · {n_stops} stop{"s" if n_stops != 1 else ""}
-                · {vr.vehicle.mode}
+                {vr.total_dist_m/1000:.1f} км · {n_stops} зупинок
+                · {mode_ua}
               </div>
             </div>""", unsafe_allow_html=True)
 
         # Multi-vehicle map
-        st.markdown('<div class="sec-head">🗺️ Vehicle Routes</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sec-head">🗺️ Маршрути транспорту</div>', unsafe_allow_html=True)
         st.markdown("""
         <div class="info-box">
-          <b>Layer control</b> (top-left) toggles individual vehicle routes and stop markers.
-          🟢 Green = Depot &nbsp;·&nbsp; Numbered markers show stop visit order per vehicle.
+          <b>Керування шарами</b> (зверху-зліва) перемикає маршрути окремих ТЗ і маркери зупинок.
+          🟢 Зелений = Склад &nbsp;·&nbsp; Номеровані маркери показують порядок відвідування для кожного ТЗ.
         </div>""", unsafe_allow_html=True)
         vmap = build_vrp_result_map(mode_graphs, vrp_routes, depot)
         st_folium(vmap, width="100%", height=560, returned_objects=[], key="vrp_result_map")
 
         # Per-vehicle stop breakdown expanders
-        st.markdown('<div class="sec-head">📋 Per-Vehicle Stop Breakdown</div>',
+        st.markdown('<div class="sec-head">📋 Розклад зупинок по ТЗ</div>',
                     unsafe_allow_html=True)
         for vr in vrp_routes:
             icon = mode_icons.get(vr.vehicle.mode, "🚛")
             n_s = len(vr.stops)
             with st.expander(
-                f"{icon} {vr.vehicle.name} — {n_s} stop{'s' if n_s != 1 else ''} · {hms(vr.total_time_s)}",
+                f"{icon} {vr.vehicle.name} — {n_s} зупинок · {hms(vr.total_time_s)}",
                 expanded=False,
             ):
                 tdist = vr.total_dist_m
                 c1, c2, c3 = st.columns(3)
-                c1.metric("Total Time",     hms(vr.total_time_s))
-                c2.metric("Total Distance", f"{tdist/1000:.2f} km")
-                c3.metric("Mode",           vr.vehicle.mode.capitalize())
+                c1.metric("Загальний час",       hms(vr.total_time_s))
+                c2.metric("Загальна відстань",   f"{tdist/1000:.2f} км")
+                c3.metric("Режим",               mode_ua_map.get(vr.vehicle.mode, vr.vehicle.mode).capitalize())
                 if vr.legs:
                     # Reuse existing render_stop_table by wrapping in a ModeResult-like object
                     pseudo = ModeResult(vr.vehicle.mode, vr.tsp_route, vr.full_route,
@@ -1615,11 +1635,11 @@ with map_tab:
         with ca:
             st.markdown("""
             <div class="warn-box">
-              🔄 Add more stops via the sidebar or adjust the fleet in
-              <b>Fleet Settings</b>, then press <b>Optimize Routes</b> again.
+              🔄 Додайте ще зупинки через бічну панель або налаштуйте флот у
+              <b>Налаштування флоту</b>, потім натисніть <b>Оптимізувати маршрути</b> знову.
             </div>""", unsafe_allow_html=True)
         with cb:
-            if st.button("🗑 Clear & Restart", key="clear_vrp", use_container_width=True):
+            if st.button("🗑 Очистити та почати знову", key="clear_vrp", use_container_width=True):
                 st.session_state.update(
                     opt_results=None, opt_graphs=None, opt_warnings=[],
                     opt_car_unreachable=[], opt_vrp_results=None, opt_vrp_warnings=[],
@@ -1631,48 +1651,50 @@ with map_tab:
 # ══════════════════════════════════════════════════════════════════════════════
 
 with fleet_tab:
-    st.markdown('<div class="sec-head">🚛 Fleet Configuration</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sec-head">🚛 Конфігурація флоту</div>', unsafe_allow_html=True)
 
     n_vehicles = len(fleet)
-    mode_badge = {"drive": "🚗 Drive", "bike": "🚲 Bike", "walk": "🚶 Walk"}
+    mode_badge = {"drive": "🚗 Авто", "bike": "🚲 Велосипед", "walk": "🚶 Пішки"}
     if n_vehicles >= 2:
         st.markdown(
-            f'<div class="info-box">Fleet has <b>{n_vehicles} vehicles</b> — '
-            f'<b>Optimize Routes</b> will use <b>multi-vehicle VRP mode</b>.</div>',
+            f'<div class="info-box">У флоті <b>{n_vehicles} ТЗ</b> — '
+            f'<b>Оптимізація маршрутів</b> використає <b>режим багатьох ТЗ (VRP)</b>.</div>',
             unsafe_allow_html=True,
         )
     else:
         st.markdown(
-            '<div class="info-box">Fleet has <b>1 vehicle</b> — '
-            '<b>Optimize Routes</b> uses single-vehicle mode (3-mode comparison). '
-            'Add a second vehicle to enable VRP.</div>',
+            '<div class="info-box">У флоті <b>1 ТЗ</b> — '
+            '<b>Оптимізація маршрутів</b> використовує одиничний режим (порівняння 3 способів). '
+            'Додайте другий ТЗ, щоб увімкнути VRP.</div>',
             unsafe_allow_html=True,
         )
 
     # Edit existing vehicles
-    st.markdown("**Edit vehicles:**")
+    st.markdown("**Редагувати транспорт:**")
     updated_fleet = list(fleet)
     changed = False
     for i, v in enumerate(fleet):
         c1, c2, c3, c4 = st.columns([2, 2, 1, 0.4])
         with c1:
-            new_name = st.text_input("Name", value=v.name, key=f"v_name_{i}",
+            new_name = st.text_input("Назва", value=v.name, key=f"v_name_{i}",
                                      label_visibility="collapsed")
         with c2:
             mode_opts = ["drive", "bike", "walk"]
-            new_mode = st.selectbox("Mode", mode_opts,
+            _mode_ua = {"drive": "🚗 Авто", "bike": "🚲 Велосипед", "walk": "🚶 Пішки"}
+            new_mode = st.selectbox("Режим", mode_opts,
                                     index=mode_opts.index(v.mode),
+                                    format_func=lambda v_: _mode_ua.get(v_, v_),
                                     key=f"v_mode_{i}",
                                     label_visibility="collapsed")
         with c3:
-            new_cap = st.number_input("Cap (kg)", min_value=1.0, max_value=10000.0,
+            new_cap = st.number_input("Вантаж. (кг)", min_value=1.0, max_value=10000.0,
                                       value=v.capacity_kg, step=10.0,
                                       key=f"v_cap_{i}",
                                       label_visibility="collapsed")
         with c4:
             rm = st.button("✕", key=f"v_rm_{i}",
                            disabled=(len(fleet) <= 1),
-                           help="Remove this vehicle")
+                           help="Видалити цей транспорт")
 
         if rm:
             updated_fleet.pop(i)
@@ -1698,10 +1720,10 @@ with fleet_tab:
     st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
     col_add, _ = st.columns([1, 3])
     with col_add:
-        if st.button("＋ Add Vehicle", use_container_width=True):
+        if st.button("＋ Додати транспорт", use_container_width=True):
             new_idx = len(st.session_state.fleet)
             st.session_state.fleet.append(
-                Vehicle(f"Vehicle {new_idx + 1}", "drive", 500.0,
+                Vehicle(f"Транспорт {new_idx + 1}", "drive", 500.0,
                         VEHICLE_COLORS[new_idx % len(VEHICLE_COLORS)])
             )
             st.session_state.opt_vrp_results = None
@@ -1710,8 +1732,8 @@ with fleet_tab:
     # Fleet summary table
     if fleet:
         st.markdown('<div style="height:16px"></div>', unsafe_allow_html=True)
-        st.markdown("**Current fleet:**")
-        header = "| # | Vehicle | Mode | Capacity (kg) | Colour |"
+        st.markdown("**Поточний флот:**")
+        header = "| # | Транспорт | Режим | Вантажомісткість (кг) | Колір |"
         sep    = "|---|---|---|---|---|"
         rows = [header, sep]
         for i, v in enumerate(st.session_state.fleet, 1):
@@ -1725,43 +1747,43 @@ with fleet_tab:
 # ══════════════════════════════════════════════════════════════════════════════
 
 with pkg_tab:
-    st.markdown('<div class="sec-head">📦 Package Manager</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sec-head">📦 Менеджер посилок</div>', unsafe_allow_html=True)
 
     # ── Summary counters ──────────────────────────────────────────────────────
     counts = _pkg_db.count_by_status()
     pc1, pc2, pc3 = st.columns(3)
-    pc1.metric("⏳ Pending",    counts[DeliveryStatus.PENDING])
-    pc2.metric("🚚 In Transit", counts[DeliveryStatus.IN_TRANSIT])
-    pc3.metric("✅ Delivered",  counts[DeliveryStatus.DELIVERED])
+    pc1.metric("⏳ Очікує",      counts[DeliveryStatus.PENDING])
+    pc2.metric("🚚 В дорозі",    counts[DeliveryStatus.IN_TRANSIT])
+    pc3.metric("✅ Доставлено",  counts[DeliveryStatus.DELIVERED])
 
     st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
 
     # ── Add new package form ──────────────────────────────────────────────────
-    with st.expander("➕ Add New Package", expanded=True):
+    with st.expander("➕ Додати нову посилку", expanded=True):
         with st.form("add_package_form", clear_on_submit=True):
             fa1, fa2 = st.columns([3, 1])
             with fa1:
                 new_addr = st.text_input(
-                    "Delivery address",
-                    placeholder=f"Street in {st.session_state.city.split(',')[0]}…",
+                    "Адреса доставки",
+                    placeholder=f"Вулиця у {st.session_state.city.split(',')[0]}…",
                 )
             with fa2:
                 new_weight = st.number_input(
-                    "Weight (kg)",
+                    "Вага (кг)",
                     min_value=0.01,
                     max_value=10_000.0,
                     value=1.0,
                     step=0.1,
                     format="%.2f",
                 )
-            submitted = st.form_submit_button("Save Package", use_container_width=True)
+            submitted = st.form_submit_button("Зберегти посилку", use_container_width=True)
 
         if submitted:
             if not new_addr.strip():
-                st.error("Address cannot be empty.")
+                st.error("Адреса не може бути порожньою.")
             else:
                 # Attempt geocoding so coordinates are stored immediately
-                with st.spinner("Geocoding address…"):
+                with st.spinner("Геокодування адреси…"):
                     geo = forward_geocode(new_addr.strip(), st.session_state.city)
                 if geo:
                     pkg = _pkg_db.add_package(
@@ -1770,7 +1792,7 @@ with pkg_tab:
                         lat=geo.lat,
                         lon=geo.lon,
                     )
-                    st.success(f"Package saved — {geo.address[:60]} ({new_weight:.2f} kg)")
+                    st.success(f"Посилку збережено — {geo.address[:60]} ({new_weight:.2f} кг)")
                 else:
                     # Save with raw address even if geocoding failed
                     pkg = _pkg_db.add_package(
@@ -1778,20 +1800,20 @@ with pkg_tab:
                         weight_kg=float(new_weight),
                     )
                     st.warning(
-                        f"Address not found in {st.session_state.city} — "
-                        "package saved without coordinates."
+                        f"Адресу не знайдено у {st.session_state.city} — "
+                        "посилку збережено без координат."
                     )
                 st.rerun()
 
     st.markdown('<div style="height:4px"></div>', unsafe_allow_html=True)
 
     # ── Filter controls ───────────────────────────────────────────────────────
-    st.markdown("**Filter by status:**")
+    st.markdown("**Фільтр за статусом:**")
     _status_labels = {
-        "All":         None,
-        "⏳ Pending":    DeliveryStatus.PENDING,
-        "🚚 In Transit": DeliveryStatus.IN_TRANSIT,
-        "✅ Delivered":  DeliveryStatus.DELIVERED,
+        "Усі":           None,
+        "⏳ Очікує":     DeliveryStatus.PENDING,
+        "🚚 В дорозі":   DeliveryStatus.IN_TRANSIT,
+        "✅ Доставлено": DeliveryStatus.DELIVERED,
     }
     filter_choice = st.radio(
         "pkg_filter",
@@ -1810,7 +1832,7 @@ with pkg_tab:
 
     if not packages:
         st.markdown(
-            '<div style="font-size:.82rem;color:#64748b;padding:12px 0">No packages found.</div>',
+            '<div style="font-size:.82rem;color:#64748b;padding:12px 0">Посилок не знайдено.</div>',
             unsafe_allow_html=True,
         )
     else:
@@ -1822,14 +1844,14 @@ with pkg_tab:
                 coords_txt = (
                     f"{pkg.lat:.5f}, {pkg.lon:.5f}"
                     if pkg.lat is not None
-                    else "coordinates unknown"
+                    else "координати невідомі"
                 )
                 st.markdown(
                     f"""<div style="padding:6px 0">
                       <div style="font-weight:600;font-size:.88rem">{short_addr}</div>
                       <div style="font-size:.75rem;color:#64748b">
                         📍 {coords_txt} &nbsp;·&nbsp;
-                        🕐 {pkg.created_at.strftime('%d %b %Y %H:%M')} UTC
+                        🕐 {pkg.created_at.strftime('%d.%m.%Y %H:%M')} UTC
                       </div>
                     </div>""",
                     unsafe_allow_html=True,
@@ -1837,7 +1859,7 @@ with pkg_tab:
 
             with col_weight:
                 new_weight = st.number_input(
-                    "Weight (kg)",
+                    "Вага (кг)",
                     min_value=0.01,
                     max_value=10_000.0,
                     value=float(pkg.weight_kg),
@@ -1848,7 +1870,7 @@ with pkg_tab:
                 )
                 if abs(float(new_weight) - float(pkg.weight_kg)) > 1e-6:
                     if st.button(
-                        "💾 Save weight",
+                        "💾 Зберегти вагу",
                         key=f"pkg_save_weight_{pkg.id}",
                         use_container_width=True,
                     ):
@@ -1863,10 +1885,16 @@ with pkg_tab:
                 )
                 # Status change selector
                 _opts = [s.value for s in DeliveryStatus]
+                _opts_labels_map = {
+                    "pending":    "⏳ Очікує",
+                    "in_transit": "🚚 В дорозі",
+                    "delivered":  "✅ Доставлено",
+                }
                 new_status_val = st.selectbox(
-                    "Change status",
+                    "Змінити статус",
                     _opts,
                     index=_opts.index(pkg.status.value),
+                    format_func=lambda v: _opts_labels_map.get(v, v),
                     key=f"pkg_status_{pkg.id}",
                     label_visibility="collapsed",
                 )
@@ -1882,13 +1910,13 @@ with pkg_tab:
                     and pkg.status != DeliveryStatus.DELIVERED
                 )
                 if st.button(
-                    "➜ Add to Route",
+                    "➜ Додати у маршрут",
                     key=f"pkg_dispatch_{pkg.id}",
                     disabled=not can_dispatch,
                     help=(
-                        "Add this address as a delivery stop"
+                        "Додати цю адресу як точку доставки"
                         if can_dispatch
-                        else "No coordinates — geocoding failed, or already delivered"
+                        else "Немає координат — геокодування не вдалось, або вже доставлено"
                     ),
                     use_container_width=True,
                 ):
@@ -1906,13 +1934,13 @@ with pkg_tab:
                         st.session_state.opt_results = None
                         st.session_state.opt_vrp_results = None
                         _pkg_db.set_status(pkg.id, DeliveryStatus.IN_TRANSIT)
-                        st.success(f"Added to route: {pkg.address[:50]}")
+                        st.success(f"Додано у маршрут: {pkg.address[:50]}")
                         st.rerun()
                     else:
-                        st.warning("This address is already in the delivery list.")
+                        st.warning("Ця адреса вже є у списку доставки.")
 
                 if st.button(
-                    "🗑 Delete",
+                    "🗑 Видалити",
                     key=f"pkg_delete_{pkg.id}",
                     use_container_width=True,
                     type="secondary",

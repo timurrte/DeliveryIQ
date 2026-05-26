@@ -664,8 +664,8 @@ def solve_vrp(
     if unreachable:
         names = "; ".join(s.address[:35] for s in unreachable)
         warnings.append(
-            f"⚠️ {len(unreachable)} stop(s) unreachable by any fleet vehicle mode "
-            f"(or fleet at capacity) — skipped: {names}"
+            f"⚠️ {len(unreachable)} зупинку(ок) недосяжно жодним режимом флоту "
+            f"(або вичерпана вантажомісткість) — пропущено: {names}"
         )
         logger.warning(
             "%d stop(s) could not be assigned to any vehicle: %s",
@@ -684,7 +684,7 @@ def solve_vrp(
 
         if not pool:
             for v in vehicles:
-                warnings.append(f"ℹ️ {v.name} has no stops assigned (idle).")
+                warnings.append(f"ℹ️ {v.name} не має призначених зупинок (простоює).")
                 logger.info("Vehicle %r (%s) is idle — no compatible stops.", v.name, mode)
             continue
 
@@ -694,12 +694,12 @@ def solve_vrp(
         active_names = {vr.vehicle.name for vr in mode_routes}
         for v in vehicles:
             if v.name not in active_names:
-                warnings.append(f"ℹ️ {v.name} has no stops assigned (idle).")
+                warnings.append(f"ℹ️ {v.name} не має призначених зупинок (простоює).")
 
     if not routes:
         raise RuntimeError(
-            "No vehicle could be routed. Check that vehicle modes are compatible "
-            "with the delivery area road network, and that fleet capacity is sufficient."
+            "Жоден транспорт не вдалося маршрутизувати. Перевірте, що режими ТЗ сумісні "
+            "з дорожньою мережею області доставки, та що вантажомісткість флоту достатня."
         )
 
     obj_val = compute_objective(routes)
