@@ -1,0 +1,59 @@
+@startuml DFD_Level1_DeliveryIQ
+!theme plain
+skinparam defaultFontSize 13
+skinparam rectangleBorderThickness 2
+skinparam ArrowThickness 1.2
+skinparam ranksep 50
+skinparam nodesep 40
+
+title Діаграма потоків даних системи DeliveryIQ (DFD рівня 1)
+
+' ── Зовнішні сутності ───────────────────────────────────────────────────────
+rectangle "**Оператор**\nлогістики" as operator #FFE0B2
+rectangle "**Nominatim**\n(OpenStreetMap)" as nominatim #FFE0B2
+rectangle "**Кур'єр**" as courier #FFE0B2
+
+' ── Процеси (Yourdon-DeMarco: круглі) ───────────────────────────────────────
+usecase "**1. Реєстрація**\n**пакунка**" as P1 #CCE5FF
+usecase "**2. Геокодування**\n**адреси**" as P2 #CCE5FF
+usecase "**3. Оптимізація**\n**маршрутів**" as P3 #CCE5FF
+usecase "**4. Підтвердження**\n**доставки**" as P4 #CCE5FF
+
+' ── Сховище даних ───────────────────────────────────────────────────────────
+database "D1: packages\n(SQLite)" as D1 #D4EDDA
+
+' ── Потоки даних ────────────────────────────────────────────────────────────
+operator --> P1   : (адреса, вага,\nопц. координати)
+P1       --> D1   : INSERT\n(status=PENDING)
+
+D1       --> P2   : SELECT\n(lat IS NULL)
+P2       --> nominatim : запит геокодування\n(адреса)
+nominatim --> P2  : (lat, lon)
+P2       --> D1   : UPDATE\nset_coordinates()
+
+operator --> P3   : команда\n"Оптимізувати"
+D1       --> P3   : SELECT\n(status=PENDING\nAND lat IS NOT NULL)
+P3       --> D1   : UPDATE\nstatus=IN_TRANSIT
+P3       --> operator : маршрути,\nкарта, метрики
+
+courier  --> P4   : підтвердження\n(package_id, OK / FAIL)
+P4       --> D1   : UPDATE\nstatus=DELIVERED\nабо PENDING
+
+note bottom of D1
+  <b>Сховище даних</b>
+  packages.db (SQLite)
+  ключ: id (UUID4 hex)
+end note
+
+note top of P3
+  Викликає VRP-розв'язувач
+  (vrp_solver.solve_vrp)
+end note
+
+legend bottom
+  | <#FFE0B2> | Зовнішня сутність |
+  | <#CCE5FF> | Процес обробки даних |
+  | <#D4EDDA> | Сховище даних |
+endlegend
+
+@enduml

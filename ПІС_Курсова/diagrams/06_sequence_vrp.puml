@@ -24,31 +24,52 @@ loop для кожної зупинки
         VRP -> RS : build_distance_matrix(\nG_mode, [depot, stop], "travel_time")
         RS --> VRP : matrix — час досяжності
     end
-    VRP -> VRP : Обрати тип ТЗ з найбільшим\nзалишком місткості серед\nсумісних режимів
+    VRP -> VRP : _assign_stops_to_modes():\nобрати тип ТЗ з найбільшим\nзалишком місткості серед\nсумісних режимів
 end
 
-== Фаза 2: Географічна кластеризація (K-Means) ==
+== Фаза 2: Генетичний алгоритм у межах пулу режиму ==
 
-loop для кожного типу ТЗ
-    VRP -> VRP : KMeans(n_clusters=k)\n.fit(stop_coords)
-    VRP -> VRP : _rebalance_clusters()\nпереміщення зупинок між\nкластерами за місткістю
+loop для кожного режиму (drive, bike, walk)
+
+    VRP -> RS : build_distance_matrix(\nG_mode, [depot] + pool_stops)
+    activate RS
+    RS --> VRP : matrix (часи між усіма\nвузлами пулу)
+    deactivate RS
+
+    VRP -> VRP : _build_ga_routes(pool, fleet_mode, matrix)
+    activate VRP #LightBlue
+
+    note right
+      <b>Ініціалізація популяції</b> (50 хромосом):
+      • 1 хромосома — _nearest_neighbour_seed()
+        («теплий старт»)
+      • 49 хромосом — випадкові перестановки
+    end note
+
+    loop GA: N_GENERATIONS = 150
+        VRP -> VRP : _tournament_select()\n(турнір 3 особин)
+        VRP -> VRP : _order_crossover()\n(OX, p = 0.85)
+        VRP -> VRP : _swap_mutation()\n(swap, p = 0.15)
+        VRP -> VRP : _evaluate():\n_decode_chromosome (Split)\n→ F = A·T_total + B·K + P·|U|
+        VRP -> VRP : Елітизм (ELITE_SIZE = 2):\nперенести 2 найкращі\nособини у нове покоління
+    end
+
+    VRP --> VRP : best_chromosome
+    deactivate VRP
+
 end
 
-== Фаза 3: TSP для кожного ТЗ ==
+== Фаза 3: Декодування переможця та реконструкція маршрутів ==
+
+loop для кожного режиму
+    VRP -> VRP : _decode_chromosome(best, …)\n→ список VehicleRoute
+end
 
 loop для кожного ТЗ (vehicle)
-    VRP -> RS : build_distance_matrix(\nG_mode, [depot] + cluster_stops)
+    VRP -> RS : reconstruct_full_route(\nG_mode, tsp_route)
     activate RS
-    RS --> VRP : matrix
+    RS --> VRP : full_route (повна\nпослідовність вузлів)
     deactivate RS
-
-    VRP -> RS : solve_tsp(nodes, matrix, "auto")
-    activate RS
-    RS --> VRP : (tsp_route, total_time)
-    deactivate RS
-
-    VRP -> RS : reconstruct_full_route(G, tsp_route)
-    RS --> VRP : full_route
 end
 
 VRP --> App : (list[VehicleRoute],\nwarnings)

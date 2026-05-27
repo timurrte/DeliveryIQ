@@ -1,0 +1,74 @@
+@startuml ER_Schema_DeliveryIQ
+!theme plain
+skinparam classAttributeIconSize 0
+skinparam classFontSize 13
+skinparam linetype ortho
+
+title ER-діаграма реляційної схеми системи DeliveryIQ
+
+entity "packages" as packages {
+    * id : TEXT <<PK>>
+    --
+    * address : TEXT <<NOT NULL>>
+    * weight_kg : REAL <<NOT NULL, > 0>>
+    * status : TEXT <<NOT NULL>>
+    * created_at : TEXT <<ISO 8601 UTC>>
+      lat : REAL <<NULL>>
+      lon : REAL <<NULL>>
+}
+
+enum "DeliveryStatus" as ds <<enum, programmatic>> {
+    PENDING
+    IN_TRANSIT
+    DELIVERED
+}
+
+entity "Location" as loc <<transient>> {
+    address : str
+    lat : float
+    lon : float
+    node_id : int
+}
+
+entity "Vehicle" as veh <<transient>> {
+    name : str
+    mode : str
+    capacity_kg : float
+}
+
+entity "VehicleRoute" as vr <<transient>> {
+    vehicle : Vehicle
+    stops : list[Package]
+    total_time_s : float
+}
+
+packages }o..|| ds : "обмеження значень\n(перевіряється у коді)"
+packages }o..o{ vr : "включений у маршрут\n(на час оптимізації)"
+loc ||..o{ packages : "джерело координат\n(після геокодування)"
+vr }o--|| veh : "виконується ТЗ"
+
+note bottom of packages
+  <b>Нормальна форма:</b> 3НФ
+  <b>Розмір запису:</b> ~150 байт
+  <b>Очікуваний обсяг:</b> ~11 МБ/рік
+end note
+
+note right of ds
+  Реалізовано як Python enum
+  без матеріалізації у БД
+  через незмінність переліку
+end note
+
+note bottom of loc
+  Об'єкти оперативної пам'яті
+  (без персистентного представлення)
+end note
+
+legend right
+  | <#FFFFFF> | <b>Тип сутності</b> |
+  |<#E8F4F8>| Персистентна (SQLite) |
+  |<#FFF8E1>| Логічне обмеження (enum) |
+  |<#F5F5F5>| Транзієнтна (RAM) |
+endlegend
+
+@enduml
