@@ -1246,7 +1246,6 @@ with st.sidebar:
 
     st.markdown('<hr style="border-color:#161d2e;margin:14px 0">', unsafe_allow_html=True)
 
-    # ── Depot ─────────────────────────────────────────────────────────────────
     st.markdown('<div style="font-size:.61rem;font-weight:700;letter-spacing:1.2px;color:#475569;text-transform:uppercase;margin-bottom:5px">🏢 Адреса складу</div>', unsafe_allow_html=True)
     dc1, dc2 = st.columns([4, 1])
     with dc1:
@@ -1284,7 +1283,6 @@ with st.sidebar:
 
     st.markdown('<hr style="border-color:#161d2e;margin:12px 0">', unsafe_allow_html=True)
 
-    # ── Add stop by typing ────────────────────────────────────────────────────
     st.markdown('<div style="font-size:.61rem;font-weight:700;letter-spacing:1.2px;color:#475569;text-transform:uppercase;margin-bottom:5px">📍 Додати точку доставки</div>', unsafe_allow_html=True)
     sc1, sc2 = st.columns([4, 1])
     with sc1:
@@ -1304,7 +1302,6 @@ with st.sidebar:
 
     st.markdown('<hr style="border-color:#161d2e;margin:12px 0">', unsafe_allow_html=True)
 
-    # ── Selected deliveries list ──────────────────────────────────────────────
     n_stops = len(st.session_state.stops)
     st.markdown(
         f'<div style="font-size:.61rem;font-weight:700;letter-spacing:1.2px;'
@@ -1379,7 +1376,6 @@ map_tab, fleet_tab, pkg_tab = st.tabs(["🗺️ Карта та оптиміза
 
 with map_tab:
 
-    # ── Coordinator map (shown when no results yet) ───────────────────────────
     no_results = (
         st.session_state.opt_results is None
         and st.session_state.opt_vrp_results is None
@@ -1388,7 +1384,6 @@ with map_tab:
         st.markdown('<div class="sec-head">🗺️ Карта координатора — Сформуйте список доставки</div>',
                     unsafe_allow_html=True)
 
-        # ── Map-click toggle (visual indicator) ──────────────────────────────
         tc_l, tc_r = st.columns([1.2, 3])
         with tc_l:
             click_on = st.toggle(
@@ -1749,7 +1744,6 @@ with fleet_tab:
 with pkg_tab:
     st.markdown('<div class="sec-head">📦 Менеджер посилок</div>', unsafe_allow_html=True)
 
-    # ── Summary counters ──────────────────────────────────────────────────────
     counts = _pkg_db.count_by_status()
     pc1, pc2, pc3 = st.columns(3)
     pc1.metric("⏳ Очікує",      counts[DeliveryStatus.PENDING])
