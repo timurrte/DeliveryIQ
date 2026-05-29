@@ -1,59 +1,78 @@
 @startuml DeliveryIQ_ClassDiagram
 !theme cerulean-outline
 skinparam classAttributeIconSize 0
-skinparam defaultFontSize 14
-skinparam classFontSize 14
-skinparam nodesep 40
-skinparam ranksep 40
+skinparam defaultFontSize 11
+skinparam classFontSize 11
+skinparam classHeaderBackgroundColor #dce9f5
+skinparam nodesep 15
+skinparam ranksep 25
+skinparam padding 2
+skinparam classBackgroundColor #f7fbff
+skinparam classBorderColor #5a9fd4
+skinparam arrowColor #3a7cbf
 hide empty members
+
+top to bottom direction
 
 title Діаграма класів
 
-enum DeliveryStatus {
-    PENDING
-    IN_TRANSIT
-    DELIVERED
+together {
+    enum DeliveryStatus {
+        PENDING
+        IN_TRANSIT
+        DELIVERED
+    }
+
+    class Package {
+        + id, address
+        + weight_kg, status
+        + lat, lon
+    }
+
+    class PackageDB <<module>> {
+        + add() / get()
+        + set_status() / delete()
+    }
 }
 
-class DeliveryStop {
-    + address, lat, lon
-    + node_id, weight_kg
-    + tw_open, tw_close, service_time
+together {
+    class DeliveryStop {
+        + address, lat, lon
+        + node_id, weight_kg
+        + tw_open, tw_close
+        + service_time
+    }
+
+    class Vehicle {
+        + name, mode
+        + capacity_kg, color
+    }
+
+    class UnreachableStop {
+        + node_id, label
+        + unreachable_from/to
+    }
 }
 
-class LegInfo {
-    + from_label, to_label
-    + distance_m, travel_time_s
-    + cumulative_time_s
-}
+together {
+    class LegInfo {
+        + from_label, to_label
+        + distance_m, travel_time_s
+        + cumulative_time_s
+    }
 
-class ModeResult {
-    + mode
-    + tsp_route, full_route
-    + total_time_s
-    + legs
-}
+    class ModeResult {
+        + mode
+        + tsp_route, full_route
+        + total_time_s, legs
+    }
 
-class Vehicle {
-    + name, mode
-    + capacity_kg, color
-}
-
-class VehicleRoute {
-    + vehicle, stops
-    + tsp_route, full_route
-    + total_time_s, total_dist_m
-    + legs
-}
-
-class Package {
-    + id, address, weight_kg
-    + status, lat, lon
-}
-
-class UnreachableStop {
-    + node_id, label
-    + unreachable_from/to
+    class VehicleRoute {
+        + vehicle, stops
+        + tsp_route, full_route
+        + total_time_s
+        + total_dist_m, legs
+    }
 }
 
 class App <<module>> {
@@ -62,36 +81,35 @@ class App <<module>> {
     + build_result_map()
 }
 
-class Geocoder <<module>> {
-    + geocode() / geocode_all()
-}
+together {
+    class Geocoder <<module>> {
+        + geocode()
+        + geocode_all()
+    }
 
-class GraphBuilder <<module>> {
-    + PENALTY = 1e9
-    + SPEED = {30/15/5}
-    + get_network()
-    + add_travel_times()
-    + nearest_node[_safe]()
-}
+    class GraphBuilder <<module>> {
+        + PENALTY = 1e9
+        + SPEED = {30/15/5}
+        + get_network()
+        + add_travel_times()
+        + nearest_node_safe()
+    }
 
-class RouteSolver <<module>> {
-    + build_distance_matrix()
-    + build_drive_matrix_hybrid()
-    + solve_tsp()
-    + audit_reachability()
-}
+    class RouteSolver <<module>> {
+        + build_distance_matrix()
+        + build_drive_matrix_hybrid()
+        + solve_tsp()
+        + audit_reachability()
+    }
 
-class VRPSolver <<module>> {
-    + POP=50, GEN=150
-    + solve_vrp()
-}
+    class VRPSolver <<module>> {
+        + POP=50, GEN=150
+        + solve_vrp()
+    }
 
-class Visualizer <<module>> {
-    + build_map()
-}
-
-class PackageDB <<module>> {
-    + add / get / set_status / delete
+    class Visualizer <<module>> {
+        + build_map()
+    }
 }
 
 ModeResult   "1" *-- "*" LegInfo
