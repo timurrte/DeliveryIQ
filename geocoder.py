@@ -1,9 +1,4 @@
-"""
-geocoder.py
------------
-Converts human-readable addresses into (lat, lon) coordinates using the
-Nominatim geocoder bundled with OSMnx / geopy.
-"""
+"""Address-to-(lat, lon) geocoding via Nominatim (geopy)."""
 
 import logging
 from dataclasses import dataclass
@@ -21,19 +16,11 @@ class Location:
     address: str
     lat: float
     lon: float
-    node_id: int | None = None          # filled in after snapping to OSM graph
+    node_id: int | None = None          # set after snapping to OSM graph
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 def geocode(address: str, retries: int = 3) -> tuple[float, float]:
-    """
-    Geocode *address* → (latitude, longitude).
-
-    Raises
-    ------
-    ValueError
-        If the address cannot be resolved after *retries* attempts.
-    """
+    """Geocode address to (lat, lon). Retries on timeout."""
     for attempt in range(1, retries + 1):
         try:
             result = _geolocator.geocode(address, timeout=10)
@@ -46,11 +33,8 @@ def geocode(address: str, retries: int = 3) -> tuple[float, float]:
     raise GeocoderServiceError(f"Geocoder failed after {retries} retries for '{address}'")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 def geocode_all(addresses: list[str]) -> list[Location]:
-    """
-    Geocode a list of addresses and return a list of :class:`Location` objects.
-    """
+    """Geocode a list of addresses into Location objects."""
     locations: list[Location] = []
     for addr in addresses:
         lat, lon = geocode(addr)

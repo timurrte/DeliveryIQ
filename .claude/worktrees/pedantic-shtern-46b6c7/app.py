@@ -1,14 +1,10 @@
 """
-app.py — DeliveryIQ · Route Optimizer v3.0
-==========================================
-New in v3:
-  • City-locked address search  — every geocode is scoped to one city
-  • Click-to-Add on the map     — reverse geocodes click coords to an address
-  • Live 'Selected Deliveries' list with per-item remove buttons
-  • Green depot / red numbered client markers
-  • Full multi-modal AntPath route rendering after optimisation
+DeliveryIQ route optimizer (Streamlit UI).
 
-Run:  streamlit run app.py
+Features: city-locked address search, click-to-add map markers, a live
+delivery list, depot/stop markers, and multi-modal AntPath route rendering.
+
+Run: streamlit run app.py
 """
 
 from __future__ import annotations
@@ -58,9 +54,7 @@ MAPBOX_API_KEY: str = os.getenv("MAPBOX_API_KEY", "")
 # Global package database (SQLite, single file in project root)
 _pkg_db = PackageDB()
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  CITY LOCK  — change this one line to re-scope the whole app
-# ══════════════════════════════════════════════════════════════════════════════
+# City lock — change this one line to re-scope the whole app.
 DEFAULT_CITY = "Dnipro, Ukraine"
 
 CITY_CENTRES: dict[str, tuple[float, float]] = {
@@ -72,9 +66,7 @@ CITY_CENTRES: dict[str, tuple[float, float]] = {
 
 _geolocator = Nominatim(user_agent="deliveryiq_v3", timeout=10)
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  PAGE CONFIG
-# ══════════════════════════════════════════════════════════════════════════════
+# Page config
 st.set_page_config(
     page_title="DeliveryIQ · Route Optimizer",
     page_icon="📦",
@@ -82,9 +74,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  GLOBAL CSS
-# ══════════════════════════════════════════════════════════════════════════════
+# Global CSS
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Outfit:wght@300;400;500;600;700;800&display=swap');
@@ -222,9 +212,7 @@ section[data-testid="stSidebar"] .stButton>button:hover{
 """, unsafe_allow_html=True)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  DATA CLASSES
-# ══════════════════════════════════════════════════════════════════════════════
+# Data classes
 
 @dataclass
 class DeliveryStop:
@@ -233,10 +221,10 @@ class DeliveryStop:
     lon: float
     source: str = "typed"        # "typed" | "map_click"
     node_id: Optional[int] = None
-    weight_kg: float = 1.0       # package weight q_k (kg)
-    tw_open: float = 0.0         # time window open  δ_min (seconds from midnight)
-    tw_close: float = 86400.0    # time window close δ_max (seconds from midnight)
-    service_time: float = 0.0    # service time s_i (seconds)
+    weight_kg: float = 1.0       # package weight (kg)
+    tw_open: float = 0.0         # time window open (seconds from midnight)
+    tw_close: float = 86400.0    # time window close (seconds from midnight)
+    service_time: float = 0.0    # service time (seconds)
 
 
 @dataclass
@@ -255,27 +243,13 @@ class ModeResult:
     full_route: list
     total_time_s: float
     legs: list = field(default_factory=list)
-    # For drive (hybrid last-meter): stops in visit order for map markers.
+    # Drive (hybrid last-meter): stops in visit order for map markers.
     stop_visit_order: Optional[list] = None
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  SESSION STATE
-# ══════════════════════════════════════════════════════════════════════════════
-#
-#  All interactive state is stored here so that Streamlit re-runs (triggered
-#  by any widget interaction) always have consistent data.
-#
-#  Key                Type                  Purpose
-#  ─────────────────────────────────────────────────────────────────────────
-#  city               str                   Active city lock
-#  depot              DeliveryStop | None   The warehouse / start point
-#  stops              list[DeliveryStop]    Growing list of delivery stops
-#  click_mode         bool                  True = map captures clicks
-#  last_click         tuple | None          Dedup: last processed click coords
-#  opt_results        dict | None           TSP results (all 3 modes)
-#  opt_graphs         dict | None           Weighted nx graphs (all 3 modes)
-#
+# Session state — holds all interactive state so each Streamlit re-run sees
+# consistent data. Keys: city, depot, stops, click_mode, last_click,
+# opt_results, opt_graphs, fleet, opt_vrp_results, and related warning lists.
 def _init():
     defs = {
         "city": DEFAULT_CITY,
@@ -299,15 +273,12 @@ def _init():
 _init()
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  CITY-LOCKED GEOCODING
-# ══════════════════════════════════════════════════════════════════════════════
+# City-locked geocoding
 
 def _lock(address: str, city: str) -> str:
     """
-    Append the city suffix if not already present.
-    This single function is the city-lock gate for ALL forward geocoding.
-    Example:  "Navigli"  →  "Navigli, Milan, Italy"
+    Append the city suffix if not already present — the city-lock gate for all
+    forward geocoding. Example: "Navigli" -> "Navigli, Milan, Italy".
     """
     city_stem = city.lower().split(",")[0].strip()
     if city_stem not in address.lower():
@@ -337,9 +308,7 @@ def reverse_geocode(lat: float, lon: float) -> Optional[DeliveryStop]:
     return DeliveryStop(address=addr, lat=lat, lon=lon, source="map_click")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  OSM / ROUTING
-# ══════════════════════════════════════════════════════════════════════════════
+# OSM / routing
 
 @st.cache_resource(show_spinner=False)
 def cached_network(city: str, radius: int):
@@ -357,12 +326,9 @@ def cached_mode_graphs(city: str, radius: int):
     """
     Build travel-time graphs for all three modes, keyed by (city, radius).
 
-    WHY not cached_mode_graphs(_G):
-    Streamlit excludes underscore-prefixed parameters from the cache hash.
-    The old `_G` signature meant this function was called ONCE ever — all
-    subsequent calls returned stale mode-graphs built from the first graph
-    object regardless of city/radius changes.  That caused every address to
-    snap to the same node as the original graph's centre.
+    Keyed by (city, radius), not the graph object: Streamlit excludes
+    underscore-prefixed params from the cache hash, so a `_G` signature would
+    cache the first result forever and reuse stale mode-graphs.
     """
     G = cached_network(city, radius)
     return add_travel_times(G)
@@ -394,29 +360,15 @@ LAST_METER_THRESHOLD_M: float = 100.0
 
 def run_optimization(depot, stops, city, radius, tsp_method):
     """
-    Full optimization pipeline — v3.2.
+    Full optimization pipeline: download the network, snap addresses, build
+    mode graphs, then solve the TSP per mode.
 
-    Fixes applied in this version
-    ──────────────────────────────
-    1. SNAP LOGGING  — every address, its (lat, lon), and its resolved
-       node ID are printed to the Python logger at INFO level before any
-       matrix work begins.  This makes it immediately visible in the
-       terminal when two addresses collapse to the same node.
-
-    2. DEDUPLICATION — after snapping, duplicate node IDs are removed
-       from all_nodes using dict.fromkeys() which preserves insertion
-       order (depot stays at index 0).  The labels dict is rebuilt so
-       colliding stops share a single merged label.  The UI receives a
-       named warning for every collision.
-
-    3. FIXED MODE-GRAPH CACHE — cached_mode_graphs() is now keyed by
-       (city, radius) instead of the graph object.  The old `_G` parameter
-       name bypassed Streamlit's cache hash so stale mode-graphs from a
-       previous city/radius were silently reused, causing every nearest-node
-       call to return the same node from the old graph's bounding area.
+    Snap results are logged so co-located addresses are visible. Duplicate
+    node IDs are deduplicated (depot stays at index 0) and colliding stops are
+    merged with a named warning.
 
     Returns (results, mode_graphs, warnings_list, car_unreachable_notes).
-    car_unreachable_notes: addresses > 100 m from nearest car-accessible road.
+    car_unreachable_notes: addresses > 100 m from the nearest car-accessible road.
     """
     prog = st.empty()
     warnings_out: list[str] = []
@@ -428,10 +380,9 @@ def run_optimization(depot, stops, city, radius, tsp_method):
             unsafe_allow_html=True,
         )
 
-    # ── Step 1: Download OSM + LSCC pruning ──────────────────────────────────
-    # Download centred on the depot's geocoded coordinates, not the city-name
-    # string.  Nominatim may place a city label far from the actual depot
-    # location, which causes the entire graph to miss the delivery area.
+    # Step 1: download OSM + LSCC pruning, centred on the depot's coordinates
+    # rather than the city name (a Nominatim city label can land far from the
+    # actual depot and miss the delivery area).
     status("Downloading OSM network (largest strongly-connected component)…")
     G_raw = cached_network_at(depot.lat, depot.lon, radius)
     summary = graph_summary(G_raw)
@@ -441,19 +392,16 @@ def run_optimization(depot, stops, city, radius, tsp_method):
         done=True,
     )
 
-    # ── Step 2: Snap every address to its nearest OSM node ───────────────────
-    # Snapping happens AFTER get_network() so every node_id is guaranteed
-    # to exist in the LSCC-pruned graph.
-    # nearest_node()      — for typed/geocoded addresses (always in-bounds)
-    # nearest_node_safe() — for map-click coordinates (may be out-of-bounds)
+    # Step 2: snap every address to its nearest OSM node. Snapping happens
+    # after get_network() so every node_id exists in the LSCC-pruned graph.
+    # nearest_node for typed addresses; nearest_node_safe for map clicks.
     status("Snapping addresses to road nodes…")
 
     def _snap(obj, label: str) -> None:
         """
-        Snap a DeliveryStop to its nearest OSM node.
-        For map-click sources, try bbox-validated snapping first; if the click
-        landed slightly outside the downloaded area, fall back to unchecked
-        nearest_node() and emit a warning rather than failing outright.
+        Snap a DeliveryStop to its nearest OSM node. For map clicks, try
+        bbox-validated snapping first and fall back to nearest_node() with a
+        warning if the click landed just outside the downloaded area.
         """
         if obj.source == "map_click":
             try:
@@ -471,9 +419,8 @@ def run_optimization(depot, stops, city, radius, tsp_method):
     for idx, stop in enumerate(stops, 1):
         _snap(stop, f"Stop #{idx}")
 
-    # ── Step 2a: DEBUG — log every snap result to the terminal ───────────────
-    # This is the primary diagnostic tool when all addresses map to the same
-    # node: run `streamlit run app.py` in a terminal and watch the output.
+    # Log every snap result to the terminal — the main diagnostic when all
+    # addresses map to the same node.
     logging.getLogger(__name__).info(
         "=== NODE SNAP REPORT (city=%s, radius=%d m) ===", city, radius
     )
@@ -487,8 +434,7 @@ def run_optimization(depot, stops, city, radius, tsp_method):
             idx, stop.lat, stop.lon, stop.node_id, stop.address[:60],
         )
 
-    # Print to stdout as well so it is visible even when the log level
-    # is set above INFO (e.g. in production deployments).
+    # Print to stdout too, so it shows even when the log level is above INFO.
     print("\n" + "=" * 60)
     print(f"NODE SNAP REPORT  city={city!r}  radius={radius}m")
     print("=" * 60)
@@ -498,7 +444,7 @@ def run_optimization(depot, stops, city, radius, tsp_method):
         print(f"  STOP #{idx}  ({stop.lat:.6f}, {stop.lon:.6f})  →  {marker}  [{stop.address[:55]}]")
     print("=" * 60 + "\n")
 
-    # ── Step 2b: Filter unsnappable stops ────────────────────────────────────
+    # Step 2b: filter unsnappable stops
     valid_stops = [s for s in stops if s.node_id is not None]
     if len(valid_stops) < len(stops):
         skipped = len(stops) - len(valid_stops)
@@ -519,17 +465,12 @@ def run_optimization(depot, stops, city, radius, tsp_method):
             "All stops are outside the downloaded graph area."
         )
 
-    # ── Step 2c: Build raw node list and detect duplicate snaps ──────────────
-    # Two addresses are "co-located" when Nominatim geocodes them to the same
-    # (lat, lon) — e.g. a vague query returns the city centroid — and both
-    # therefore snap to the same OSM node.  We:
-    #   a) warn the user by name for each collision
-    #   b) deduplicate all_nodes so build_distance_matrix never sees
-    #      src==dst for what should be two different stops (which produces
-    #      a 0.0 s cost and makes the whole route cost 0.0 s)
-    #   c) merge their labels so the leg table still shows both addresses
+    # Step 2c: build the node list and detect duplicate snaps. Two addresses
+    # co-locate when they geocode to the same point and snap to one OSM node.
+    # We warn per collision, deduplicate so build_distance_matrix never sees
+    # src==dst (which yields a 0.0 s cost), and merge labels for the leg table.
 
-    # Map: node_id → list of human labels that share it
+    # node_id -> labels sharing it
     node_label_map: dict[int, list[str]] = {}
     node_label_map[depot.node_id] = ["Depot"]
     for idx, stop in enumerate(valid_stops, 1):
@@ -554,12 +495,11 @@ def run_optimization(depot, stops, city, radius, tsp_method):
             )
             print(f"⚠️  {msg}")
 
-    # Deduplicated node list — dict.fromkeys preserves insertion order,
-    # guaranteeing depot stays at index 0.
+    # Deduplicate; dict.fromkeys preserves order so the depot stays at index 0.
     raw_nodes  = [depot.node_id] + [s.node_id for s in valid_stops]
     unique_nodes: list[int] = list(dict.fromkeys(raw_nodes))
 
-    # Merged labels: if two stops share a node, join their names
+    # Merge labels when two stops share a node.
     labels: dict[int, str] = {
         node_id: " & ".join(lbls)
         for node_id, lbls in node_label_map.items()
@@ -580,14 +520,14 @@ def run_optimization(depot, stops, city, radius, tsp_method):
             f"specific street addresses, or increase the network radius."
         )
 
-    # ── Step 3: Build mode graphs ─────────────────────────────────────────────
+    # Step 3: build mode graphs
     status("Building travel-time graphs (drive / bike / walk)…")
     mode_graphs = cached_mode_graphs_at(depot.lat, depot.lon, radius)
     status("Mode graphs ready", done=True)
 
-    # ── Step 3b: Hybrid last-meter — dual-node mapping for car ─────────────────
-    # N_ped = current node_id (nearest in full graph). N_car = nearest car-accessible.
-    # d = distance(N_ped, N_car). If d > 100 m → car unreachable; else use N_car + walk time.
+    # Step 3b: hybrid last-meter. N_car is the nearest car-accessible node to
+    # the stop; if it is more than 100 m away the car cannot reach the stop,
+    # otherwise the gap is added as walking time.
     G_drive = mode_graphs["drive"]
     walk_speed_ms = SPEED_KMH["walk"] * 1_000.0 / 3_600.0
     car_unreachable_notes: list[str] = []
@@ -616,12 +556,12 @@ def run_optimization(depot, stops, city, radius, tsp_method):
     for (n_car, _wt, stop, _lbl) in car_reachable:
         node_to_stops_drive.setdefault(n_car, []).append(stop)
 
-    # ── Step 4: Distance matrix + TSP per mode ─────────────────────────────────
+    # Step 4: distance matrix + TSP per mode
     results: dict[str, ModeResult] = {}
 
     for mode, G_mode in mode_graphs.items():
         if mode == "drive":
-            # Hybrid last-meter: only car-reachable stops; cost = drive to N_car + walk d.
+            # Hybrid last-meter: only car-reachable stops; cost = drive + walk.
             if len(car_reachable) < 1:
                 status("[drive] No car-reachable stops (all beyond 100 m) — skipping TSP")
                 results["drive"] = ModeResult(
@@ -697,7 +637,7 @@ def run_optimization(depot, stops, city, radius, tsp_method):
                     labels_drive_list[j],
                     dist, t, cum,
                 ))
-            # Route indices: 0 = depot, 1..n_drive-1 = stops; car_reachable[k] = (k+1)-th stop
+            # Index 0 is the depot; index i maps to car_reachable[i-1].
             stop_visit_order_d = [
                 car_reachable[i - 1][2] for i in tsp_route_indices[1:-1]
             ]
@@ -767,7 +707,7 @@ def run_vrp_optimization(depot, stops, fleet, radius, tsp_method):
             unsafe_allow_html=True,
         )
 
-    # ── Step 1: OSM network ───────────────────────────────────────────────────
+    # Step 1: OSM network
     status("Downloading OSM network…")
     G_raw = cached_network_at(depot.lat, depot.lon, radius)
     summary = graph_summary(G_raw)
@@ -776,7 +716,7 @@ def run_vrp_optimization(depot, stops, fleet, radius, tsp_method):
         done=True,
     )
 
-    # ── Step 2: Snap addresses to road nodes ─────────────────────────────────
+    # Step 2: snap addresses to road nodes
     status("Snapping addresses to road nodes…")
 
     def _snap(obj, label: str) -> None:
@@ -810,12 +750,12 @@ def run_vrp_optimization(depot, stops, fleet, radius, tsp_method):
 
     status(f"Snapped {len(valid_stops)} stop(s)", done=True)
 
-    # ── Step 3: Modal graphs ──────────────────────────────────────────────────
+    # Step 3: modal graphs
     status("Building modal travel-time graphs…")
     mode_graphs = cached_mode_graphs_at(depot.lat, depot.lon, radius)
     status("Modal graphs ready", done=True)
 
-    # ── Step 4: Total fleet weight capacity check ────────────────────────────
+    # Step 4: total fleet weight capacity check
     total_cap_kg = sum(v.capacity_kg for v in fleet)
     total_weight_kg = sum(s.weight_kg for s in valid_stops)
     if total_cap_kg < total_weight_kg:
@@ -825,14 +765,14 @@ def run_vrp_optimization(depot, stops, fleet, radius, tsp_method):
             f"Increase vehicle capacities or add more vehicles."
         )
 
-    # ── Step 5: Solve VRP ─────────────────────────────────────────────────────
+    # Step 5: solve VRP
     status(f"Running VRP for {len(fleet)} vehicle(s), {len(valid_stops)} stop(s)…")
     vrp_routes, vrp_warnings = solve_vrp(
         valid_stops, depot, fleet, mode_graphs, tsp_method
     )
     warnings_out.extend(vrp_warnings)
 
-    # ── Step 6: Build leg info for each vehicle route ────────────────────────
+    # Step 6: build leg info for each vehicle route
     for vr in vrp_routes:
         G = mode_graphs[vr.vehicle.mode]
         label_map = {depot.node_id: "Depot"}
@@ -862,9 +802,7 @@ def run_vrp_optimization(depot, stops, fleet, radius, tsp_method):
     return vrp_routes, mode_graphs, warnings_out
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  MAP BUILDERS
-# ══════════════════════════════════════════════════════════════════════════════
+# Map builders
 
 MODE_META = {
     "drive": {"icon": "🚗", "colour": "#e74c3c", "label": "Car"},
@@ -1044,9 +982,7 @@ def build_vrp_result_map(mode_graphs, vrp_routes, depot) -> folium.Map:
     return fmap
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  HELPERS
-# ══════════════════════════════════════════════════════════════════════════════
+# Helpers
 
 def hms(s: float) -> str:
     if not math.isfinite(s): return "N/A"
@@ -1092,9 +1028,7 @@ def render_stop_table(result: ModeResult) -> str:
             f'</tr></thead><tbody>{rows}</tbody></table>')
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  SIDEBAR
-# ══════════════════════════════════════════════════════════════════════════════
+# Sidebar
 
 with st.sidebar:
     st.markdown("""
@@ -1105,7 +1039,7 @@ with st.sidebar:
     <hr style="border-color:#161d2e;margin:6px 0 14px">
     """, unsafe_allow_html=True)
 
-    # ── City lock ─────────────────────────────────────────────────────────────
+    # City lock
     st.markdown('<div style="font-size:.61rem;font-weight:700;letter-spacing:1.2px;color:#475569;text-transform:uppercase;margin-bottom:5px">🌆 City Lock</div>', unsafe_allow_html=True)
     city_opts = list(CITY_CENTRES.keys()) + ["Custom…"]
     sel_city = st.selectbox("city_sel", city_opts,
@@ -1125,7 +1059,7 @@ with st.sidebar:
 
     city = st.session_state.city
 
-    # ── Network settings ──────────────────────────────────────────────────────
+    # Network settings
     st.markdown('<div style="font-size:.61rem;font-weight:700;letter-spacing:1.2px;color:#475569;text-transform:uppercase;margin:12px 0 5px">⚙️ Settings</div>', unsafe_allow_html=True)
     radius = st.slider("Radius (m)", 2000, 8000, 4000, 500)
     tsp_method = st.selectbox("TSP solver",
@@ -1133,7 +1067,7 @@ with st.sidebar:
 
     st.markdown('<hr style="border-color:#161d2e;margin:14px 0">', unsafe_allow_html=True)
 
-    # ── Depot ─────────────────────────────────────────────────────────────────
+    # Depot
     st.markdown('<div style="font-size:.61rem;font-weight:700;letter-spacing:1.2px;color:#475569;text-transform:uppercase;margin-bottom:5px">🏢 Depot Address</div>', unsafe_allow_html=True)
     dc1, dc2 = st.columns([4, 1])
     with dc1:
@@ -1171,7 +1105,7 @@ with st.sidebar:
 
     st.markdown('<hr style="border-color:#161d2e;margin:12px 0">', unsafe_allow_html=True)
 
-    # ── Add stop by typing ────────────────────────────────────────────────────
+    # Add stop by typing
     st.markdown('<div style="font-size:.61rem;font-weight:700;letter-spacing:1.2px;color:#475569;text-transform:uppercase;margin-bottom:5px">📍 Add Delivery Stop</div>', unsafe_allow_html=True)
     sc1, sc2 = st.columns([4, 1])
     with sc1:
@@ -1191,7 +1125,7 @@ with st.sidebar:
         else:
             st.error(f"Not found in {city}")
 
-    # ── Click-to-add toggle ───────────────────────────────────────────────────
+    # Click-to-add toggle
     click_label = "🖱 Disable Map Click" if st.session_state.click_mode else "🖱 Enable Map Click"
     if st.button(click_label, key="click_tog", use_container_width=True):
         st.session_state.click_mode = not st.session_state.click_mode
@@ -1207,7 +1141,7 @@ with st.sidebar:
 
     st.markdown('<hr style="border-color:#161d2e;margin:12px 0">', unsafe_allow_html=True)
 
-    # ── Selected deliveries list ──────────────────────────────────────────────
+    # Selected deliveries list
     n_stops = len(st.session_state.stops)
     st.markdown(
         f'<div style="font-size:.61rem;font-weight:700;letter-spacing:1.2px;'
@@ -1238,7 +1172,7 @@ with st.sidebar:
 
     st.markdown('<hr style="border-color:#161d2e;margin:12px 0">', unsafe_allow_html=True)
 
-    # ── Run button ────────────────────────────────────────────────────────────
+    # Run button
     can_run = st.session_state.depot is not None and len(st.session_state.stops) >= 1
     run_btn = st.button(
         "🚀  Optimize Routes",
@@ -1255,9 +1189,7 @@ with st.sidebar:
     </div>""", unsafe_allow_html=True)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  MAIN CONTENT
-# ══════════════════════════════════════════════════════════════════════════════
+# Main content
 
 city  = st.session_state.city
 depot = st.session_state.depot
@@ -1276,13 +1208,11 @@ st.markdown(f"""
 
 map_tab, fleet_tab, pkg_tab = st.tabs(["🗺️ Map & Optimize", "🚛 Fleet Settings", "📦 Packages"])
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  MAP & OPTIMIZE TAB
-# ══════════════════════════════════════════════════════════════════════════════
+# Map & optimize tab
 
 with map_tab:
 
-    # ── Coordinator map (shown when no results yet) ───────────────────────────
+    # Coordinator map (shown when no results yet)
     no_results = (
         st.session_state.opt_results is None
         and st.session_state.opt_vrp_results is None
@@ -1335,7 +1265,7 @@ with map_tab:
                     st.session_state.opt_vrp_results = None
                     st.rerun()
 
-    # ── Run optimisation ──────────────────────────────────────────────────────
+    # Run optimisation
     if run_btn and can_run:
         st.markdown('<div class="sec-head">⏳ Running Optimization</div>', unsafe_allow_html=True)
         if len(st.session_state.fleet) >= 2:
@@ -1370,7 +1300,7 @@ with map_tab:
                 st.error(f"Optimization failed: {e}")
                 st.exception(e)
 
-    # ── Single-vehicle results dashboard ─────────────────────────────────────
+    # Single-vehicle results dashboard
     if st.session_state.opt_results is not None:
         results     = st.session_state.opt_results
         mode_graphs = st.session_state.opt_graphs
@@ -1446,7 +1376,7 @@ with map_tab:
                 )
                 st.rerun()
 
-    # ── VRP results dashboard ─────────────────────────────────────────────────
+    # VRP results dashboard
     elif st.session_state.opt_vrp_results is not None:
         vrp_routes  = st.session_state.opt_vrp_results
         mode_graphs = st.session_state.opt_graphs
@@ -1524,9 +1454,7 @@ with map_tab:
                 )
                 st.rerun()
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  FLEET SETTINGS TAB
-# ══════════════════════════════════════════════════════════════════════════════
+# Fleet settings tab
 
 with fleet_tab:
     st.markdown('<div class="sec-head">🚛 Fleet Configuration</div>', unsafe_allow_html=True)
@@ -1618,14 +1546,12 @@ with fleet_tab:
         st.markdown("\n".join(rows), unsafe_allow_html=True)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  PACKAGES TAB
-# ══════════════════════════════════════════════════════════════════════════════
+# Packages tab
 
 with pkg_tab:
     st.markdown('<div class="sec-head">📦 Package Manager</div>', unsafe_allow_html=True)
 
-    # ── Summary counters ──────────────────────────────────────────────────────
+    # Summary counters
     counts = _pkg_db.count_by_status()
     pc1, pc2, pc3 = st.columns(3)
     pc1.metric("⏳ Pending",    counts[DeliveryStatus.PENDING])
@@ -1634,7 +1560,7 @@ with pkg_tab:
 
     st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
 
-    # ── Add new package form ──────────────────────────────────────────────────
+    # Add new package form
     with st.expander("➕ Add New Package", expanded=True):
         with st.form("add_package_form", clear_on_submit=True):
             fa1, fa2 = st.columns([3, 1])
@@ -1683,7 +1609,7 @@ with pkg_tab:
 
     st.markdown('<div style="height:4px"></div>', unsafe_allow_html=True)
 
-    # ── Filter controls ───────────────────────────────────────────────────────
+    # Filter controls
     st.markdown("**Filter by status:**")
     _status_labels = {
         "All":         None,
@@ -1699,7 +1625,7 @@ with pkg_tab:
     )
     selected_status = _status_labels[filter_choice]
 
-    # ── Package list ──────────────────────────────────────────────────────────
+    # Package list
     packages = (
         _pkg_db.get_all()
         if selected_status is None

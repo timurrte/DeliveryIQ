@@ -1,13 +1,5 @@
 """
-app.py — DeliveryIQ · Route Optimizer v3.0
-==========================================
-New in v3:
-  • City-locked address search  — every geocode is scoped to one city
-  • Click-to-Add on the map     — reverse geocodes click coords to an address
-  • Live 'Selected Deliveries' list with per-item remove buttons
-  • Green depot / red numbered client markers
-  • Full multi-modal AntPath route rendering after optimisation
-
+app.py — DeliveryIQ
 Run:  streamlit run app.py
 """
 

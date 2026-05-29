@@ -1,55 +1,20 @@
 """
-vrp_solver.py — CVRPTW solver for DeliveryIQ (Genetic Algorithm)
-==============================================================================
-Solves the Capacitated Vehicle Routing Problem with Time Windows (CVRPTW)
-via a genetic algorithm, as described in the thesis
-"Розробка та програмна реалізація алгоритму оптимізації розподілу вантажів
-у транспортній мережі".
+CVRPTW solver (genetic algorithm).
 
-Algorithm overview
-------------------
-Phase 1 — Mode assignment (per stop):
-  For every stop, compute which vehicle modes can reach it via the road
-  network (Dijkstra with travel_time weight, PENALTY sentinel for
-  impassable edges).  Assign each stop to the vehicle-type pool that has
-  the most remaining capacity among compatible modes.
+Phase 1 assigns each stop to a vehicle-mode pool: it finds the modes that can
+reach the stop (Dijkstra, travel_time weight, PENALTY for impassable edges)
+and picks the pool with the most remaining capacity.
 
-Phase 2 — Genetic algorithm (per mode):
-  Within each mode's stop pool, a steady-state GA searches for a good
-  assignment + ordering:
-    * Chromosome: a permutation of customer indices (giant tour, no
-      route-boundary markers).
-    * Decoder (Split): walks the permutation and greedily partitions
-      it into capacity- and time-window-feasible sub-sequences,
-      dispatching each to the next available vehicle from the fleet.
-    * Fitness (minimised):   F = A·T_total + B·K + P·|U|
-      where K is the number of active vehicles and U is the set of
-      unrouted customers (P >> A, B discourages infeasibility).
-    * Operators: tournament selection, Order Crossover (OX), swap
-      mutation, elitism.
-    * Initialisation: one greedy nearest-neighbour chromosome plus
-      random permutations — this seeds the population with a
-      reasonable warm start while preserving diversity.
+Phase 2 runs a GA per mode. The chromosome is a permutation of customer
+indices; a Split decoder greedily partitions it into capacity- and
+time-window-feasible routes, one per available vehicle. Fitness (minimised) is
+F = A*T_total + B*K + P*|U|, where K is active vehicles and U is unrouted
+customers. Operators: tournament selection, Order Crossover, swap mutation,
+elitism. The population is seeded with one nearest-neighbour chromosome plus
+random permutations.
 
-Key design decisions
---------------------
-* Round-trip routing: every vehicle starts AND ends at the depot.
-* PENALTY sentinel (1e9): same value as route_solver.py.
-* Permutation encoding is universally feasible (decode enforces
-  all constraints), so operators never produce malformed offspring.
-* Elitism preserves the top E chromosomes each generation,
-  guaranteeing the best-so-far fitness is non-increasing.
-* Deterministic by default (GA_SEED = 42) so repeated runs reproduce
-  the same routes — important for debugging and for consistent UI.
-
-References
-----------
-Holland, J. H. (1975). Adaptation in Natural and Artificial Systems.
-Prins, C. (2004). A simple and effective evolutionary algorithm for the
-  vehicle routing problem. Computers & Operations Research, 31(12),
-  1985–2002.
-Oliver, I. M., Smith, D. J., Holland, J. R. C. (1987). A study of
-  permutation crossover operators on the TSP. Proc. ICGA '87.
+Every vehicle starts and ends at the depot. PENALTY (1e9) matches
+route_solver.py. GA_SEED defaults to 42 for reproducible runs.
 """
 
 from __future__ import annotations
@@ -77,7 +42,7 @@ VEHICLE_COLORS: list[str] = [
     "#66c2a5", "#fc8d62",
 ]
 
-# ── Genetic-algorithm default parameters (§2.7 of thesis) ───────────────────
+# Genetic-algorithm default parameters
 POP_SIZE: int = 50
 N_GENERATIONS: int = 150
 CROSSOVER_RATE: float = 0.85
@@ -87,20 +52,18 @@ TOURNAMENT_SIZE: int = 3
 UNROUTED_PENALTY: float = 1.0e6   # fitness penalty per unrouted customer
 GA_SEED: int | None = 42          # None => non-deterministic runs
 
-# Objective-function weights: F = A·T_total + B·|V_act|
+# Objective-function weights: F = A*T_total + B*K
 OBJ_A: float = 1.0
 OBJ_B: float = 0.0
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  DATA CLASSES
-# ══════════════════════════════════════════════════════════════════════════════
+# Data classes
 
 @dataclass
 class Vehicle:
     name: str
     mode: str           # "drive" | "bike" | "walk"
-    capacity_kg: float  # maximum payload weight Q_θ (kg)
+    capacity_kg: float  # maximum payload weight (kg)
     color: str = ""
 
 
@@ -116,9 +79,7 @@ class VehicleRoute:
     skipped_stops: list = field(default_factory=list)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  GENETIC ALGORITHM — DECODER (Split)
-# ══════════════════════════════════════════════════════════════════════════════
+# Genetic algorithm — Split decoder
 
 def _decode_chromosome(
     chromosome: list[int],
@@ -130,19 +91,14 @@ def _decode_chromosome(
     stop_nodes: dict,
 ) -> tuple[list[tuple[Vehicle, list[int]]], list[int]]:
     """
-    Split decoder — converts a permutation into a list of feasible vehicle
-    routes.
+    Split decoder: convert a permutation into feasible vehicle routes.
 
-    Walks through the chromosome in order, adding each customer to the
-    current vehicle's route as long as capacity and time-window
-    constraints remain satisfied.  When an insertion would violate a
-    constraint, the current route is closed and the customer is tried on
-    the next vehicle in the fleet.
+    Walks the chromosome in order, adding each customer to the current
+    vehicle's route while capacity and time windows hold. On a violation, the
+    route is closed and the customer is tried on the next vehicle.
 
-    Returns
-    -------
-    routes     : list of (Vehicle, [customer_indices]) for routes with ≥1 stop
-    unassigned : list of customer indices that fit no vehicle
+    Returns (routes, unassigned), where routes is a list of
+    (Vehicle, [customer_indices]) and unassigned lists customers that fit none.
     """
     def t(i: int, j: int) -> float:
         ni = depot_node if i == -1 else stop_nodes[i]
@@ -241,7 +197,7 @@ def _evaluate(
     stop_nodes: dict,
 ) -> tuple[float, list[tuple[Vehicle, list[int]]], list[int]]:
     """
-    Compute fitness F = A·T_total + B·K + P·|U|  (lower is better).
+    Fitness F = A*T_total + B*K + P*|U| (lower is better).
 
     Returns (fitness, routes, unassigned).
     """
@@ -257,9 +213,7 @@ def _evaluate(
     return fitness, routes, unassigned
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  GENETIC OPERATORS
-# ══════════════════════════════════════════════════════════════════════════════
+# Genetic operators
 
 def _order_crossover(
     p1: list[int],
@@ -337,9 +291,7 @@ def _nearest_neighbour_seed(
     return chromo
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  MAIN GA LOOP
-# ══════════════════════════════════════════════════════════════════════════════
+# Main GA loop
 
 def _genetic_algorithm(
     stops: list,
@@ -358,23 +310,10 @@ def _genetic_algorithm(
     seed: int | None = GA_SEED,
 ) -> list[tuple[Vehicle, list[int]]]:
     """
-    Genetic algorithm for CVRPTW.
+    Genetic algorithm for CVRPTW. stop_nodes maps each customer index to its
+    OSM node id; seed=None gives non-deterministic runs.
 
-    Parameters
-    ----------
-    stops       : list[DeliveryStop] — unrouted customers
-    vehicles    : list[Vehicle]      — available fleet for this mode
-    depot       : DeliveryStop       — depot (tw_open/close, service_time)
-    matrix      : dict[(node_i, node_j) -> float] travel-time matrix
-    depot_node  : OSM node id of the depot
-    stop_nodes  : dict[customer_index -> OSM node id]
-    pop_size, n_generations, crossover_rate, mutation_rate,
-    elite_size, tournament_size : GA control parameters.
-    seed        : RNG seed for reproducibility (None = non-deterministic).
-
-    Returns
-    -------
-    list of (Vehicle, [customer_indices_in_visit_order])
+    Returns a list of (Vehicle, [customer_indices_in_visit_order]).
     """
     n = len(stops)
     if n == 0:
@@ -382,7 +321,7 @@ def _genetic_algorithm(
 
     rng = random.Random(seed)
 
-    # ── Initial population: 1 NN seed + random permutations ──────────────
+    # Initial population: 1 NN seed + random permutations
     population: list[list[int]] = []
     nn_chromo = _nearest_neighbour_seed(n, matrix, depot_node, stop_nodes)
     if nn_chromo:
@@ -402,7 +341,7 @@ def _genetic_algorithm(
     best_fitness = fitnesses[best_idx]
     best_eval = evaluations[best_idx]
 
-    # ── Evolutionary loop ───────────────────────────────────────────────
+    # Evolutionary loop
     for _ in range(n_generations):
         order = sorted(range(pop_size), key=lambda i: fitnesses[i])
         new_population: list[list[int]] = [
@@ -445,9 +384,7 @@ def _genetic_algorithm(
     return best_routes
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  INTERNAL HELPERS
-# ══════════════════════════════════════════════════════════════════════════════
+# Internal helpers
 
 def _bearing(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Compass bearing in degrees (0-360) from point 1 to point 2."""
@@ -461,10 +398,8 @@ def _bearing(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 def _check_reachable(stop, depot, graphs: dict) -> set:
     """
-    Return the set of mode names that can reach *stop* from *depot*.
-
-    A mode is considered reachable when the Dijkstra shortest-path cost
-    (travel_time weight) is strictly below PENALTY.
+    Modes that can reach stop from depot — i.e. the Dijkstra travel_time cost
+    is below PENALTY.
     """
     if stop.node_id is None or stop.node_id == depot.node_id:
         return set()
@@ -497,15 +432,10 @@ def _assign_stops_to_modes(
     graphs: dict,
 ) -> tuple[dict, list]:
     """
-    Phase 1 — assign each stop to a vehicle-type pool.
+    Phase 1: assign each stop to a vehicle-mode pool. When several modes fit,
+    pick the one whose vehicles have the most remaining capacity.
 
-    For stops compatible with multiple fleet modes, the mode whose vehicles
-    have the most remaining total capacity is chosen.
-
-    Returns
-    -------
-    mode_stop_pool : dict[mode -> list[stop]]
-    unreachable    : list[stop]
+    Returns (mode_stop_pool, unreachable).
     """
     mode_remaining_kg: dict[str, float] = {}
     for v in fleet:
@@ -605,25 +535,19 @@ def _build_ga_routes(
     return results
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  OBJECTIVE FUNCTION (§1.4 of thesis)
-# ══════════════════════════════════════════════════════════════════════════════
+# Objective function
 
 def compute_objective(routes: list[VehicleRoute], A: float = OBJ_A, B: float = OBJ_B) -> float:
     """
-    Objective function value:
-        F = A · Σ T_total + B · K
-    where T_total is the total travel time across all routes and K is the
-    number of active vehicles.
+    Objective value F = A*sum(T_total) + B*K, where T_total is total travel
+    time across all routes and K is the number of active vehicles.
     """
     T_total = sum(vr.total_time_s for vr in routes)
     K = len(routes)
     return A * T_total + B * K
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  PUBLIC API
-# ══════════════════════════════════════════════════════════════════════════════
+# Public API
 
 def solve_vrp(
     stops: list,
@@ -635,19 +559,11 @@ def solve_vrp(
     """
     Solve a Capacitated VRP with Time Windows using a genetic algorithm.
 
-    Parameters
-    ----------
-    stops      : list[DeliveryStop]        — all delivery stops (node_id set)
-    depot      : DeliveryStop              — start/end point (node_id set)
-    fleet      : list[Vehicle]             — vehicles with mode and capacity
-    graphs     : dict[str, MultiDiGraph]   — {"drive": G, "bike": G, "walk": G}
-    tsp_method : str                       — kept for API compatibility (unused by GA)
+    stops and depot must already have node_id set; graphs is the per-mode
+    travel-time graph dict. tsp_method is kept for API compatibility (unused).
 
-    Returns
-    -------
-    (routes, warnings)
-    routes   : list[VehicleRoute]  — one entry per active vehicle
-    warnings : list[str]           — user-facing warning messages
+    Returns (routes, warnings): one VehicleRoute per active vehicle, plus
+    user-facing warning messages.
     """
     if not fleet:
         raise ValueError("Fleet is empty. Add at least one vehicle.")
@@ -658,7 +574,7 @@ def solve_vrp(
 
     warnings: list[str] = []
 
-    # ── Phase 1: assign each stop to a vehicle-type pool ────────────────
+    # Phase 1: assign each stop to a vehicle-type pool
     mode_stop_pool, unreachable = _assign_stops_to_modes(stops, fleet, depot, graphs)
 
     if unreachable:
@@ -672,7 +588,7 @@ def solve_vrp(
             len(unreachable), [s.address[:40] for s in unreachable],
         )
 
-    # ── Phase 2: GA per mode ────────────────────────────────────────────
+    # Phase 2: GA per mode
     mode_to_vehicles: dict[str, list] = {}
     for v in fleet:
         mode_to_vehicles.setdefault(v.mode, []).append(v)

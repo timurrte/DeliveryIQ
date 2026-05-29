@@ -1,7 +1,4 @@
-"""
-visualizer.py
-Renders an interactive Folium map for all three travel modes.
-"""
+"""Renders an interactive Folium map for all three travel modes."""
 from __future__ import annotations
 import logging, math
 from pathlib import Path

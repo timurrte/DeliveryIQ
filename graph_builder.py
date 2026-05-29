@@ -1,31 +1,13 @@
 """
-graph_builder.py
-----------------
-OSM street-network download and pre-processing for DeliveryIQ.
+OSM street-network download and pre-processing. Requires OSMnx >= 2.1.
 
-Requires OSMnx >= 2.1.
+Each edge in the 'all' graph carries OSM tags describing which modes may use
+it: highway (road/path type), access, motor_vehicle, bicycle, foot, oneway,
+oneway:bicycle, cycleway, and OSMnx's synthetic `reversed` flag.
 
-Modal routing tag model
-────────────────────────
-Every edge in the 'all' graph carries OSM tags that describe which
-transport modes may legally and physically use it.  The key tags are:
-
-  highway         — road/path type; the primary modal discriminator
-  access          — generic access restriction (inherits to all modes)
-  motor_vehicle   — car/motorcycle access override
-  bicycle         — cycling access override
-  foot            — pedestrian access override
-  oneway          — one-directional restriction (cars)
-  oneway:bicycle  — one-directional override for bikes (no = contra-flow OK)
-  cycleway        — cycling facility type; "opposite*" = contra-flow allowed
-  reversed        — OSMnx synthetic flag on edges added to model non-oneway
-                    travel in the reverse direction for non-car modes
-
-The impassable sentinel (PENALTY = 1e9 s) is used instead of 999 999 s
-because route_solver.py's audit_reachability() flags pairs whose matrix
-cost is >= PENALTY.  Using a smaller value like 999 999 would silently
-allow multi-hop paths through "impassable" edges without triggering any
-warning.  1e9 s ~= 31 years - Dijkstra will always prefer any real detour.
+PENALTY (1e9 s) marks impassable edges. It matches route_solver.PENALTY so
+audit_reachability() flags any pair with cost >= PENALTY. A smaller sentinel
+would let Dijkstra route through "impassable" edges without warning.
 """
 
 from __future__ import annotations
@@ -41,19 +23,18 @@ logger = logging.getLogger(__name__)
 logger.info("graph_builder loaded — OSMnx version: %s", ox.__version__)
 
 
-# ── Mode speeds (km/h) ────────────────────────────────────────────────────────
+# Mode speeds (km/h)
 SPEED_KMH: dict[str, float] = {
     "drive": 30.0,
     "bike":  15.0,
     "walk":   5.0,
 }
 
-# Sentinel for impassable edges AND unreachable matrix pairs.
-# Must match route_solver.PENALTY so audit_reachability() triggers correctly.
+# Impassable edges and unreachable pairs. Must match route_solver.PENALTY.
 PENALTY: float = 1e9
 
 
-# ── OSM tags we must retain on every edge ────────────────────────────────────
+# OSM tags to retain on every edge
 _REQUIRED_TAGS: list[str] = [
     "access",
     "highway",
@@ -77,15 +58,10 @@ _REQUIRED_TAGS: list[str] = [
 ]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  PRIVATE HELPERS  — OSM tag reading
-# ══════════════════════════════════════════════════════════════════════════════
+# --- OSM tag reading ---
 
 def _osm_tag(data: dict, key: str, default: str = "") -> str:
-    """
-    Read one OSM tag value from an edge data dict, returning a normalised
-    lowercase string.  For list values, returns the first non-empty element.
-    """
+    """Read one OSM tag as a normalised lowercase string (first item if a list)."""
     val = data.get(key, default)
     if val is None or val == "":
         return default
@@ -110,10 +86,7 @@ def _osm_tag_in(data: dict, key: str, values: frozenset) -> bool:
 
 
 def _bike_contraflow_allowed(data: dict) -> bool:
-    """
-    True if a bicycle is explicitly permitted to travel AGAINST a one-way
-    car restriction on this edge.
-    """
+    """True if a bicycle may travel against a one-way car restriction here."""
     _OPPOSITE = frozenset({"opposite", "opposite_lane", "opposite_track"})
     return (
         _osm_tag(data, "oneway:bicycle")  == "no"       or
@@ -126,9 +99,7 @@ def _bike_contraflow_allowed(data: dict) -> bool:
     )
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  PRIVATE HELPERS  — per-mode travel time
-# ══════════════════════════════════════════════════════════════════════════════
+# --- Per-mode travel time ---
 
 _DRIVE_BLOCKED_HW: frozenset = frozenset({
     "footway", "path", "pedestrian", "steps", "corridor", "elevator", "escalator", "bridleway",
@@ -141,10 +112,7 @@ _STEPS_WALK_MULTIPLIER: float = 0.5
 
 
 def _compute_travel_time(data: dict, mode: str, speed_ms: float) -> float:
-    """
-    Return the travel time in seconds for ONE directed edge under *mode*.
-    Returns PENALTY (1e9 s) when the mode is legally or physically blocked.
-    """
+    """Travel time (s) for one directed edge under mode; PENALTY if blocked."""
     raw_len  = data.get("length", None)
     length_m = max(float(raw_len) if raw_len is not None else 1.0, 1.0)
 
@@ -190,15 +158,10 @@ def _compute_travel_time(data: dict, mode: str, speed_ms: float) -> float:
     raise ValueError(f"Unknown mode {mode!r}. Expected one of: 'drive', 'bike', 'walk'.")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  PRIVATE HELPERS  — OSMnx 2.x wrappers
-# ══════════════════════════════════════════════════════════════════════════════
+# --- OSMnx 2.x wrappers ---
 
 def _configure_osmnx_tags() -> None:
-    """
-    Tell OSMnx to retain all tags the modal filter needs.
-    Must be called before any ox.graph_from_* download.
-    """
+    """Retain the tags the modal filter needs. Call before any ox.graph_from_*."""
     current: list[str] = list(ox.settings.useful_tags_way or [])
     merged = list(dict.fromkeys(current + _REQUIRED_TAGS))
     ox.settings.useful_tags_way = merged
@@ -230,27 +193,15 @@ def _largest_strongly_connected_component(G: nx.MultiDiGraph) -> nx.MultiDiGraph
     return G_lscc
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  PUBLIC API
-# ══════════════════════════════════════════════════════════════════════════════
+# --- Public API ---
 
 def get_network_from_point(lat: float, lon: float, dist: int = 3_000) -> nx.MultiDiGraph:
     """
     Download an OSM 'all' network centred on (lat, lon) and return its LSCC.
 
-    Use this in preference to get_network() when you have explicit coordinates
-    (e.g. a geocoded depot address), so the download area is guaranteed to be
-    centred on the actual location rather than wherever Nominatim places a
-    city-name label.
-
-    Parameters
-    ----------
-    lat, lon : float  WGS-84 coordinates of the centre point.
-    dist     : int    Download radius in metres (default 3 000).
-
-    Returns
-    -------
-    nx.MultiDiGraph  — LSCC-pruned, ready for add_travel_times().
+    Prefer this over get_network() when you have explicit coordinates, so the
+    download is centred on the actual location rather than a Nominatim label.
+    dist is the download radius in metres.
     """
     _configure_osmnx_tags()
     logger.info(
@@ -284,17 +235,9 @@ def get_network_from_point(lat: float, lon: float, dist: int = 3_000) -> nx.Mult
 
 def get_network(location: str, dist: int = 3_000) -> nx.MultiDiGraph:
     """
-    Download an OSM 'all' network centred on *location* and return ONLY
-    its Largest Strongly Connected Component (LSCC).
+    Download an OSM 'all' network centred on location and return its LSCC.
 
-    Parameters
-    ----------
-    location : str   Nominatim-compatible address or place name.
-    dist     : int   Download radius in metres (default 3 000).
-
-    Returns
-    -------
-    nx.MultiDiGraph  — LSCC-pruned, ready for add_travel_times().
+    location is a Nominatim-compatible address; dist is the radius in metres.
     """
     _configure_osmnx_tags()
     logger.info("get_network: downloading OSM 'all' graph — location='%s', dist=%d m", location, dist)
@@ -329,16 +272,9 @@ def get_network_from_place(
     which_result: Optional[int] = None,
 ) -> nx.MultiDiGraph:
     """
-    Download an OSM 'all' network for a named *place* and return its LSCC.
+    Download an OSM 'all' network for a named place and return its LSCC.
 
-    Parameters
-    ----------
-    place         : str   Nominatim query string (place name, city, region).
-    which_result  : int, optional  Which Nominatim result to use (1-based).
-
-    Returns
-    -------
-    nx.MultiDiGraph  — LSCC-pruned, ready for add_travel_times().
+    which_result picks which Nominatim result to use (1-based).
     """
     _configure_osmnx_tags()
     logger.info("get_network_from_place: downloading OSM 'all' graph — place='%s'", place)
@@ -371,12 +307,8 @@ def get_network_from_place(
 
 def add_travel_times(G: nx.MultiDiGraph) -> dict[str, nx.MultiDiGraph]:
     """
-    Build three independent mode-specific copies of *G* and stamp every edge
-    with a ``travel_time`` attribute (seconds) encoding modal accessibility.
-
-    Returns
-    -------
-    dict[str, nx.MultiDiGraph]   keys: "drive", "bike", "walk"
+    Build three mode-specific copies of G, each edge stamped with a
+    travel_time attribute (seconds). Returns {"drive", "bike", "walk"}.
     """
     mode_graphs: dict[str, nx.MultiDiGraph] = {}
 
@@ -421,8 +353,7 @@ def add_travel_times(G: nx.MultiDiGraph) -> dict[str, nx.MultiDiGraph]:
 
 def add_travel_times_to_single_graph(G: nx.MultiDiGraph) -> nx.MultiDiGraph:
     """
-    Add three mode-specific travel-time attributes to every edge of *G*
-    (travel_time_drive, travel_time_bike, travel_time_walk).
+    Add travel_time_drive/bike/walk attributes to every edge of G.
     """
     H = G.copy()
     speed_ms = {
@@ -495,10 +426,7 @@ def nearest_car_accessible_node(
     weight: str = "travel_time",
     penalty: float = PENALTY,
 ) -> int:
-    """
-    Return the nearest node to (lat, lon) that is car-accessible (has at least
-    one incident edge with travel_time < penalty).
-    """
+    """Nearest car-accessible node to (lat, lon) (incident edge < penalty)."""
     nn = ox.nearest_nodes(G_drive, X=lon, Y=lat)
     if _node_car_accessible(G_drive, nn, weight=weight, penalty=penalty):
         return nn
@@ -545,10 +473,10 @@ def nearest_node_safe(
     tolerance_m: float = 500.0,
 ) -> int:
     """
-    Bounding-box-validated node snapping for map-click coordinates.
+    Bbox-validated node snapping for map-click coordinates.
 
     Raises ValueError if (lat, lon) is more than tolerance_m outside the
-    graph bbox, so the Streamlit UI can show a clear warning.
+    graph bbox, so the UI can show a clear warning.
     """
     node_lats = [d["y"] for _, d in G.nodes(data=True)]
     node_lons = [d["x"] for _, d in G.nodes(data=True)]

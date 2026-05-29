@@ -1,39 +1,16 @@
 """
-route_solver.py
----------------
 TSP solver for the DeliveryIQ route optimizer.
 
-Key fixes vs v2
-───────────────
-1. Robust distance matrix (the 0.0 s bug)
-   The old code used `single_source_dijkstra_path_length` which returns
-   a *generator-backed dict* — accessing a missing key silently returned
-   `math.inf`, but the real problem was that the raw graph contained
-   weakly-connected nodes whose 'travel_time' was never set (= 0).
-   The new `build_distance_matrix` uses `nx.shortest_path_length` with
-   an explicit per-pair try/except so a genuinely missing path always
-   inserts PENALTY (1e9 s) rather than 0.0.
-
-2. Unreachable-node reporting
-   `audit_reachability` inspects the finished matrix and returns a
-   structured list of {node_id, label, unreachable_from, unreachable_to}
-   objects.  The Streamlit UI renders these as named warnings
-   ("Stop #2 – Shevchenka St is unreachable") instead of a silent
-   0-cost route.
-
-3. Safe Christofides
-   The old fallback swallowed the exception and silently ran 2-opt on
-   whatever broken graph was passed in.  The new version:
-     a) Pre-checks that the TSP helper graph H is non-null and connected
-        before calling christofides().
-     b) If H has isolated nodes (from PENALTY edges that were excluded),
-        it logs them by name and falls back to 2-opt explicitly.
-     c) Never calls christofides on a graph with < 3 nodes.
-
-4. Auto-method selection now prefers 2-opt over Christofides by default
-   because Christofides requires a *complete* undirected graph — which
-   we cannot guarantee when some stops are truly unreachable.  2-opt
-   works fine with PENALTY weights.
+Notes:
+- build_distance_matrix uses nx.shortest_path_length per pair, inserting
+  PENALTY (1e9 s) for missing paths rather than a silent 0.0.
+- audit_reachability inspects the matrix and reports unreachable stops by
+  name instead of producing a silent 0-cost route.
+- _christofides_tsp pre-checks that the helper graph is connected and has
+  >= 3 nodes, falling back to 2-opt otherwise.
+- "auto" prefers 2-opt over Christofides for small instances: Christofides
+  needs a complete undirected graph, which fails when stops are unreachable;
+  2-opt handles PENALTY weights gracefully.
 """
 
 from __future__ import annotations
@@ -49,20 +26,18 @@ from networkx.algorithms.approximation import christofides
 
 logger = logging.getLogger(__name__)
 
-# Sentinel for unreachable pairs — large enough to dominate any real path
-# but finite so TSP solvers can still form a valid (if bad) tour.
+# Unreachable-pair sentinel: large enough to dominate any real path, but
+# finite so TSP solvers can still form a valid (if bad) tour.
 PENALTY: float = 1e9
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  REACHABILITY AUDIT
-# ══════════════════════════════════════════════════════════════════════════════
+# --- Reachability audit ---
 
 @dataclass
 class UnreachableStop:
-    """Describes one stop that could not be reached from / to some other stop."""
+    """One stop that could not be reached from / to some other stop."""
     node_id: int
-    label: str                        # "Depot", "Stop #2", …
+    label: str                        # "Depot", "Stop #2", ...
     unreachable_from: list[str] = field(default_factory=list)
     unreachable_to:   list[str] = field(default_factory=list)
 
@@ -86,20 +61,12 @@ def audit_reachability(
     labels: dict[int, str],
 ) -> list[UnreachableStop]:
     """
-    Scan the distance matrix for PENALTY-weight entries and return one
-    UnreachableStop per affected node.
+    Scan the matrix for PENALTY-weight entries and return one UnreachableStop
+    per affected node. Empty if every pair is reachable.
 
-    Parameters
-    ----------
-    matrix : distance matrix from build_distance_matrix()
-    nodes  : ordered list [depot_node, stop1_node, …]
-    labels : {node_id: "Depot" | "Stop #N"} mapping for human-readable output
-
-    Returns
-    -------
-    list[UnreachableStop]  — empty if every pair is reachable
+    nodes is the ordered list [depot_node, stop1_node, ...]; labels maps each
+    node_id to a human-readable name.
     """
-    # Build a per-node problem report
     report: dict[int, UnreachableStop] = {}
 
     for src in nodes:
@@ -135,9 +102,7 @@ def audit_reachability(
     return problems
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  DISTANCE MATRIX  (Phase 1)
-# ══════════════════════════════════════════════════════════════════════════════
+# --- Distance matrix ---
 
 def build_distance_matrix(
     G: nx.MultiDiGraph,
@@ -145,63 +110,22 @@ def build_distance_matrix(
     weight: str = "travel_time",
 ) -> dict[tuple[int, int], float]:
     """
-    Compute all-pairs shortest-path travel times (seconds) using Dijkstra.
+    All-pairs shortest-path travel times (seconds) via Dijkstra.
 
-    Input deduplication (defence-in-depth)
-    ───────────────────────────────────────
-    The function immediately deduplicates *nodes* using dict.fromkeys(),
-    which preserves insertion order (Python 3.7+) so the depot stays at
-    index 0.  This is a safety net on top of the deduplication performed
-    in run_optimization().
+    nodes is deduplicated first (dict.fromkeys preserves order, so the depot
+    stays at index 0). This is critical: if two addresses snap to the same
+    OSM node, the src==dst diagonal writes 0.0 and the TSP total collapses to
+    0.0 s. Deduplication ensures every off-diagonal pair gets a real path.
 
-    WHY deduplication is critical
-    ──────────────────────────────
-    If two or more OSM node IDs in *nodes* are identical (because two
-    addresses geocoded to the same lat/lon and snapped to the same road
-    node), the inner loop evaluates ``src == dst`` for those pairs and
-    writes ``0.0`` into the matrix.  The TSP then accumulates
-    0 + 0 + … = 0.0 s total cost.  That is the sole cause of the
-    "every address maps to node 7651745427, route cost = 0.0 s" bug.
+    Returns {(src, dst): travel_time_s}. Diagonal is 0.0; unreachable pairs
+    carry PENALTY (1e9 s).
 
-    Deduplication turns [A, A, B, A, C] → [A, B, C] so every off-diagonal
-    pair (A,B), (A,C), (B,C) etc. is computed with a real Dijkstra path.
-
-    Debug logging
-    ─────────────
-    Every (src → dst) cost is logged at DEBUG level.  To see it, set the
-    log level to DEBUG before running:
-        import logging; logging.basicConfig(level=logging.DEBUG)
-    or start Streamlit with:
-        PYTHONPATH=. python -m streamlit run app.py --logger.level=debug
-
-    A compact summary line is also printed to stdout at INFO level — it
-    shows the original node count, the deduplicated count, and the count
-    of reachable vs penalty pairs, which is the first place to look when
-    diagnosing a 0.0 s route cost.
-
-    Parameters
-    ----------
-    G      : weighted MultiDiGraph (output of add_travel_times)
-    nodes  : ordered list  [depot_node_id, stop1_node_id, …]
-             duplicates are silently removed; depot stays first
-    weight : edge attribute to minimise (default ``"travel_time"``)
-
-    Returns
-    -------
-    dict[(src_node_id, dst_node_id) → travel_time_seconds]
-        Keys cover every ordered pair in the deduplicated node list.
-        Diagonal entries (src == dst) are always 0.0.
-        Unreachable pairs carry PENALTY (1e9 s).
-
-    Raises
-    ------
-    RuntimeError
-        If a node ID is absent from *G* (indicates snapping before LSCC
-        pruning — always snap *after* calling get_network()).
-    ValueError
-        If fewer than 2 unique nodes remain after deduplication.
+    Raises RuntimeError if a node is absent from G (snapping happened before
+    LSCC pruning — always snap after get_network()), or ValueError if fewer
+    than 2 unique nodes remain.
     """
-    # ── Step 1: Deduplicate while preserving order ────────────────────────────
+    # Deduplicate while preserving order
+
     n_raw = len(nodes)
     unique_nodes: list[int] = list(dict.fromkeys(nodes))
     n = len(unique_nodes)
@@ -245,9 +169,8 @@ def build_distance_matrix(
         + f"  weight='{weight}'"
     )
 
-    # ── Step 2: Validate every node exists in the graph ───────────────────────
-    # Do this up front (before the O(n²) Dijkstra loop) so the error fires
-    # immediately with a clear message rather than mid-way through the matrix.
+    # Validate every node exists in the graph up front, so the error fires
+    # immediately rather than mid-way through the O(n^2) Dijkstra loop.
     for node_id in unique_nodes:
         if node_id not in G:
             raise RuntimeError(
@@ -258,12 +181,11 @@ def build_distance_matrix(
                 f"using the graph returned by get_network(), not the raw download."
             )
 
-    # ── Step 3: All-pairs Dijkstra ────────────────────────────────────────────
+    # All-pairs Dijkstra
     matrix: dict[tuple[int, int], float] = {}
 
     for src in unique_nodes:
         for dst in unique_nodes:
-            # Diagonal: a node's distance to itself is always 0.
             if src == dst:
                 matrix[(src, dst)] = 0.0
                 continue
@@ -271,9 +193,8 @@ def build_distance_matrix(
             try:
                 cost = nx.shortest_path_length(G, src, dst, weight=weight)
 
-                # Guard: a 0.0 cost between two DIFFERENT nodes means the
-                # travel_time attribute was not stamped on the intermediate
-                # edges (add_travel_times() should prevent this, but defend).
+                # 0.0 cost between two different nodes means travel_time was
+                # not stamped on the intermediate edges; treat as PENALTY.
                 if cost == 0.0:
                     logger.warning(
                         "  Dijkstra: %s → %s returned 0.0 s — "
@@ -292,22 +213,19 @@ def build_distance_matrix(
                 logger.debug("    %s → %s : %.2f s", src, dst, cost)
 
             except nx.NetworkXNoPath:
-                # Both nodes are in the same graph but no directed path joins
-                # them.  Inside the LSCC this should not happen; it can occur
-                # if the radius was manually overridden after snapping.
+                # No directed path; should not happen inside the LSCC.
                 logger.warning(
                     "  No directed path %s → %s — inserting PENALTY.", src, dst
                 )
                 matrix[(src, dst)] = PENALTY
 
             except nx.NodeNotFound as exc:
-                # Should never reach here after the validation loop above,
-                # but re-raise with context just in case.
+                # Unreachable after the validation loop above; re-raise with context.
                 raise RuntimeError(
                     f"Node lookup failed during Dijkstra ({src} → {dst}): {exc}"
                 ) from exc
 
-    # ── Step 4: Summary ───────────────────────────────────────────────────────
+    # Summary
     reachable = sum(1 for (s, d), v in matrix.items() if s != d and v < PENALTY)
     penalised = sum(1 for (s, d), v in matrix.items() if s != d and v >= PENALTY)
     diagonal  = n
@@ -339,23 +257,14 @@ def build_drive_matrix_hybrid(
     weight: str = "travel_time",
 ) -> tuple[dict[tuple[int, int], float], list[int]]:
     """
-    Build the drive-mode distance matrix for hybrid last-meter logic.
+    Drive-mode distance matrix for hybrid last-meter routing.
 
-    Each car-reachable stop is represented by its N_car (nearest car-accessible
-    node). The cost to reach stop j is: drive time to N_car_j + walk_time_j.
-    Matrix is keyed by (i, j) indices so duplicate N_car nodes (same parking
-    spot for multiple stops) get distinct columns with different walk times.
+    Each car-reachable stop is represented by its nearest car-accessible node
+    (N_car). Cost to reach stop j = drive time to N_car_j + walk_time_j. Keyed
+    by (i, j) indices so stops sharing one N_car still get distinct columns.
 
-    Parameters
-    ----------
-    G_drive    : Drive graph (travel_time on edges).
-    depot_node : Single depot node ID.
-    car_stops  : List of (n_car, walk_time_s) for each car-reachable stop.
-
-    Returns
-    -------
-    matrix     : dict[(i, j), float] — i, j are indices into nodes_drive.
-    nodes_drive: [depot_node, n_car_1, n_car_2, …] — node IDs for route/labels.
+    car_stops is a list of (n_car, walk_time_s). Returns (matrix, nodes_drive)
+    where nodes_drive is [depot_node, n_car_1, ...].
     """
     nodes_drive: list[int] = [depot_node] + [n_car for (n_car, _) in car_stops]
     walk_times: list[float] = [0.0] + [wt for (_, wt) in car_stops]
@@ -395,9 +304,8 @@ def build_drive_matrix_hybrid(
 _MAPBOX_MATRIX_URL = (
     "https://api.mapbox.com/directions-matrix/v1/mapbox/driving-traffic/{coords}"
 )
-# Mapbox Matrix allows at most 25 coordinates per request.
-# We use chunks of 12 so that each request contains at most 24 unique
-# coordinates (12 sources + 12 destinations, with possible overlap).
+# Mapbox Matrix allows at most 25 coordinates per request. Chunks of 12 keep
+# each request to at most 24 unique coordinates (12 sources + 12 dests).
 _MAPBOX_CHUNK = 12
 
 
@@ -406,28 +314,14 @@ def build_drive_matrix_mapbox(
     api_key: str,
 ) -> dict[tuple[int, int], float]:
     """
-    Build an n×n drive-time matrix (seconds) using the Mapbox Directions
-    Matrix API with the ``driving-traffic`` profile.
+    n x n drive-time matrix (seconds) via the Mapbox Directions Matrix API
+    (driving-traffic profile), which uses historical traffic patterns for more
+    realistic times than the static OSMnx Dijkstra approach.
 
-    Mapbox uses historical traffic patterns (speed profiles by time-of-day
-    and day-of-week) rather than a fixed speed constant, giving more realistic
-    car travel times than the OSMnx-based Dijkstra approach.
+    stops is [(lat, lon), ...] with the depot at index 0. Returns {(i, j): s};
+    diagonal is 0.0, unreachable pairs carry PENALTY.
 
-    Parameters
-    ----------
-    stops   : [(lat, lon), …]  Depot at index 0, delivery stops follow.
-    api_key : Mapbox public access token (sk.* or pk.*).
-
-    Returns
-    -------
-    dict[(i, j) → float]
-        Travel time in seconds.  Diagonal is 0.0.
-        Unreachable pairs carry PENALTY (1e9).
-
-    Raises
-    ------
-    requests.HTTPError   if Mapbox returns a non-2xx response.
-    ValueError           if fewer than 2 stops are provided.
+    Raises requests.HTTPError on a non-2xx response, ValueError if < 2 stops.
     """
     n = len(stops)
     if n < 2:
@@ -476,9 +370,8 @@ def build_drive_matrix_mapbox(
                 else:
                     matrix[(gi, gj)] = float(val)
 
-    # Iterate over (source_chunk × destination_chunk) pairs.
-    # Each chunk is at most _MAPBOX_CHUNK indices, so the total unique
-    # coordinates per request is at most 2 × _MAPBOX_CHUNK = 24 ≤ 25.
+    # Iterate over (source_chunk x destination_chunk) pairs; each chunk is at
+    # most _MAPBOX_CHUNK indices, keeping unique coords per request <= 24.
     all_indices = list(range(n))
     for src_start in range(0, n, _MAPBOX_CHUNK):
         src_chunk = all_indices[src_start : src_start + _MAPBOX_CHUNK]
@@ -495,73 +388,21 @@ def build_drive_matrix_mapbox(
     return matrix
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  TSP SOLVERS  (Phase 2)
-# ══════════════════════════════════════════════════════════════════════════════
-
-# ── Core cost helper  ─────────────────────────────────────────────────────────
-# _route_cost MUST be defined before every function that calls it:
-#   solve_tsp (line ~314), _two_opt (line ~363), _genetic_algorithm (line ~491).
-# Python resolves names at call-time for module-level functions, so placement
-# anywhere before the first *runtime* call is technically sufficient — but we
-# define it here, at the top of the TSP section, so the read-order matches the
-# execution order and the NameError can never occur.
+# --- TSP solvers ---
 
 def _route_cost(route: list[int], matrix: dict) -> float:
     """
-    Calculate the total travel cost of a complete TSP tour.
+    Total travel cost of a closed TSP tour [depot, s1, ..., sn, depot].
 
-    Route structure assumption
-    ──────────────────────────
-    Every solver in this module returns a *closed* route — a list that
-    starts AND ends at the depot:
+    The return-to-depot leg is already the last consecutive pair, so the cost
+    is just the sum of matrix[route[i] -> route[i+1]] — no extra wrap-around
+    term (that would double-count depot->depot).
 
-        [depot, stop_1, stop_2, …, stop_n, depot]
-
-    The return-to-depot leg is therefore already represented as the last
-    consecutive pair  (stop_n → depot),  so we must NOT add an extra
-    matrix[route[-1]][route[0]] term on top — that would double-count
-    the depot→depot leg (cost 0) in the best case and add a spurious
-    depot→depot traversal cost in the worst case.
-
-    The correct formula is simply the sum of consecutive pairs:
-
-        Cost = Σ  matrix[ route[i] → route[i+1] ]   for i = 0 … len-2
-
-    which naturally covers:
-        depot → stop_1  (first leg)
-        stop_1 → stop_2
-        …
-        stop_n → depot  (return leg, already in the list as the last pair)
-
-    None / inf / missing-key handling
-    ───────────────────────────────────
-    Any of the following pathological values in a matrix entry is treated
-    as PENALTY so the TSP solvers always deal with finite floats:
-
-        • Key absent from matrix dict   → matrix.get() returns None default
-        • Explicit None value           → direct None check
-        • math.inf                      → isinf() check
-        • math.nan                      → isnan() check
-        • value ≥ PENALTY               → already the sentinel, kept as-is
-
-    This matches the Dnipro use-case where some street pairs are
-    genuinely unreachable (river crossings, one-way-only access roads)
-    and end up in the matrix as PENALTY after build_distance_matrix().
-
-    Parameters
-    ----------
-    route  : list of OSM node ids, first == last == depot
-    matrix : dict[(src_node, dst_node) → travel_time_seconds]
-             produced by build_distance_matrix()
-
-    Returns
-    -------
-    float  — total travel time in seconds, or a PENALTY multiple if any
-             leg is unreachable.  Never raises; never returns NaN or inf.
+    Any pathological matrix value (missing key, None, inf, nan) is treated as
+    PENALTY, so solvers always work with finite floats. Never raises.
     """
     if len(route) < 2:
-        # A degenerate route with 0 or 1 node has no edges to traverse.
+        # A 0- or 1-node route has no edges to traverse.
         return 0.0
 
     total = 0.0
@@ -573,8 +414,7 @@ def _route_cost(route: list[int], matrix: dict) -> float:
 
         # Normalise every pathological value to PENALTY
         if raw is None:
-            # Key missing — node pair was never computed (should not happen
-            # after build_distance_matrix, but guard defensively)
+            # Key missing — pair never computed; should not happen.
             logger.debug(
                 "_route_cost: matrix key (%s, %s) missing — using PENALTY.", src, dst
             )
@@ -601,9 +441,7 @@ def _route_cost(route: list[int], matrix: dict) -> float:
 
         total += cost
 
-        # Early-exit optimisation: once the running total already exceeds
-        # PENALTY there is no point accumulating further — this tour is
-        # definitively non-viable and the TSP solver will reject it.
+        # Early exit: once total hits PENALTY the tour is non-viable.
         if total >= PENALTY:
             return PENALTY
 
@@ -617,38 +455,21 @@ def solve_tsp(
     seed: int = 42,
 ) -> tuple[list[int], float]:
     """
-    Find a near-optimal visit order for *nodes* (nodes[0] is the depot).
+    Find a near-optimal visit order for nodes (nodes[0] is the depot).
 
-    Method selection
-    ────────────────
-    "auto"          Choose based on stop count (see table below).
-    "nn"            Nearest-Neighbour greedy (O(n²), any size).
-    "2opt"          NN + 2-opt edge-swap refinement (O(n³) per pass).
-    "christofides"  NetworkX Christofides (½-approx, needs complete graph).
-    "genetic"       Order-crossover Genetic Algorithm (large instances).
+    Methods:
+      "auto"          pick by stop count: nn (1-2), 2opt (3-20), genetic (21+)
+      "nn"            nearest-neighbour greedy
+      "2opt"          NN + 2-opt refinement
+      "christofides"  NetworkX Christofides (needs a complete graph)
+      "genetic"       order-crossover genetic algorithm
 
-    Auto-selection table
-    ┌──────────────┬──────────────┐
-    │  Stop count  │  Method      │
-    ├──────────────┼──────────────┤
-    │  1–2         │  nn          │
-    │  3–20        │  2opt        │  ← changed: was christofides
-    │  21–60       │  genetic     │
-    │  61+         │  genetic     │
-    └──────────────┴──────────────┘
+    auto uses 2opt rather than Christofides for small graphs because
+    Christofides needs a complete connected graph and fails when any stop is
+    unreachable; 2opt handles PENALTY weights gracefully.
 
-    Why 2opt instead of Christofides for small graphs?
-    Christofides requires a *complete*, *connected*, *undirected* helper
-    graph.  When even one pair has a PENALTY weight (unreachable stop)
-    the helper graph becomes disconnected and christofides() raises
-    "Connectivity is undefined for the null graph".  2-opt handles
-    PENALTY weights gracefully — it will simply never choose to traverse
-    a PENALTY edge if any finite alternative exists.
-
-    Returns
-    -------
-    (ordered_node_ids, total_travel_time_seconds)
-        ordered_node_ids starts and ends at nodes[0] (the depot).
+    Returns (ordered_node_ids, total_travel_time_s); the order starts and ends
+    at the depot.
     """
     n = len(nodes)
     if n == 0:
@@ -689,13 +510,10 @@ def solve_tsp(
     return route, total
 
 
-# ── Nearest-Neighbour ─────────────────────────────────────────────────────────
+# --- Nearest-neighbour ---
 
 def _nearest_neighbour(nodes: list[int], matrix: dict) -> list[int]:
-    """
-    Classic greedy nearest-neighbour starting at the depot.
-    Always produces a complete tour even when some edges are PENALTY-weight.
-    """
+    """Greedy nearest-neighbour from the depot; always returns a full tour."""
     depot = nodes[0]
     unvisited = set(nodes[1:])
     route = [depot]
@@ -711,7 +529,7 @@ def _nearest_neighbour(nodes: list[int], matrix: dict) -> list[int]:
     return route
 
 
-# ── 2-opt ─────────────────────────────────────────────────────────────────────
+# --- 2-opt ---
 
 def _two_opt(
     route: list[int],
@@ -719,11 +537,9 @@ def _two_opt(
     max_iter: int = 2_000,
 ) -> list[int]:
     """
-    Standard 2-opt local-search improvement.
-    Depot is pinned at index 0 and len-1 and is never swapped.
-    Handles PENALTY weights correctly — a swap is only accepted if it
-    genuinely reduces total cost, so PENALTY edges are avoided whenever
-    a finite-cost alternative exists.
+    2-opt local search. Depot is pinned at index 0 / len-1 and never swapped.
+    A swap is accepted only if it lowers total cost, so PENALTY edges are
+    avoided whenever a finite alternative exists.
     """
     best = route[:]
     best_cost = _route_cost(best, matrix)
@@ -746,41 +562,34 @@ def _two_opt(
     return best
 
 
-# ── Christofides ──────────────────────────────────────────────────────────────
+# --- Christofides ---
 
 def _christofides_tsp(nodes: list[int], matrix: dict) -> list[int]:
     """
-    Attempt NetworkX Christofides approximation.
-
-    Safety checks before calling christofides():
-    1. Exclude all PENALTY-weight edges from the helper graph H.
-    2. If H has isolated nodes (nodes with no finite-cost neighbour),
-       log them by name and fall back to 2-opt immediately — calling
-       christofides on a disconnected graph raises
-       "Connectivity is undefined for the null graph".
-    3. If H has fewer than 3 nodes, fall back to 2-opt (trivial case).
-
-    Falls back to 2-opt on ANY exception so the user always gets a result.
+    NetworkX Christofides approximation, with fallbacks to 2-opt when the
+    helper graph H (PENALTY edges excluded) has isolated nodes, fewer than 3
+    nodes, or is disconnected. Falls back on any exception, so a result is
+    always returned.
     """
     try:
-        # Build undirected complete helper graph with only finite edges
+        # Build an undirected helper graph with only finite edges.
         H = nx.Graph()
         H.add_nodes_from(nodes)
         for (u, v), w in matrix.items():
             if u != v and w < PENALTY:
-                # Use the minimum of the two directions for the undirected edge
+                # Keep the cheaper of the two directions.
                 existing = H.get_edge_data(u, v)
                 if existing is None or w < existing["weight"]:
                     H.add_edge(u, v, weight=w)
 
-        # Check 1: need at least 3 nodes for Christofides
+        # Christofides needs at least 3 nodes.
         if H.number_of_nodes() < 3:
             logger.info(
                 "  Christofides: graph has < 3 nodes — falling back to 2-opt."
             )
             return _two_opt(_nearest_neighbour(nodes, matrix), matrix)
 
-        # Check 2: every node must have at least one finite-weight neighbour
+        # Every node must have at least one finite-weight neighbour.
         isolated = [n for n in nodes if H.degree(n) == 0]
         if isolated:
             logger.warning(
@@ -790,7 +599,7 @@ def _christofides_tsp(nodes: list[int], matrix: dict) -> list[int]:
             )
             return _two_opt(_nearest_neighbour(nodes, matrix), matrix)
 
-        # Check 3: the helper graph must be connected
+        # The helper graph must be connected.
         if not nx.is_connected(H):
             components = nx.number_connected_components(H)
             logger.warning(
@@ -801,17 +610,16 @@ def _christofides_tsp(nodes: list[int], matrix: dict) -> list[int]:
             )
             return _two_opt(_nearest_neighbour(nodes, matrix), matrix)
 
-        # All checks passed — run Christofides
+        # All checks passed — run Christofides.
         cycle = christofides(H, weight="weight")
 
-        # Rotate so depot is first
+        # Rotate so the depot is first.
         depot = nodes[0]
         if depot in cycle:
             idx = cycle.index(depot)
             cycle = cycle[idx:] + cycle[1:idx + 1]
         else:
-            # Christofides returned a cycle that doesn't include the depot —
-            # this should not happen but handle it defensively
+            # Cycle missing the depot; should not happen.
             cycle = cycle + [cycle[0]]
 
         logger.debug("  Christofides succeeded — %d-node cycle.", len(cycle))
@@ -826,7 +634,7 @@ def _christofides_tsp(nodes: list[int], matrix: dict) -> list[int]:
         return _two_opt(_nearest_neighbour(nodes, matrix), matrix)
 
 
-# ── Genetic Algorithm ─────────────────────────────────────────────────────────
+# --- Genetic algorithm ---
 
 def _genetic_algorithm(
     nodes: list[int],
@@ -837,10 +645,9 @@ def _genetic_algorithm(
     seed: int = 42,
 ) -> list[int]:
     """
-    Order-crossover (OX) Genetic Algorithm.
-    Depot is always at position 0 / −1 and excluded from the chromosome.
-    Works with PENALTY weights — the fitness function naturally penalises
-    routes that include an unreachable leg.
+    Order-crossover (OX) genetic algorithm. The depot sits at position 0 / -1
+    and is excluded from the chromosome. PENALTY weights are handled by the
+    fitness function, which penalises any unreachable leg.
     """
     random.seed(seed)
     depot = nodes[0]
@@ -895,9 +702,7 @@ def _genetic_algorithm(
     return [depot] + best_chrom + [depot]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  PATH RECONSTRUCTION  (Phase 1b)
-# ══════════════════════════════════════════════════════════════════════════════
+# --- Path reconstruction ---
 
 def get_full_path(
     G: nx.MultiDiGraph,
@@ -906,11 +711,10 @@ def get_full_path(
     weight: str = "travel_time",
 ) -> list[int]:
     """
-    Return the list of OSM node ids for the shortest path from *src* to *dst*.
+    OSM node ids for the shortest path src -> dst.
 
-    Returns ``[src]`` if src == dst.
-    Returns ``[src, dst]`` with a warning if no path exists (graceful
-    degradation — the polyline will be a straight line on the map).
+    Returns [src] if src == dst, or [src, dst] with a warning if no path
+    exists (the polyline degrades to a straight line on the map).
     """
     if src == dst:
         return [src]
@@ -934,8 +738,8 @@ def reconstruct_full_route(
     weight: str = "travel_time",
 ) -> list[int]:
     """
-    Expand a TSP node sequence into a full sequence of OSM nodes,
-    including all intermediate road nodes between each pair of stops.
+    Expand a TSP node sequence into the full OSM node sequence, including all
+    intermediate road nodes between each pair of stops.
     """
     full: list[int] = []
     for i in range(len(tsp_route) - 1):

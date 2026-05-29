@@ -1,17 +1,6 @@
 """
-package_db.py — DeliveryIQ Package Storage
-===========================================
-Provides the Package dataclass and a SQLite-backed PackageDB for persistent
-package management.  Packages represent physical parcels to be delivered;
-they carry a weight, a delivery address, and a delivery status.
-
-Usage:
-    from package_db import Package, PackageDB, DeliveryStatus
-
-    db = PackageDB()                          # opens/creates packages.db
-    pkg = db.add_package("Shevchenka 1", 2.5) # returns Package
-    db.set_status(pkg.id, DeliveryStatus.IN_TRANSIT)
-    pending = db.get_by_status(DeliveryStatus.PENDING)
+Package dataclass and a SQLite-backed PackageDB for persistent package
+management. A package carries a weight, a delivery address, and a status.
 """
 
 from __future__ import annotations
@@ -25,30 +14,26 @@ from pathlib import Path
 from typing import Optional
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  STATUS ENUM
-# ──────────────────────────────────────────────────────────────────────────────
+# Status enum
 
 class DeliveryStatus(str, Enum):
-    PENDING     = "pending"       # Waiting to be dispatched
-    IN_TRANSIT  = "in_transit"    # Currently being delivered
-    DELIVERED   = "delivered"     # Successfully delivered
+    PENDING     = "pending"       # waiting to be dispatched
+    IN_TRANSIT  = "in_transit"    # currently being delivered
+    DELIVERED   = "delivered"     # successfully delivered
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  PACKAGE DATACLASS
-# ──────────────────────────────────────────────────────────────────────────────
+# Package dataclass
 
 @dataclass
 class Package:
     """A parcel to be delivered."""
     id:         str                      # UUID4 hex string
-    address:    str                      # Delivery address (human-readable)
-    weight_kg:  float                    # Weight in kilograms
-    status:     DeliveryStatus           # Current delivery status
+    address:    str                      # delivery address
+    weight_kg:  float                    # weight in kilograms
+    status:     DeliveryStatus           # current delivery status
     created_at: datetime.datetime        # UTC creation timestamp
-    lat:        Optional[float] = None   # Geocoded latitude  (set on dispatch)
-    lon:        Optional[float] = None   # Geocoded longitude (set on dispatch)
+    lat:        Optional[float] = None   # geocoded latitude (set on dispatch)
+    lon:        Optional[float] = None   # geocoded longitude (set on dispatch)
 
     @property
     def status_label(self) -> str:
@@ -69,9 +54,7 @@ class Package:
         return colors.get(self.status, "#6b7280")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  DATABASE
-# ──────────────────────────────────────────────────────────────────────────────
+# Database
 
 _DB_PATH = Path(__file__).parent / "packages.db"
 
@@ -95,7 +78,7 @@ class PackageDB:
         self._path = db_path
         self._bootstrap()
 
-    # ── internal helpers ──────────────────────────────────────────────────────
+    # Internal helpers
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._path)
@@ -118,7 +101,7 @@ class PackageDB:
             lon=float(row["lon"]) if row["lon"] is not None else None,
         )
 
-    # ── public API ────────────────────────────────────────────────────────────
+    # Public API
 
     def add_package(
         self,
