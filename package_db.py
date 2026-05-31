@@ -1,6 +1,5 @@
 """
-package_db.py — DeliveryIQ Package Storage
-===========================================
+package_db.py
 Provides the Package dataclass and a SQLite-backed PackageDB for persistent
 package management.  Packages represent physical parcels to be delivered;
 they carry a weight, a delivery address, and a delivery status.
