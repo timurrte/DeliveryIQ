@@ -1165,7 +1165,7 @@ with st.sidebar:
     st.markdown("""
     <div style="padding:18px 0 6px">
       <div style="font-size:1.3rem;font-weight:800;color:#f0f9ff">📦 DeliveryIQ</div>
-      <div style="font-size:.68rem;color:#334155;letter-spacing:.5px">Оптимізатор маршрутів · v3.0</div>
+      <div style="font-size:.68rem;color:#334155;letter-spacing:.5px">Оптимізатор маршрутів</div>
     </div>
     <hr style="border-color:#161d2e;margin:6px 0 14px">
     """, unsafe_allow_html=True)
